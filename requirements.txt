@@ -5,3 +5,4 @@ numpy
 openai
 pandas
 psutil
+requests

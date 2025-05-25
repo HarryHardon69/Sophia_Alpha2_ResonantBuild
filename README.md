@@ -12,23 +12,25 @@
 ## System Architecture
 (Placeholder for System Architecture Overview - To be populated based on Phase2KB.md and further design)
 
+The `core.brain` module is a central component, housing the `SpacetimeManifold` class. This class implements a Spiking Neural Network (SNN) for cognitive processing, bootstraps concepts using Large Language Models (LLMs), incorporates STDP/Hebbian learning, and generates awareness metrics. Its behavior is extensively configurable via `config/config.py`.
+
 ## Directory Structure
 ```
 Sophia_Alpha2_ResonantBuild/
 ├── .gitignore
-├──README.md
+├── README.md
 ├── config/
 │   ├── __init__.py
-│   └── config.py
+│   └── config.py      # System-wide configuration settings
 ├── core/
-│   ├── __init__.py
-│   ├── brain.py
-│   ├── dialogue.py
-│   ├── ethics.py
-│   ├── gui.py
-│   ├── library.py
-│   ├── memory.py
-│   └── persona.py
+│   ├── __init__.py    # Core package initializer, exposes key functions
+│   ├── brain.py       # Cognitive core: SpacetimeManifold (SNN), LLM bootstrap, learning, awareness
+│   ├── dialogue.py    # (Stub) For dialogue management
+│   ├── ethics.py      # (Stub) For ethical framework and decision-making
+│   ├── gui.py         # (Stub) For Streamlit-based GUI
+│   ├── library.py     # (Stub) For knowledge library management
+│   ├── memory.py      # (Stub) For memory systems
+│   └── persona.py     # (Stub) For persona management
 ├── data/
 │   ├── ethics_store/
 │   │   └── .gitkeep
@@ -46,7 +48,7 @@ Sophia_Alpha2_ResonantBuild/
 │       └── .gitkeep
 ├── docs/
 │   ├── Phase2KB.md
-│   └── documentation.md
+│   └── documentation.md # Detailed technical documentation
 ├── interface/
 │   └── __init__.py
 ├── main.py
@@ -65,7 +67,7 @@ Sophia_Alpha2_ResonantBuild/
 ## Roadmap
 (Placeholder for Project Roadmap - To be populated later)
 *   Phase 1: Initial Scaffolding (Complete)
-*   Phase 2: ...
+*   Phase 2: Core module implementation (config.py, brain.py in progress)
 *   Phase 3: ...
 
 ## Contributing

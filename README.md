@@ -5,14 +5,18 @@
 
 ## Key Features
 (Placeholder for Key Features - To be populated based on Phase2KB.md)
-*   Feature 1
-*   Feature 2
-*   Feature 3
+*   Modular core components (configurable, cognitive processing, memory).
+*   SNN-based cognitive architecture with LLM bootstrapping.
+*   Persistent knowledge graph with novelty and ethical filtering.
 
 ## System Architecture
 (Placeholder for System Architecture Overview - To be populated based on Phase2KB.md and further design)
 
-The `core.brain` module is a central component, housing the `SpacetimeManifold` class. This class implements a Spiking Neural Network (SNN) for cognitive processing, bootstraps concepts using Large Language Models (LLMs), incorporates STDP/Hebbian learning, and generates awareness metrics. Its behavior is extensively configurable via `config/config.py`.
+The `core.brain` module is a central component, housing the `SpacetimeManifold` class. This class implements a Spiking Neural Network (SNN) for cognitive processing, bootstraps concepts using Large Language Models (LLMs), incorporates STDP/Hebbian learning, and generates awareness metrics.
+
+The `core.memory` module manages Sophia_Alpha2's knowledge graph, stored in `data/memory_store/knowledge_graph.json`. It handles storing new concepts based on novelty and ethical alignment, calculates concept novelty, and provides various functions for retrieving memories.
+
+Both `core.brain` and `core.memory` (and other future core modules) are extensively configurable via `config/config.py`.
 
 ## Directory Structure
 ```
@@ -29,7 +33,7 @@ Sophia_Alpha2_ResonantBuild/
 │   ├── ethics.py      # (Stub) For ethical framework and decision-making
 │   ├── gui.py         # (Stub) For Streamlit-based GUI
 │   ├── library.py     # (Stub) For knowledge library management
-│   ├── memory.py      # (Stub) For memory systems
+│   ├── memory.py      # Manages the knowledge graph (storing, retrieving, novelty calculation)
 │   └── persona.py     # (Stub) For persona management
 ├── data/
 │   ├── ethics_store/
@@ -38,7 +42,7 @@ Sophia_Alpha2_ResonantBuild/
 │   │   └── .gitkeep
 │   ├── logs/
 │   │   └── .gitkeep
-│   ├── memory_store/
+│   ├── memory_store/  # Contains knowledge_graph.json
 │   │   └── .gitkeep
 │   ├── personas/
 │   │   └── .gitkeep
@@ -47,7 +51,7 @@ Sophia_Alpha2_ResonantBuild/
 │   └── public/
 │       └── .gitkeep
 ├── docs/
-│   ├── Phase2KB.md
+│   ├── Phase2KB.md      # Project knowledge base and evolving specifications
 │   └── documentation.md # Detailed technical documentation
 ├── interface/
 │   └── __init__.py
@@ -67,8 +71,9 @@ Sophia_Alpha2_ResonantBuild/
 ## Roadmap
 (Placeholder for Project Roadmap - To be populated later)
 *   Phase 1: Initial Scaffolding (Complete)
-*   Phase 2: Core module implementation (config.py, brain.py in progress)
-*   Phase 3: ...
+*   Phase 2: Core module implementation (config.py complete, brain.py complete, memory.py complete)
+*   Phase 3: Implementation of ethics, persona, dialogue, and GUI modules.
+*   Phase 4: ...
 
 ## Contributing
 (Placeholder for Contribution Guidelines - To be populated later)

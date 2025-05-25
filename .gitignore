@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+
+# Data files - assuming most data should not be versioned
+data/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/

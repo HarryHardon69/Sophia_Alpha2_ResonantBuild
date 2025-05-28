@@ -7,6 +7,7 @@ of the Sophia_Alpha2_ResonantBuild project.
 *   [Configuration (`config/config.py`)](#configuration-configconfigpy)
 *   [Core Cognitive Engine (`core/brain.py`)](#core-cognitive-engine-corebrainpy)
 *   [Memory System (`core/memory.py`)](#memory-system-corememorypy)
+*   [Persona Management (`core/persona.py`)](#persona-management-corepersonapy)
 
 ---
 
@@ -102,4 +103,60 @@ Key settings for `core/memory.py` include:
 
 The module includes a comprehensive self-testing suite (`if __name__ == "__main__":`).
 
+---
+
+## Persona Management (`core/persona.py`)
+
+The `core/persona.py` module defines and manages Sophia_Alpha2's identity, traits, operational mode, and awareness state. This is crucial for maintaining a consistent and evolving persona throughout her interactions and cognitive processes.
+
+### Module Overview
+`persona.py` encapsulates Sophia's characteristics and her dynamic understanding of her own operational state. This state is influenced by metrics received from the cognitive core (`core/brain.py`) and is persisted to a profile file, allowing Sophia's persona to be consistent across sessions and to evolve over time.
+
+### `Persona` Class
+This is the central class in `core/persona.py`.
+
+*   **Purpose:** Manages all aspects of Sophia's identity, including her name, current operational mode, inherent traits, and a detailed dictionary of awareness metrics.
+*   **Key Attributes:**
+    *   `name` (str): The name of the persona, e.g., "Sophia_Alpha2_Default".
+    *   `mode` (str): The current operational mode, such as "reflective", "learning", or "active_problem_solving".
+    *   `traits` (list[str]): A list of strings defining core characteristics, e.g., `["CuriosityDriven", "EthicallyMinded"]`.
+    *   `awareness` (dict): A dictionary holding various metrics that represent Sophia's current state of awareness. This includes:
+        *   `curiosity` (float): Her current level of curiosity.
+        *   `coherence` (float): The coherence of her current cognitive state.
+        *   `context_stability` (float): Stability of the current context.
+        *   `self_evolution_rate` (float): Rate of her own developmental change.
+        *   `active_llm_fallback` (bool): Whether the system is currently relying on LLM fallbacks.
+        *   `primary_concept_coord` (tuple | None): A 4-tuple `(x, y, z, t_intensity_raw)` representing the manifold coordinates of the current primary concept of focus, along with its raw T-intensity (0-1). This T-value, or Focus Intensity, indicates the intensity of focus on this concept. It is `None` if no concept is primary.
+
+### Key Methods
+*   **`__init__()`**: Initializes the Persona instance. It sets up default attributes (name, mode, traits, awareness metrics) and then attempts to load an existing persona state from the profile file defined by `config.PERSONA_PROFILE_PATH`. If no profile is found, or if it's malformed, it initializes with defaults and saves a new profile.
+*   **`update_awareness(brain_awareness_metrics: dict)`**: Updates the `awareness` dictionary based on new metrics received from `core/brain.py` (typically after a `think()` cycle). This method handles the logic for integrating new values, including the `primary_concept_coord` and its associated raw T-intensity. Changes are automatically saved to the profile.
+*   **`get_intro()`**: Generates a string that provides a brief introduction to the persona, including her name, mode, and key awareness metrics like curiosity, coherence, and the current Focus Intensity (T-value) if a primary concept is active.
+*   **`save_state()` / `load_state()`**: These methods handle the persistence of the persona's state. `save_state()` writes the current attributes to the JSON profile file and is typically called automatically when changes occur (e.g., in `update_awareness` or after initialization if a new profile is created). `load_state()` reads from the profile file during initialization, gracefully handling missing or malformed files by applying defaults.
+
+### Persistent Data (`persona_profile.json`)
+The state of the `Persona` class is persisted in a JSON file.
+
+*   **Path:** The path to this file is defined in `config.py` via the `config.PERSONA_PROFILE_PATH` setting. An example could be `data/private/persona_profile_default.json` or a user-configured path like `data/personas/Sophia_Alpha2_Default.json`.
+*   **Structure:** The JSON file generally contains the following structure:
+    ```json
+    {
+      "name": "Sophia_Alpha2_Default",
+      "mode": "reflective",
+      "traits": ["CuriosityDriven", "EthicallyMinded", "ResonanceAware", "Developmental"],
+      "awareness": {
+        "curiosity": 0.5,
+        "context_stability": 0.5,
+        "self_evolution_rate": 0.0,
+        "coherence": 0.0,
+        "active_llm_fallback": false,
+        "primary_concept_coord": [0.123, -0.456, 0.789, 0.85]
+      },
+      "last_saved": "2023-10-27T10:30:00.123456Z"
+    }
+    ```
+    *   If `primary_concept_coord` is not active or defined, its value will be `null` in the JSON file.
+    *   The `primary_concept_coord` array stores the X, Y, Z coordinates (scaled values as used within the manifold) and the fourth element is the raw T-intensity (a float between 0.0 and 1.0) representing the focus level.
+
+The module includes a comprehensive self-testing suite (`if __name__ == "__main__":`) which also serves as an example of how to interact with the `Persona` class.
 ```

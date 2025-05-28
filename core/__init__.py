@@ -49,6 +49,9 @@ from .ethics import (
     track_trends
 )
 
+# --- Persona Exports ---
+from .persona import Persona
+
 __all__ = [
     # Brain components
     'SpacetimeManifold',
@@ -64,6 +67,8 @@ __all__ = [
     # Ethics components
     'score_ethics',
     'track_trends',
+    # Persona component
+    'Persona',
     # Other core components will be added here as they are developed
     # e.g., 'DialogueManager', 'PersonaManager', etc. 
     # Corrected placeholder from 'EthicsEngine' as it's now implemented.

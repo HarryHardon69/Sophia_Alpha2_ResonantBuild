@@ -16,7 +16,9 @@ The `core.brain` module is a central component, housing the `SpacetimeManifold` 
 
 The `core.memory` module manages Sophia_Alpha2's knowledge graph, stored in `data/memory_store/knowledge_graph.json`. It handles storing new concepts based on novelty and ethical alignment, calculates concept novelty, and provides various functions for retrieving memories.
 
-Both `core.brain` and `core.memory` (and other future core modules) are extensively configurable via `config/config.py`.
+The `core.persona` module manages Sophia_Alpha2's identity, traits, operational mode, and evolving awareness state. Handles the persistence of this state to `persona_profile.json` (path typically defined in `config.PERSONA_PROFILE_PATH`).
+
+All core modules are designed to be extensively configurable via `config/config.py`.
 
 ## Directory Structure
 ```
@@ -34,7 +36,7 @@ Sophia_Alpha2_ResonantBuild/
 │   ├── gui.py         # (Stub) For Streamlit-based GUI
 │   ├── library.py     # (Stub) For knowledge library management
 │   ├── memory.py      # Manages the knowledge graph (storing, retrieving, novelty calculation)
-│   └── persona.py     # (Stub) For persona management
+│   └── persona.py     # Manages Sophia_Alpha2's identity, traits, mode, and awareness state
 ├── data/
 │   ├── ethics_store/
 │   │   └── .gitkeep
@@ -71,8 +73,8 @@ Sophia_Alpha2_ResonantBuild/
 ## Roadmap
 (Placeholder for Project Roadmap - To be populated later)
 *   Phase 1: Initial Scaffolding (Complete)
-*   Phase 2: Core module implementation (config.py complete, brain.py complete, memory.py complete)
-*   Phase 3: Implementation of ethics, persona, dialogue, and GUI modules.
+*   Phase 2: Core module implementation (config.py complete, brain.py complete, memory.py complete, persona.py updated)
+*   Phase 3: Implementation of ethics, dialogue, and GUI modules.
 *   Phase 4: ...
 
 ## Contributing

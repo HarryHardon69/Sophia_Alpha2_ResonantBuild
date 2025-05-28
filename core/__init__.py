@@ -78,6 +78,9 @@ from .library import (
 # --- Dialogue Exports ---
 from .dialogue import generate_response, dialogue_loop
 
+# --- GUI Exports ---
+from .gui import start_gui
+
 __all__ = [
     # Brain components
     'SpacetimeManifold',
@@ -115,6 +118,8 @@ __all__ = [
     # Dialogue components
     'generate_response',
     'dialogue_loop',
+    # GUI components
+    'start_gui',
     # Other core components will be added here as they are developed
     # e.g., 'DialogueManager', 'PersonaManager', etc. 
     # Corrected placeholder from 'EthicsEngine' as it's now implemented.

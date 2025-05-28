@@ -8,6 +8,7 @@ of the Sophia_Alpha2_ResonantBuild project.
 *   [Core Cognitive Engine (`core/brain.py`)](#core-cognitive-engine-corebrainpy)
 *   [Memory System (`core/memory.py`)](#memory-system-corememorypy)
 *   [Persona Management (`core/persona.py`)](#persona-management-corepersonapy)
+*   [Knowledge Library and Utilities (`core/library.py`)](#knowledge-library-and-utilities-corelibrarypy)
 
 ---
 
@@ -159,4 +160,92 @@ The state of the `Persona` class is persisted in a JSON file.
     *   The `primary_concept_coord` array stores the X, Y, Z coordinates (scaled values as used within the manifold) and the fourth element is the raw T-intensity (a float between 0.0 and 1.0) representing the focus level.
 
 The module includes a comprehensive self-testing suite (`if __name__ == "__main__":`) which also serves as an example of how to interact with the `Persona` class.
+
+---
+
+## Knowledge Library and Utilities (`core/library.py`)
+
+The `core/library.py` module serves a dual purpose: it provides a collection of shared utility functions and custom exceptions for use across the `core` package, and it manages a persistent, curated knowledge library.
+
+### Module Overview
+This module is designed to centralize common functionalities like text processing, data validation, and a standardized exception hierarchy. Additionally, it offers a system for storing and retrieving structured knowledge entries, distinct from the more dynamic `core.memory` (knowledge graph). The library includes an ethical mitigation component (`Mitigator`) to moderate content.
+
+### Key Features & Components
+
+#### 1. Knowledge Persistence
+*   **In-Memory Store (`KNOWLEDGE_LIBRARY`):** A Python dictionary that holds the loaded knowledge entries. Each key is an `entry_id` (a SHA256 hash of the content).
+*   **Persistent Storage (`library_log.json`):** The knowledge library is persisted to a JSON file, typically located at `data/library_store/library_log.json` (path configured via `config.LIBRARY_LOG_PATH`).
+*   **Loading (`_load_knowledge_library()`):** Loads the library from the JSON file into the `KNOWLEDGE_LIBRARY` dictionary when the module is imported. Handles file not found, empty files, and malformed JSON.
+*   **Saving (`_save_knowledge_library()`):** Saves the `KNOWLEDGE_LIBRARY` to the JSON file if any changes have been made (tracked by `_library_dirty_flag`). Uses an atomic write process (write to temp file, then replace) to prevent data corruption.
+
+#### 2. Utility Functions
+*   **`sanitize_text(input_text: str) -> str`:** Removes leading/trailing whitespace and normalizes multiple internal whitespace characters to a single space.
+*   **`summarize_text(text: str, max_length: int) -> str`:** Truncates text to a specified `max_length`, appending "..." if truncation occurs. Handles `None` or empty input.
+*   **`is_valid_coordinate(coord: tuple | list) -> bool`:** Validates if the input is a list or tuple containing 3 or 4 numeric elements.
+
+#### 3. Custom Exceptions
+A hierarchy of custom exceptions is defined for standardized error handling within the `core` package:
+*   **`CoreException(Exception)`:** Base class for all custom core exceptions.
+*   Derivatives include: `BrainError`, `PersonaError`, `MemoryError`, `EthicsError`, `LibraryError`, `DialogueError`, `NetworkError`, and `ConfigError`, each intended for issues specific to their respective modules or concerns.
+
+#### 4. `Mitigator` Class
+*   **Purpose:** Provides mechanisms for ethical oversight and content moderation. It's designed to identify and reframe or flag content that may be ethically problematic.
+*   **Initialization:** Loads thresholds (e.g., `ETHICAL_ALIGNMENT_THRESHOLD`, `MITIGATION_ETHICAL_THRESHOLD`) and lists of sensitive keywords/reframing phrases from `config.py`, with built-in defaults.
+*   **Key Method (`moderate_ethically_flagged_content`):**
+    *   Takes original text, an ethical score, and a strict mode flag as input.
+    *   Evaluates the content based on the ethical score against configured thresholds and checks for sensitive keywords.
+    *   If mitigation is triggered, it logs the event and returns a moderated string (e.g., reframing the content, providing a placeholder, or indicating review is needed).
+    *   If no mitigation is needed, it returns the original text.
+
+#### 5. Knowledge Management Functions
+These functions form the public API for interacting with the knowledge library:
+*   **`store_knowledge(content: str, is_public: bool, source_uri: str, author: str) -> str | None`:**
+    *   **Role:** Adds a new piece of knowledge to the library.
+    *   **Inputs:**
+        *   `content` (str): The textual content.
+        *   `is_public` (bool, default `False`): Indicates if the content is for public access.
+        *   `source_uri` (str, optional): URI of the knowledge source.
+        *   `author` (str, optional): Author of the knowledge.
+    *   **Key Processes:**
+        *   Validates input content.
+        *   Generates an `entry_id` (SHA256 hash of content) and other metadata.
+        *   Attempts to generate 4D manifold coordinates and raw T-intensity for the content by calling `bootstrap_concept_from_llm` from `core.brain` (via `get_shared_manifold`). Uses fallbacks if brain interaction fails.
+        *   Calculates an ethical score for the content using `score_ethics` from `core.ethics`, providing relevant awareness metrics. Uses a default score on failure.
+        *   Handles placeholder consent for public items if `config.REQUIRE_PUBLIC_STORAGE_CONSENT` is true.
+        *   Constructs and stores the entry, then saves the library.
+    *   **Output:** The `entry_id` if stored successfully, otherwise `None`.
+*   **`retrieve_knowledge_by_id(entry_id: str) -> dict | None`:**
+    *   Retrieves a specific knowledge entry using its unique `entry_id`.
+*   **`retrieve_knowledge_by_keyword(keyword: str, search_public: bool, search_private: bool) -> list[dict]`:**
+    *   Searches for knowledge entries containing the specified `keyword` (case-insensitive) within their `content_preview` or `full_content`.
+    *   Allows filtering based on whether entries are public or private using the `search_public` and `search_private` boolean flags.
+
+### Data Structure for `library_log.json`
+The `library_log.json` file stores the `KNOWLEDGE_LIBRARY` as a JSON object, where each key is an `entry_id` (SHA256 hash), and the value is an object representing the knowledge entry.
+
+**Example Entry:**
+```json
+{
+  "entry_id_hash_example": {
+    "id": "entry_id_hash_example",
+    "timestamp": "2023-12-01T12:00:00.000000Z",
+    "content_hash": "entry_id_hash_example",
+    "content_preview": "A concise summary of the knowledge item...",
+    "full_content": "The complete textual content of the knowledge item, which can be extensive.",
+    "is_public": true,
+    "source_uri": "https://example.com/original_article",
+    "author": "Dr. Jane Doe",
+    "coordinates": [0.123, -0.456, 0.789, 1.234],
+    "raw_t_intensity": 0.85,
+    "ethics_score": 0.92,
+    "version": "1.0"
+  }
+  // ... other entries keyed by their IDs
+}
+```
+*   **`coordinates`**: A 4-tuple `(x, y, z, t_coord)` representing the concept's position in the manifold (scaled values), or `null` if not generated.
+*   **`raw_t_intensity`**: A float between 0.0 and 1.0 representing the T-value (intensity) derived from the brain's LLM bootstrapping, or `null`/`0.0` if not applicable.
+*   **`ethics_score`**: A float between 0.0 and 1.0 representing the assessed ethical alignment of the content.
+
+The module includes a comprehensive self-testing suite (`if __name__ == "__main__":`) to validate its functionalities.
 ```

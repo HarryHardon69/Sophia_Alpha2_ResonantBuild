@@ -52,6 +52,29 @@ from .ethics import (
 # --- Persona Exports ---
 from .persona import Persona
 
+# --- Library Exports ---
+from .library import (
+    # Public API functions
+    store_knowledge,
+    retrieve_knowledge_by_id,
+    retrieve_knowledge_by_keyword,
+    # Utility classes/functions
+    Mitigator,
+    sanitize_text,
+    summarize_text,
+    is_valid_coordinate,
+    # Custom Exceptions
+    CoreException, 
+    BrainError, 
+    PersonaError, 
+    MemoryError, 
+    EthicsError, 
+    LibraryError, 
+    DialogueError, 
+    NetworkError, 
+    ConfigError
+)
+
 __all__ = [
     # Brain components
     'SpacetimeManifold',
@@ -69,6 +92,23 @@ __all__ = [
     'track_trends',
     # Persona component
     'Persona',
+    # Library components
+    'store_knowledge',
+    'retrieve_knowledge_by_id',
+    'retrieve_knowledge_by_keyword',
+    'Mitigator',
+    'sanitize_text',
+    'summarize_text',
+    'is_valid_coordinate',
+    'CoreException', 
+    'BrainError', 
+    'PersonaError', 
+    'MemoryError', 
+    'EthicsError', 
+    'LibraryError', 
+    'DialogueError', 
+    'NetworkError', 
+    'ConfigError',
     # Other core components will be added here as they are developed
     # e.g., 'DialogueManager', 'PersonaManager', etc. 
     # Corrected placeholder from 'EthicsEngine' as it's now implemented.

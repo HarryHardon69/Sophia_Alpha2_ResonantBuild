@@ -75,6 +75,9 @@ from .library import (
     ConfigError
 )
 
+# --- Dialogue Exports ---
+from .dialogue import generate_response, dialogue_loop
+
 __all__ = [
     # Brain components
     'SpacetimeManifold',
@@ -109,6 +112,9 @@ __all__ = [
     'DialogueError', 
     'NetworkError', 
     'ConfigError',
+    # Dialogue components
+    'generate_response',
+    'dialogue_loop',
     # Other core components will be added here as they are developed
     # e.g., 'DialogueManager', 'PersonaManager', etc. 
     # Corrected placeholder from 'EthicsEngine' as it's now implemented.

@@ -9,6 +9,7 @@ of the Sophia_Alpha2_ResonantBuild project.
 *   [Memory System (`core/memory.py`)](#memory-system-corememorypy)
 *   [Persona Management (`core/persona.py`)](#persona-management-corepersonapy)
 *   [Knowledge Library and Utilities (`core/library.py`)](#knowledge-library-and-utilities-corelibrarypy)
+*   [Dialogue Management (`core/dialogue.py`)](#dialogue-management-coredialoguepy)
 
 ---
 
@@ -248,4 +249,53 @@ The `library_log.json` file stores the `KNOWLEDGE_LIBRARY` as a JSON object, whe
 *   **`ethics_score`**: A float between 0.0 and 1.0 representing the assessed ethical alignment of the content.
 
 The module includes a comprehensive self-testing suite (`if __name__ == "__main__":`) to validate its functionalities.
+
+---
+
+## Dialogue Management (`core/dialogue.py`)
+
+The `core/dialogue.py` module acts as the central nervous system for Sophia_Alpha2's interactions. It's responsible for processing user input, orchestrating the cognitive and ethical faculties of the system, and generating coherent, context-aware responses.
+
+### Module Overview
+`dialogue.py` is the primary orchestrator. It connects the `core.brain` (for thinking), `core.persona` (for state and identity), `core.ethics` (for moral alignment), `core.memory` (for recalling past interactions/knowledge), and `core.library` (for curated knowledge and utilities like content mitigation) to produce meaningful dialogue. It also provides the command-line interface (CLI) for direct user interaction.
+
+### Key Functions
+
+*   **`generate_response(user_input: str, stream_thought_steps: bool = False) -> tuple[str, list, dict]`**
+    *   **Core Responsibility:** This function is the workhorse for processing a single piece of user input and generating Sophia's reply. It returns a tuple containing the final response string for the user, a list of strings detailing the internal "thought steps" taken, and a dictionary of the latest awareness metrics.
+    *   **Orchestration Flow:**
+        1.  **Persona Retrieval:** Obtains the current `Persona` instance.
+        2.  **Brain Interaction:** Calls `core.brain.think()` with the user input to get the initial response, thought steps, and raw awareness metrics.
+        3.  **Persona Update:** Updates the `Persona` instance's awareness state with the metrics from the brain.
+        4.  **Ethical Scoring:** Uses `core.ethics.score_ethics()` to evaluate the ethical alignment of the generated response and context.
+        5.  **Memory Storage:** Records key aspects of the interaction (user input, Sophia's response, ethical score, relevant coordinates) into the `core.memory` knowledge graph using `store_memory()`.
+        6.  **Content Mitigation:** Employs the `Mitigator` class from `core.library` to moderate the brain's response if its ethical score falls below configured thresholds, potentially reframing or flagging the content.
+        7.  **Ethical Trend Tracking:** Updates ethical trends using `core.ethics.track_trends()` based on the interaction's ethical score.
+        8.  **Response Formatting:** Constructs the final response string, often prefixing it with persona mode and ethical score indicators.
+    *   **Error Handling:** Each step in the orchestration is wrapped in try-except blocks to ensure graceful handling of failures in any dependent module, logging errors and attempting to provide a fallback response.
+
+*   **`dialogue_loop(enable_streaming_thoughts: bool = None)`**
+    *   **Core Responsibility:** Provides the main entry point for continuous, interactive command-line dialogue with Sophia_Alpha2.
+    *   **Features:**
+        *   **Dynamic Prompt:** Displays a prompt that includes the current persona's name, mode, and key awareness metrics (e.g., curiosity, coherence) to provide context to the user.
+        *   **Special Commands:** Handles commands prefixed with `!`:
+            *   `!stream`: Toggles the real-time display of thought steps from `generate_response`.
+            *   `!persona`: Shows the current persona's detailed information.
+            *   `!ethicsdb`, `!memgraph`, `!library`: Debug commands to inspect the current state of the ethics database, memory knowledge graph, and knowledge library respectively.
+            *   `!help`: Displays a list of available commands.
+            *   `quit` / `exit`: Terminates the dialogue loop.
+        *   **Query Processing:** For any input not recognized as a command, it calls `generate_response()` to get Sophia's reply and then prints the response and, if enabled, the thought steps.
+
+### Interaction Flow
+`core/dialogue.py` serves as the central hub. When a user provides input via `dialogue_loop()`:
+1.  The input is passed to `generate_response()`.
+2.  `generate_response()` coordinates with `brain` for initial processing.
+3.  `persona` is updated with new awareness data.
+4.  `ethics` assesses the response.
+5.  `memory` records the interaction.
+6.  `library` (specifically `Mitigator`) may moderate the response.
+7.  The final, potentially moderated, response is returned to `dialogue_loop()` and presented to the user.
+This cycle ensures that all core components contribute to Sophia's behavior in a cohesive manner.
+
+The module includes a comprehensive self-testing suite (`if __name__ == "__main__":`) to validate its functionalities, especially the complex orchestration within `generate_response` and the command handling in `dialogue_loop`.
 ```

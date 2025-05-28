@@ -16,16 +16,6 @@ def think(input_text: str, stream_thought_steps: bool = False) -> tuple[list, st
     """
     Primary entry point for making Sophia_Alpha2 process input and generate a response.
     Retrieves the shared SpacetimeManifold instance and calls its think() method.
-
-    Args:
-        input_text: The text input to be processed.
-        stream_thought_steps: Whether to stream thought process steps to console (if verbose).
-
-    Returns:
-        A tuple containing:
-            - thought_steps_list (list): Log of cognitive steps.
-            - response_text_string (str): The generated response.
-            - awareness_metrics_dict (dict): Dictionary of awareness metrics.
     """
     manifold = get_shared_manifold()
     if manifold:
@@ -53,6 +43,12 @@ from .memory import (
     read_memory
 )
 
+# --- Ethics Exports ---
+from .ethics import (
+    score_ethics,
+    track_trends
+)
+
 __all__ = [
     # Brain components
     'SpacetimeManifold',
@@ -65,6 +61,10 @@ __all__ = [
     'get_memories_by_concept_name',
     'get_recent_memories',
     'read_memory',
+    # Ethics components
+    'score_ethics',
+    'track_trends',
     # Other core components will be added here as they are developed
-    # e.g., 'DialogueManager', 'EthicsEngine', etc.
+    # e.g., 'DialogueManager', 'PersonaManager', etc. 
+    # Corrected placeholder from 'EthicsEngine' as it's now implemented.
 ]

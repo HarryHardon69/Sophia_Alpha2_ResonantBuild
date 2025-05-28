@@ -4,6 +4,7 @@ This document provides more detailed technical information about the modules and
 of the Sophia_Alpha2_ResonantBuild project.
 
 ## Table of Contents
+*   [Main Application Entry Point (`main.py`)](#main-application-entry-point-mainpy)
 *   [Configuration (`config/config.py`)](#configuration-configconfigpy)
 *   [Core Cognitive Engine (`core/brain.py`)](#core-cognitive-engine-corebrainpy)
 *   [Memory System (`core/memory.py`)](#memory-system-corememorypy)
@@ -11,6 +12,82 @@ of the Sophia_Alpha2_ResonantBuild project.
 *   [Knowledge Library and Utilities (`core/library.py`)](#knowledge-library-and-utilities-corelibrarypy)
 *   [Dialogue Management (`core/dialogue.py`)](#dialogue-management-coredialoguepy)
 *   [Graphical User Interface (`core/gui.py`)](#graphical-user-interface-coreguipy)
+
+---
+
+## Main Application Entry Point (`main.py`)
+
+### Overview
+The `main.py` script is the central and primary entry point for launching and managing the Sophia_Alpha2_ResonantBuild application. Its main responsibilities include:
+*   Parsing command-line arguments to allow user control over the application's behavior at startup.
+*   Ensuring the project's Python path is correctly set up for module resolution.
+*   Loading the main configuration from `config/config.py`.
+*   Overriding specific configurations (like `VERBOSE_OUTPUT`) based on CLI arguments.
+*   Ensuring that essential data and logging directories are present.
+*   Performing critical initializations, such as creating the shared `SpacetimeManifold` instance from `core.brain`.
+*   Determining and launching the appropriate user interface (Command-Line Interface or Graphical User Interface).
+
+### Key Functionality
+
+*   **Argument Parsing:**
+    `main.py` uses the `argparse` module to handle command-line arguments:
+    *   `--interface {cli,gui}`: Allows the user to explicitly choose between the Command-Line Interface (`cli`) or the Streamlit-based Graphical User Interface (`gui`). If not provided, the default behavior is determined by the `ENABLE_GUI` setting in `config.py`.
+    *   `--query "Your question here"`: If provided, `main.py` submits this single query to Sophia_Alpha2 via the CLI, prints the response, and then exits. This forces the interface to 'cli'.
+    *   `-v`, `--verbose`: Enables verbose logging output for the current session. This overrides the `VERBOSE_OUTPUT` setting in `config.py`.
+
+*   **Configuration Handling:**
+    *   The script robustly imports the `config` object from `config/config.py`. If this import fails, a fatal error is logged, and the application exits.
+    *   The `--verbose` CLI argument directly influences `config.VERBOSE_OUTPUT`, allowing runtime control over logging verbosity.
+
+*   **Path Setup:**
+    *   At startup, `main.py` modifies `sys.path` to include the project's root directory. This ensures that all modules (e.g., in `core` and `config`) can be imported correctly regardless of where the script is executed from.
+
+*   **Directory Initialization:**
+    *   Before launching any interface, `main.py` iterates through a list of essential directory paths defined in `config.py` (e.g., `DATA_DIR`, `LOG_DIR`, `PERSONA_DIR`). It calls `config.ensure_path()` for each to create them if they don't already exist, preventing runtime errors due to missing directories.
+
+*   **Centralized Manifold Initialization:**
+    *   `main.py` is responsible for the initial, centralized creation of the shared `SpacetimeManifold` instance by calling `core.brain.get_shared_manifold(force_recreate=True)`. This ensures that the brain is ready before any other part of the system attempts to use it.
+
+*   **Interface Launching:**
+    *   Based on the parsed arguments and the `ENABLE_GUI` setting in `config.py`, `main_logic` (a function within `main.py`) determines the `effective_interface`.
+    *   **GUI Mode:** If "gui" is selected and enabled, `core.gui.start_gui()` is called. If `start_gui()` fails (e.g., Streamlit not installed or other GUI-specific errors), `main.py` logs the error and attempts to fall back to CLI mode.
+    *   **CLI Mode:** If "cli" is selected (or as a fallback from GUI failure):
+        *   If a `--query` was provided, `core.dialogue.generate_response()` is called directly, and its output is printed.
+        *   Otherwise, the interactive `core.dialogue.dialogue_loop()` is initiated.
+
+### Usage Examples
+
+*   **Launch with default interface (GUI if enabled in config, else CLI):**
+    ```bash
+    python main.py
+    ```
+
+*   **Force Command-Line Interface:**
+    ```bash
+    python main.py --interface cli
+    ```
+
+*   **Force Graphical User Interface (Streamlit):**
+    ```bash
+    python main.py --interface gui
+    ```
+
+*   **Submit a single query and exit (CLI):**
+    ```bash
+    python main.py --query "What is the nature of consciousness?"
+    ```
+
+*   **Launch GUI with verbose output:**
+    ```bash
+    python main.py --interface gui --verbose
+    ```
+    or
+    ```bash
+    python main.py --interface gui -v
+    ```
+
+### Error Handling
+`main.py` includes top-level `try-except` blocks to catch critical errors during initialization (like config import failures) or during the execution of `main_logic`. These handlers print detailed error messages and tracebacks to `sys.stderr` and ensure the application exits with an appropriate status code, aiding in debugging startup issues.
 
 ---
 
@@ -322,9 +399,14 @@ The `core/gui.py` module provides a web-based Graphical User Interface (GUI) for
 ### Launching the GUI
 *   **Primary Method:** The GUI is launched by running the following command from the project's root directory:
     ```bash
+    python main.py --interface gui
+    ```
+    (Or simply `python main.py` if `ENABLE_GUI` is true in `config.py`).
+*   **Direct Streamlit Command (Alternative):**
+    ```bash
     streamlit run core/gui.py
     ```
-*   **Alternative (Future):** `main.py` might be updated in the future to provide an alternative launch command like `python main.py --gui`.
+    While this works, using `main.py` is preferred as it ensures all system initializations are performed.
 
 ### Session State (`st.session_state`)
 The GUI relies heavily on Streamlit's session state (`st.session_state`) to maintain information across user interactions and reruns. Key variables stored include:

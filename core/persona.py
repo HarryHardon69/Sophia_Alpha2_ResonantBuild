@@ -41,23 +41,20 @@ class Persona:
         a default state if loading fails).
         """
         # Default attributes that will be used if not overridden by config or loaded state.
-        default_name = "Sophia_Alpha2_Default"
-        self.name = default_name
-        self.mode = "reflective"  # e.g., reflective, learning, active_problem_solving
-        self.traits = ["CuriosityDriven", "EthicallyMinded", "ResonanceAware", "Developmental"]
+        default_name = getattr(config, 'DEFAULT_PERSONA_NAME', "Sophia_Alpha2_Default")
+        self.name = default_name # Will be overridden by config.PERSONA_NAME if available
+        self.mode = getattr(config, 'DEFAULT_PERSONA_MODE', "reflective")
+        self.traits = getattr(config, 'DEFAULT_PERSONA_TRAITS', ["CuriosityDriven", "EthicallyMinded", "ResonanceAware", "Developmental"])
         
-        # Awareness metrics - initialized with sensible defaults
-        # primary_concept_coord is (scaled_x, scaled_y, scaled_z, raw_t_intensity_0_to_1)
-        self.awareness = {
-            "curiosity": 0.5,
-            "context_stability": 0.5,
-            "self_evolution_rate": 0.0,
-            "coherence": 0.0,
-            "active_llm_fallback": False,
-            "primary_concept_coord": None
-        }
+        # Awareness metrics - initialized with sensible defaults from config or hardcoded fallbacks
+        default_awareness_metrics = getattr(config, 'DEFAULT_PERSONA_AWARENESS', {
+            "curiosity": 0.5, "context_stability": 0.5, "self_evolution_rate": 0.0,
+            "coherence": 0.0, "active_llm_fallback": False, "primary_concept_coord": None
+        })
+        self.awareness = default_awareness_metrics.copy()
 
-        default_profile_filename = "persona_profile_default.json"
+
+        default_profile_filename = getattr(config, 'DEFAULT_PERSONA_PROFILE_FILENAME', "persona_profile_default.json")
         # Fallback profile path determination
         try:
             module_dir = os.path.dirname(os.path.abspath(__file__))
@@ -168,19 +165,16 @@ class Persona:
         if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
             print(f"Info (Persona): Initializing default persona state for '{getattr(self, 'profile_path', 'N/A')}'.", file=sys.stderr)
 
-        default_name = "Sophia_Alpha2_Default_Reset"
-        self.name = getattr(config, 'PERSONA_NAME', default_name) if config else default_name
-        self.mode = "reflective"
-        self.traits = ["CuriosityDriven", "EthicallyMinded", "ResonanceAware", "Developmental"]
+        default_name_reset = getattr(config, 'DEFAULT_PERSONA_NAME_RESET', "Sophia_Alpha2_Default_Reset")
+        self.name = getattr(config, 'PERSONA_NAME', default_name_reset) if config else default_name_reset
+        self.mode = getattr(config, 'DEFAULT_PERSONA_MODE', "reflective")
+        self.traits = getattr(config, 'DEFAULT_PERSONA_TRAITS', ["CuriosityDriven", "EthicallyMinded", "ResonanceAware", "Developmental"])
         
-        self.awareness = { # Default awareness state
-            "curiosity": 0.5,
-            "context_stability": 0.5,
-            "self_evolution_rate": 0.0,
-            "coherence": 0.0,
-            "active_llm_fallback": False,
-            "primary_concept_coord": None 
-        }
+        default_awareness_metrics_reset = getattr(config, 'DEFAULT_PERSONA_AWARENESS', {
+            "curiosity": 0.5, "context_stability": 0.5, "self_evolution_rate": 0.0,
+            "coherence": 0.0, "active_llm_fallback": False, "primary_concept_coord": None
+        })
+        self.awareness = default_awareness_metrics_reset.copy()
         
         if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
             print(f"Info (Persona): Default state re-initialized. Name='{self.name}', Mode='{self.mode}'. Attempting save.", file=sys.stderr)
@@ -461,55 +455,96 @@ if __name__ == "__main__":
 
     # --- Test Utilities ---
     class TempConfigOverride:
-        def __init__(self, temp_configs_dict):
+        """
+        A context manager for temporarily overriding attributes in the global `config` module
+        or a mock `config` object if the global `config` is None.
+
+        This is useful for testing different configurations without permanently altering
+        the `config` object or needing to reload modules. It handles cases where the
+        global `config` might be None (e.g., during standalone module testing before
+        full application initialization).
+        """
+        def __init__(self, temp_configs_dict: dict):
+            """
+            Initializes the TempConfigOverride context manager.
+
+            Args:
+                temp_configs_dict (dict): A dictionary where keys are attribute names (str)
+                                          to be overridden in the `config` module, and values
+                                          are the temporary values for these attributes.
+            """
             self.temp_configs = temp_configs_dict
-            self.original_values = {}
-            self.config_module = config # Use the 'config' resolved at module level
+            self.original_values = {} # Stores original values of overridden attributes.
+            self.config_module_was_none = False # Flag if global `config` was initially None.
+            self.original_global_config = None # Stores the reference to the original global `config`.
 
         def __enter__(self):
-            if not self.config_module:
-                # Create a dummy config object if it's None (e.g., standalone without ..config)
-                class DummyConfig: pass
-                self.config_module = DummyConfig()
-                # If 'config' was None globally, set it to this dummy for the duration of the test
-                # This is tricky because 'config' is a global in Persona's scope.
-                # For simplicity, we'll rely on the tests passing this dummy config module
-                # to Persona instances if needed, or Persona handling config=None.
-                # The tests will primarily set attributes on this temporary config_module.
-                global config
-                self.original_global_config = config
-                config = self.config_module
-                # print("TempConfigOverride: Created dummy config module.", file=sys.stderr)
+            """
+            Sets up the temporary configuration overrides when entering the context.
 
+            If the global `config` is None, a temporary dummy `config` object is created
+            for the duration of the context. Original attribute values are stored, and
+            temporary values are set.
 
+            Returns:
+                The `config` object (either the original or the temporary dummy)
+                with overrides applied.
+            """
+            global config # Allow modification of the global 'config' variable.
+            self.original_global_config = config # Store the original global config.
+
+            current_config_module = config
+            if current_config_module is None: # If global 'config' is not loaded.
+                self.config_module_was_none = True
+                class DummyConfig: pass # Create a simple placeholder class.
+                current_config_module = DummyConfig() # Assign the dummy to be used in this context.
+                config = current_config_module # Update global 'config' to this dummy for the test's duration.
+            
+            # Apply temporary configurations.
             for key, value in self.temp_configs.items():
-                if hasattr(self.config_module, key):
-                    self.original_values[key] = getattr(self.config_module, key)
-                else:
-                    self.original_values[key] = "__ATTR_NOT_SET__" # Sentinel for attributes that didn't exist
-                setattr(self.config_module, key, value)
-            return self.config_module
+                if hasattr(current_config_module, key): # If attribute exists.
+                    self.original_values[key] = getattr(current_config_module, key)
+                else: # Attribute does not exist, will be added temporarily.
+                    self.original_values[key] = "__ATTR_NOT_SET__" # Sentinel.
+                setattr(current_config_module, key, value) # Set the temporary value.
+            return current_config_module # Return the modified config object.
 
         def __exit__(self, exc_type, exc_val, exc_tb):
-            if not self.config_module:
-                return
+            """
+            Restores the original configuration when exiting the context.
 
-            for key, original_value in self.original_values.items():
-                if original_value == "__ATTR_NOT_SET__":
-                    if hasattr(self.config_module, key):
-                        delattr(self.config_module, key)
-                else:
-                    setattr(self.config_module, key, original_value)
+            Reverts changes made to the `config` object, removing temporarily added
+            attributes or restoring original values. If a dummy `config` was used,
+            the global `config` is restored to its original state (e.g., None).
+            """
+            global config # Allow modification of the global 'config' variable.
             
-            if hasattr(self, 'original_global_config'): # Restore original global config if it was changed
-                global config
-                config = self.original_global_config
+            current_config_module_being_restored = config # The config object that was modified.
+
+            # Restore original attribute values.
+            for key, original_value in self.original_values.items():
+                if original_value == "__ATTR_NOT_SET__": # If attribute was temporarily added.
+                    if hasattr(current_config_module_being_restored, key):
+                        delattr(current_config_module_being_restored, key) # Remove it.
+                else: # Attribute existed before, restore its original value.
+                    setattr(current_config_module_being_restored, key, original_value)
+            
+            # Restore the original global 'config' object itself.
+            # This is crucial if `config` was temporarily replaced by a DummyConfig.
+            config = self.original_global_config
 
     TEST_PROFILE_FILENAME = "test_persona_profile.json"
     # Place test profile in the same directory as this script for simplicity
     TEST_PROFILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), TEST_PROFILE_FILENAME)
 
-    def delete_test_profile(profile_path=TEST_PROFILE_PATH):
+    def delete_test_profile(profile_path: str = TEST_PROFILE_PATH):
+        """
+        Deletes the specified test profile file if it exists.
+
+        Args:
+            profile_path (str, optional): The path to the test profile file.
+                                          Defaults to `TEST_PROFILE_PATH`.
+        """
         if os.path.exists(profile_path):
             try:
                 os.remove(profile_path)
@@ -518,7 +553,16 @@ if __name__ == "__main__":
 
     test_results = {"passed": 0, "failed": 0, "details": []}
 
-    def _run_test(test_func, *args):
+    def _run_test(test_func: callable, *args):
+        """
+        Wrapper function to execute a single test case.
+        Manages printing test status, accumulating results, and error handling.
+        Ensures test profile cleanup after each test.
+
+        Args:
+            test_func (callable): The test function to execute.
+            *args: Arguments to pass to the test function.
+        """
         test_name = test_func.__name__
         print(f"\n--- Running {test_name} ---")
         try:
@@ -526,33 +570,38 @@ if __name__ == "__main__":
             test_results["passed"] += 1
             test_results["details"].append(f"[PASS] {test_name}")
             print(f"[PASS] {test_name}")
-        except AssertionError as e:
+        except AssertionError as e_assert: # Catch assertion errors specifically.
             test_results["failed"] += 1
             error_info = traceback.format_exc()
-            test_results["details"].append(f"[FAIL] {test_name}: {e}\n{error_info}")
-            print(f"[FAIL] {test_name}: Assertion Error: {e}\n{error_info}", file=sys.stderr)
-        except Exception as e:
+            test_results["details"].append(f"[FAIL] {test_name}: AssertionError: {e_assert}\n{error_info}")
+            print(f"[FAIL] {test_name}: AssertionError: {e_assert}\n{error_info}", file=sys.stderr)
+        except Exception as e_general: # Catch any other exceptions.
             test_results["failed"] += 1
             error_info = traceback.format_exc()
-            test_results["details"].append(f"[FAIL] {test_name}: Exception: {e}\n{error_info}")
-            print(f"[FAIL] {test_name}: Exception: {e}\n{error_info}", file=sys.stderr)
+            test_results["details"].append(f"[FAIL] {test_name}: Exception: {e_general}\n{error_info}")
+            print(f"[FAIL] {test_name}: Exception: {e_general}\n{error_info}", file=sys.stderr)
         finally:
-            # Clean up profile after each test to ensure independence,
-            # unless a test specifically needs to persist it for a subsequent check by another test (not ideal).
-            # For these tests, cleanup is generally good.
-            delete_test_profile()
+            delete_test_profile() # Cleanup after each test.
 
 
     # --- Test Scenario Implementations ---
 
     def test_initialization():
+        """
+        Tests the `Persona` class initialization, including:
+        - Default attribute values.
+        - Loading of persona name from config.
+        - Correct structure of the initial `awareness` dictionary.
+        - Creation of the persona profile file upon initialization.
+        - Correct content of the `get_intro()` method for a new persona.
+        """
         test_persona_name = "TestSophia"
         with TempConfigOverride({"PERSONA_PROFILE_PATH": TEST_PROFILE_PATH, 
                                  "VERBOSE_OUTPUT": False, 
                                  "PERSONA_NAME": test_persona_name,
-                                 "ensure_path": lambda path: os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None}):
-            delete_test_profile()
-            persona = current_module_persona()
+                                 "ensure_path": lambda path: os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) and not os.path.exists(os.path.dirname(path)) else None}):
+            # `delete_test_profile()` is called by `_run_test`'s finally block.
+            persona = current_module_persona() # Initializes and should save a default profile.
 
             assert persona.name == test_persona_name, f"Name mismatch: expected {test_persona_name}, got {persona.name}"
             assert persona.mode == "reflective", "Default mode mismatch"
@@ -568,149 +617,181 @@ if __name__ == "__main__":
             assert "Focus Intensity (T):" not in intro, "Focus Intensity should not be in intro for new persona"
             assert test_persona_name in intro, "Persona name not in intro"
 
-            assert os.path.exists(TEST_PROFILE_PATH), "Persona profile file was not created"
+            assert os.path.exists(TEST_PROFILE_PATH), "Persona profile file was not created upon initialization"
             with open(TEST_PROFILE_PATH, 'r') as f:
                 saved_state = json.load(f)
-            assert saved_state["name"] == test_persona_name
-            assert saved_state["awareness"]["primary_concept_coord"] is None
+            assert saved_state["name"] == test_persona_name, "Saved name in profile mismatch"
+            assert saved_state["awareness"]["primary_concept_coord"] is None, "Saved PCC in profile mismatch"
 
     def test_update_awareness():
+        """
+        Tests the `update_awareness` method with various scenarios:
+        - Update with a full set of valid brain metrics.
+        - Update with a partial set of metrics.
+        - Handling of malformed `primary_concept_coord` from brain metrics.
+        - Handling of `primary_concept_coord` being explicitly set to None.
+        - Fallback logic for `raw_t_intensity` if not directly provided but inferable
+          from `primary_concept_coord[3]` (and validation of that inference).
+        """
         with TempConfigOverride({"PERSONA_PROFILE_PATH": TEST_PROFILE_PATH, 
-                                 "VERBOSE_OUTPUT": False, # Set to True for debugging this test
-                                 "ensure_path": lambda path: os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None}):
-            delete_test_profile()
+                                 "VERBOSE_OUTPUT": False, 
+                                 "ensure_path": lambda path: os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) and not os.path.exists(os.path.dirname(path)) else None}):
+            # `delete_test_profile()` is called by `_run_test`'s finally block.
             persona = current_module_persona()
 
-            # Scenario 1: Valid Full Metrics
+            # Scenario 1: Valid Full Metrics from brain.
             brain_metrics_valid = { 
                 "curiosity": 0.8, "coherence": 0.75, "active_llm_fallback": True, 
-                "primary_concept_coord": (1.0, 2.0, 3.0, 75.0), # Brain sends scaled T-coord
-                "raw_t_intensity": 0.75, 
+                "primary_concept_coord": (1.0, 2.0, 3.0, 75.0), # Brain might send scaled T-coord as 4th element
+                "raw_t_intensity": 0.75, # Explicit raw T-intensity (0-1) is preferred.
                 "context_stability": 0.85, "self_evolution_rate": 0.05 
             }
             persona.update_awareness(brain_metrics_valid)
+            # Persona stores (scaled_x, scaled_y, scaled_z, raw_t_intensity_0_to_1)
             assert persona.awareness["primary_concept_coord"] == (1.0, 2.0, 3.0, 0.75), f"PCC S1: {persona.awareness['primary_concept_coord']}"
             assert "Focus Intensity (T): 0.75" in persona.get_intro(), f"Intro S1: {persona.get_intro()}"
-            assert persona.awareness["curiosity"] == 0.8
-            assert persona.awareness["active_llm_fallback"] is True
+            assert persona.awareness["curiosity"] == 0.8, "S1 Curiosity"
+            assert persona.awareness["active_llm_fallback"] is True, "S1 LLM Fallback"
 
-            # Scenario 2: Partial Metrics
+            # Scenario 2: Partial Metrics update.
             persona.update_awareness({"curiosity": 0.9, "self_evolution_rate": 0.1})
-            assert persona.awareness["curiosity"] == 0.9, "Curiosity S2"
-            assert persona.awareness["self_evolution_rate"] == 0.1, "SER S2"
+            assert persona.awareness["curiosity"] == 0.9, "S2 Curiosity"
+            assert persona.awareness["self_evolution_rate"] == 0.1, "S2 SER"
+            # Previous valid primary_concept_coord should persist if not updated.
             assert persona.awareness["primary_concept_coord"] == (1.0, 2.0, 3.0, 0.75), "PCC S2 (should remain from S1)"
 
-            # Scenario 3: Malformed primary_concept_coord from Brain
-            original_pcc = persona.awareness['primary_concept_coord']
+            # Scenario 3: Malformed primary_concept_coord from Brain (e.g., wrong type).
+            original_pcc_s2 = persona.awareness['primary_concept_coord'] # Store before malformed update.
             persona.update_awareness({"primary_concept_coord": "not-a-tuple", "raw_t_intensity": "bad-type"})
-            assert persona.awareness['primary_concept_coord'] == original_pcc, "PCC S3 (should remain from S2)"
+            assert persona.awareness['primary_concept_coord'] == original_pcc_s2, "PCC S3 (should remain from S2 due to malformed input)"
 
-            # Scenario 4: primary_concept_coord is None from Brain
+            # Scenario 4: primary_concept_coord is explicitly None from Brain.
             persona.update_awareness({"primary_concept_coord": None, "raw_t_intensity": None})
-            assert persona.awareness['primary_concept_coord'] is None, "PCC S4 (should be None)"
-            assert "Focus Intensity (T):" not in persona.get_intro(), "Intro S4 (no T-intensity)"
+            assert persona.awareness['primary_concept_coord'] is None, "PCC S4 (should be None as per brain metrics)"
+            assert "Focus Intensity (T):" not in persona.get_intro(), "Intro S4 (no T-intensity as PCC is None)"
             
-            # Scenario 5: Missing raw_t_intensity, but scaled_coord[3] is valid 0-1 (heuristic fallback)
+            # Scenario 5: Missing 'raw_t_intensity', but brain's primary_concept_coord[3] is a valid raw T-intensity (0-1 range).
             persona.update_awareness({
-                "primary_concept_coord": (4.0, 5.0, 6.0, 0.88), # scaled_coord[3] is 0.88
-                # "raw_t_intensity": missing
+                "primary_concept_coord": (4.0, 5.0, 6.0, 0.88), # Assume brain's 4th element is raw T here.
+                # "raw_t_intensity": is missing from brain_metrics.
             })
             assert persona.awareness["primary_concept_coord"] == (4.0, 5.0, 6.0, 0.88), f"PCC S5: {persona.awareness['primary_concept_coord']}"
             assert "Focus Intensity (T): 0.88" in persona.get_intro(), f"Intro S5: {persona.get_intro()}"
 
-            # Scenario 6: Missing raw_t_intensity, and scaled_coord[3] is NOT valid 0-1 (heuristic fallback fails, T defaults to 0.0)
+            # Scenario 6: Missing 'raw_t_intensity', AND brain's primary_concept_coord[3] is NOT a valid raw T-intensity (e.g., still scaled).
+            # Persona should default raw T-intensity to 0.0 in this ambiguous case.
             persona.update_awareness({
-                "primary_concept_coord": (7.0, 8.0, 9.0, 88.0), # scaled_coord[3] is 88.0 (not 0-1)
-                 # "raw_t_intensity": missing
+                "primary_concept_coord": (7.0, 8.0, 9.0, 88.0), # Assume brain's 4th element is scaled (not 0-1).
+                 # "raw_t_intensity": is missing.
             })
             assert persona.awareness["primary_concept_coord"] == (7.0, 8.0, 9.0, 0.0), f"PCC S6: {persona.awareness['primary_concept_coord']}"
             assert "Focus Intensity (T): 0.00" in persona.get_intro(), f"Intro S6: {persona.get_intro()}"
 
 
     def test_save_load_cycle():
+        """
+        Tests the full cycle of saving a persona's state and then loading it
+        into a new persona instance. Verifies that all attributes, especially
+        the `awareness` dictionary and `primary_concept_coord` (with raw T-intensity),
+        are correctly persisted and restored.
+        """
         with TempConfigOverride({"PERSONA_PROFILE_PATH": TEST_PROFILE_PATH, 
                                  "VERBOSE_OUTPUT": False,
-                                 "ensure_path": lambda path: os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None}):
-            delete_test_profile()
+                                 "ensure_path": lambda path: os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) and not os.path.exists(os.path.dirname(path)) else None}):
+            # `delete_test_profile()` is called by `_run_test`'s finally block.
             persona1 = current_module_persona()
             
             metrics_to_save = { 
                 "curiosity": 0.66, 
-                "primary_concept_coord": (10.0, 20.0, 30.0, 99.0), # Scaled T-coord from brain
-                "raw_t_intensity": 0.99 # Raw T from brain
+                "primary_concept_coord": (10.0, 20.0, 30.0, 99.0), # Example scaled coord from brain
+                "raw_t_intensity": 0.99 # Explicit raw T-intensity
             }
-            persona1.update_awareness(metrics_to_save)
-            persona1_awareness = persona1.awareness.copy() # Shallow copy is fine for this flat dict
+            persona1.update_awareness(metrics_to_save) # This will also call save_state()
+            persona1_awareness_snapshot = persona1.awareness.copy() 
             
-            # persona1.save_state() is called by update_awareness if changed.
-            # Create a new persona instance, which should load from the saved profile.
+            # Create a new persona instance, which should load from the profile saved by persona1.
             persona2 = current_module_persona()
 
-            assert persona2.awareness == persona1_awareness, f"Awareness mismatch after load: P1: {persona1_awareness}, P2: {persona2.awareness}"
-            assert persona2.awareness['primary_concept_coord'] == (10.0, 20.0, 30.0, 0.99), f"PCC mismatch after load: {persona2.awareness['primary_concept_coord']}"
+            assert persona2.awareness == persona1_awareness_snapshot, \
+                f"Awareness mismatch after load: P1: {persona1_awareness_snapshot}, P2: {persona2.awareness}"
+            # Specifically check the reconstructed primary_concept_coord in persona2.
+            expected_pcc_after_load = (10.0, 20.0, 30.0, 0.99) # Scaled x,y,z + raw T
+            assert persona2.awareness['primary_concept_coord'] == expected_pcc_after_load, \
+                f"PCC mismatch after load. Expected: {expected_pcc_after_load}, Got: {persona2.awareness['primary_concept_coord']}"
             assert "Focus Intensity (T): 0.99" in persona2.get_intro(), f"Intro mismatch after load: {persona2.get_intro()}"
 
     def test_load_old_format_profile():
+        """
+        Tests loading a persona profile that might be in an older format
+        (e.g., missing some newer `awareness` fields like `primary_concept_coord`).
+        Ensures that missing fields are initialized to their defaults.
+        """
         with TempConfigOverride({"PERSONA_PROFILE_PATH": TEST_PROFILE_PATH,
                                  "VERBOSE_OUTPUT": False,
-                                 "ensure_path": lambda path: os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None}):
-            delete_test_profile()
-            # Manually write an old format profile (missing some awareness fields, esp. primary_concept_coord)
-            old_profile_data = {"name": "OldSophia", "mode": "archaic", "traits": ["Classic"], "awareness": {"curiosity": 0.1, "coherence": 0.2}}
+                                 "ensure_path": lambda path: os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) and not os.path.exists(os.path.dirname(path)) else None}):
+            # Manually write an old format profile.
+            old_profile_data = {
+                "name": "OldSophia", "mode": "archaic", "traits": ["Classic"], 
+                "awareness": {"curiosity": 0.1, "coherence": 0.2} # Missing primary_concept_coord, etc.
+            }
             with open(TEST_PROFILE_PATH, 'w') as f:
                 json.dump(old_profile_data, f)
             
-            persona = current_module_persona()
+            persona = current_module_persona() # Load from the manually created old profile.
             
             assert persona.name == "OldSophia", "Name from old profile"
             assert persona.mode == "archaic", "Mode from old profile"
             assert persona.traits == ["Classic"], "Traits from old profile"
             assert persona.awareness['curiosity'] == 0.1, "Curiosity from old profile"
             assert persona.awareness['coherence'] == 0.2, "Coherence from old profile"
-            # Fields not in old profile should have defaults
-            assert persona.awareness['primary_concept_coord'] is None, "PCC from old profile (should be None)"
-            assert persona.awareness['context_stability'] == 0.5, "Context stability default" # Assuming 0.5 is default
-            assert "Focus Intensity (T):" not in persona.get_intro(), "Intro from old profile"
+            # Check that fields not present in the old profile are set to defaults.
+            assert persona.awareness['primary_concept_coord'] is None, "PCC from old profile (should be default None)"
+            assert persona.awareness['context_stability'] == 0.5, "Context stability (should be default)"
+            assert "Focus Intensity (T):" not in persona.get_intro(), "Intro from old profile (should not have T-intensity)"
 
     def test_load_malformed_profile():
+        """
+        Tests loading various types of malformed persona profiles:
+        - Empty profile file.
+        - File with invalid JSON.
+        - File with valid JSON but malformed `primary_concept_coord` (e.g., wrong length, non-numeric elements).
+        Ensures that the persona initializes to a default state in these cases.
+        """
         with TempConfigOverride({"PERSONA_PROFILE_PATH": TEST_PROFILE_PATH,
                                  "VERBOSE_OUTPUT": False,
-                                 "ensure_path": lambda path: os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None}):
-            default_persona_name = "Sophia_Alpha2_Default_Reset" # Name after _initialize_default_state_and_save
+                                 "ensure_path": lambda path: os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) and not os.path.exists(os.path.dirname(path)) else None}):
+            default_persona_name_after_reset = "Sophia_Alpha2_Default_Reset" 
             
-            # Scenario 1: Empty File
-            delete_test_profile()
-            with open(TEST_PROFILE_PATH, 'w') as f:
-                f.write("") # Create empty file
+            # Scenario 1: Empty File.
+            with open(TEST_PROFILE_PATH, 'w') as f: f.write("") 
             persona_empty = current_module_persona()
-            assert persona_empty.name == default_persona_name, f"Empty file: Name {persona_empty.name}"
-            assert persona_empty.awareness["primary_concept_coord"] is None, "Empty file: PCC"
+            assert persona_empty.name == default_persona_name_after_reset, f"Empty file: Name {persona_empty.name}"
+            assert persona_empty.awareness["primary_concept_coord"] is None, "Empty file: PCC should be None"
 
-            # Scenario 2: Invalid JSON
-            delete_test_profile()
-            with open(TEST_PROFILE_PATH, 'w') as f:
-                f.write("{invalid_json: ")
+            # Scenario 2: Invalid JSON.
+            delete_test_profile() # Clean before next sub-test.
+            with open(TEST_PROFILE_PATH, 'w') as f: f.write("{invalid_json: ")
             persona_invalid_json = current_module_persona()
-            assert persona_invalid_json.name == default_persona_name, f"Invalid JSON: Name {persona_invalid_json.name}"
-            assert persona_invalid_json.awareness["primary_concept_coord"] is None, "Invalid JSON: PCC"
+            assert persona_invalid_json.name == default_persona_name_after_reset, f"Invalid JSON: Name {persona_invalid_json.name}"
+            assert persona_invalid_json.awareness["primary_concept_coord"] is None, "Invalid JSON: PCC should be None"
 
-            # Scenario 3: Malformed primary_concept_coord in File (e.g., wrong length)
+            # Scenario 3: Malformed primary_concept_coord (wrong length).
             delete_test_profile()
-            malformed_pcc_profile = {"name": "TestPCC", "awareness": {"primary_concept_coord": [1, 2, 3]}} # List of 3, not 4
-            with open(TEST_PROFILE_PATH, 'w') as f:
-                json.dump(malformed_pcc_profile, f)
-            persona_malformed_pcc = current_module_persona()
-            assert persona_malformed_pcc.name == "TestPCC", f"Malformed PCC file: Name {persona_malformed_pcc.name}"
-            assert persona_malformed_pcc.awareness["primary_concept_coord"] is None, f"Malformed PCC file: PCC should be None, got {persona_malformed_pcc.awareness['primary_concept_coord']}"
+            malformed_pcc_profile_len = {"name": "TestPCC_Len", "awareness": {"primary_concept_coord": [1, 2, 3]}}
+            with open(TEST_PROFILE_PATH, 'w') as f: json.dump(malformed_pcc_profile_len, f)
+            persona_malformed_pcc_len = current_module_persona()
+            assert persona_malformed_pcc_len.name == "TestPCC_Len", f"Malformed PCC (len): Name {persona_malformed_pcc_len.name}"
+            assert persona_malformed_pcc_len.awareness["primary_concept_coord"] is None, \
+                f"Malformed PCC (len): PCC should be None, got {persona_malformed_pcc_len.awareness['primary_concept_coord']}"
 
-            # Scenario 4: Malformed primary_concept_coord in File (e.g., non-numeric)
+            # Scenario 4: Malformed primary_concept_coord (non-numeric elements).
             delete_test_profile()
-            malformed_pcc_profile_non_numeric = {"name": "TestPCC2", "awareness": {"primary_concept_coord": [1, 2, 3, "not-a-number"]}}
-            with open(TEST_PROFILE_PATH, 'w') as f:
-                json.dump(malformed_pcc_profile_non_numeric, f)
-            persona_malformed_pcc_nn = current_module_persona()
-            assert persona_malformed_pcc_nn.name == "TestPCC2"
-            assert persona_malformed_pcc_nn.awareness["primary_concept_coord"] is None, f"Malformed PCC (non-numeric) file: PCC should be None, got {persona_malformed_pcc_nn.awareness['primary_concept_coord']}"
+            malformed_pcc_profile_type = {"name": "TestPCC_Type", "awareness": {"primary_concept_coord": [1, 2, 3, "not-a-number"]}}
+            with open(TEST_PROFILE_PATH, 'w') as f: json.dump(malformed_pcc_profile_type, f)
+            persona_malformed_pcc_type = current_module_persona()
+            assert persona_malformed_pcc_type.name == "TestPCC_Type", f"Malformed PCC (type): Name {persona_malformed_pcc_type.name}"
+            assert persona_malformed_pcc_type.awareness["primary_concept_coord"] is None, \
+                f"Malformed PCC (type): PCC should be None, got {persona_malformed_pcc_type.awareness['primary_concept_coord']}"
 
 
     # --- Test Runner ---

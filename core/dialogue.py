@@ -282,13 +282,14 @@ def generate_response(user_input: str, stream_thought_steps: bool = False) -> tu
 
     # Initialize default awareness metrics and thought log.
     # These will be updated by results from brain, ethics, etc.
-    awareness_metrics = {
+    awareness_metrics = getattr(config, 'DEFAULT_AWARENESS_METRICS_DIALOGUE', {
         "curiosity": 0.1, "context_stability": 0.3, "self_evolution_rate": 0.0,
-        "coherence": 0.0, "active_llm_fallback": True, # Assume LLM fallback initially.
+        "coherence": 0.0, "active_llm_fallback": True,
         "primary_concept_coord": None, "raw_t_intensity": 0.0, "snn_error": None
-    }
+    }).copy() # Use .copy() to prevent modification of the global default dict
+
     thought_steps: list[str] = ["Dialogue Manager: Initializing response sequence."]
-    brain_response_text = "System did not generate a specific response due to an internal processing issue." # Default brain response.
+    brain_response_text = getattr(config, 'DEFAULT_DIALOGUE_ERROR_BRAIN_RESPONSE', "System did not generate a specific response due to an internal processing issue.")
 
     # Step 2: Process input with the brain's `think` method.
     try:
@@ -328,10 +329,12 @@ def generate_response(user_input: str, stream_thought_steps: bool = False) -> tu
         thought_steps.append(f"Dialogue Manager: Error updating persona awareness: {str(e_persona_update_awareness)}")
 
     # Step 4: Calculate ethical score for the current context.
-    ethical_score_value = 0.5 # Default neutral ethical score.
+    ethical_score_value = getattr(config, 'DEFAULT_DIALOGUE_ETHICAL_SCORE_FALLBACK', 0.5)
     # Determine summary for ethics: use user input if LLM fallback, else brain's response.
-    summary_text_for_ethics = summarize_text(user_input if awareness_metrics.get("active_llm_fallback") else brain_response_text, 100)
-    action_text_for_ethics = summarize_text(brain_response_text, 200) # Brain's response as the "action".
+    summary_len_short = getattr(config, 'DIALOGUE_SUMMARY_LENGTH_SHORT', 100)
+    summary_len_action = getattr(config, 'DIALOGUE_SUMMARY_LENGTH_ACTION', 200)
+    summary_text_for_ethics = summarize_text(user_input if awareness_metrics.get("active_llm_fallback") else brain_response_text, summary_len_short)
+    action_text_for_ethics = summarize_text(brain_response_text, summary_len_action) # Brain's response as the "action".
     try:
         if _ETHICS_SCORE_ETHICS_AVAILABLE: # Check if `score_ethics` function is available.
             calculated_score = score_ethics(awareness_metrics, concept_summary=summary_text_for_ethics, action_description=action_text_for_ethics)
@@ -350,12 +353,17 @@ def generate_response(user_input: str, stream_thought_steps: bool = False) -> tu
             primary_coord_for_memory = awareness_metrics.get("primary_concept_coord")
             # Store memory only if valid coordinates are available (from SNN processing).
             if _IS_VALID_COORDINATE_AVAILABLE and is_valid_coordinate(primary_coord_for_memory):
-                concept_name_for_memory_storage = summarize_text(user_input, 30).replace("...", "").strip() or "interaction_summary"
+                concept_name_max_len = getattr(config, 'MAX_CONCEPT_NAME_FOR_MEMORY_LEN', 30)
+                default_concept_name = getattr(config, 'DEFAULT_MEMORY_CONCEPT_NAME', "interaction_summary")
+                concept_name_for_memory_storage = summarize_text(user_input, concept_name_max_len).replace("...", "").strip() or default_concept_name
+                
                 intensity_for_memory_storage = awareness_metrics.get("raw_t_intensity", 0.0) # Raw T-intensity (0-1).
+                
+                memory_summary_max_len = getattr(config, 'MAX_MEMORY_SUMMARY_LEN', 200)
                 # Prepare data packet for memory storage.
                 memory_data_packet = {
                     "concept_name": concept_name_for_memory_storage, "concept_coord": primary_coord_for_memory,
-                    "summary": summarize_text(f"User: {user_input} | Sophia: {brain_response_text}", 200), # Interaction summary.
+                    "summary": summarize_text(f"User: {user_input} | Sophia: {brain_response_text}", memory_summary_max_len), # Interaction summary.
                     "intensity": float(intensity_for_memory_storage) if isinstance(intensity_for_memory_storage, (int,float)) else 0.0,
                     "ethical_alignment": ethical_score_value, # Store with calculated ethical score.
                 }
@@ -546,32 +554,79 @@ if __name__ == "__main__":
 
     # --- Test Utilities ---
     class TempConfigOverride:
-        def __init__(self, temp_configs_dict):
+        """
+        A context manager for temporarily overriding attributes in the global `config` module
+        or a mock `config` object if the global `config` is None.
+
+        This is useful for testing different configurations without permanently altering
+        the `config` object or needing to reload modules. It handles cases where the
+        global `config` might be None (e.g., during standalone module testing before
+        full application initialization).
+        """
+        def __init__(self, temp_configs_dict: dict):
+            """
+            Initializes the TempConfigOverride context manager.
+
+            Args:
+                temp_configs_dict (dict): A dictionary where keys are attribute names (str)
+                                          to be overridden in the `config` module, and values
+                                          are the temporary values for these attributes.
+            """
             self.temp_configs = temp_configs_dict
-            self.original_values = {}
-            self.config_module_was_none = False
-            self.original_global_config = None
+            self.original_values = {} # Stores original values of overridden attributes.
+            self.config_module_was_none = False # Flag if global `config` was initially None.
+            self.original_global_config = None # Stores the reference to the original global `config`.
 
         def __enter__(self):
-            global config 
-            self.original_global_config = config 
-            if config is None:
+            """
+            Sets up the temporary configuration overrides when entering the context.
+
+            If the global `config` is None, a temporary dummy `config` object is created
+            for the duration of the context. Original attribute values are stored, and
+            temporary values are set.
+
+            Returns:
+                The `config` object (either the original or the temporary dummy)
+                with overrides applied.
+            """
+            global config # Allow modification of the global 'config' variable.
+            self.original_global_config = config # Store the original global config.
+
+            if config is None: # If global 'config' is not loaded.
                 self.config_module_was_none = True
-                class DummyConfig: pass
-                config = DummyConfig()
+                class DummyConfig: pass # Create a simple placeholder class.
+                config = DummyConfig() # Assign the dummy to the global 'config'.
+            
+            # Apply temporary configurations.
             for key, value in self.temp_configs.items():
-                if hasattr(config, key): self.original_values[key] = getattr(config, key)
-                else: self.original_values[key] = "__ATTR_NOT_SET__"
-                setattr(config, key, value)
-            return config
+                if hasattr(config, key): # If attribute exists.
+                    self.original_values[key] = getattr(config, key)
+                else: # Attribute does not exist, will be added temporarily.
+                    self.original_values[key] = "__ATTR_NOT_SET__" # Sentinel.
+                setattr(config, key, value) # Set the temporary value.
+            return config # Return the modified config object.
 
         def __exit__(self, exc_type, exc_val, exc_tb):
-            global config 
-            current_config_module = config 
+            """
+            Restores the original configuration when exiting the context.
+
+            Reverts changes made to the `config` object, removing temporarily added
+            attributes or restoring original values. If a dummy `config` was used,
+            the global `config` is restored to its original state (e.g., None).
+            """
+            global config # Allow modification of the global 'config' variable.
+            
+            current_config_module_being_restored = config # The config object that was modified.
+
+            # Restore original attribute values.
             for key, original_value in self.original_values.items():
-                if original_value == "__ATTR_NOT_SET__":
-                    if hasattr(current_config_module, key): delattr(current_config_module, key)
-                else: setattr(current_config_module, key, original_value)
+                if original_value == "__ATTR_NOT_SET__": # If attribute was temporarily added.
+                    if hasattr(current_config_module_being_restored, key):
+                        delattr(current_config_module_being_restored, key) # Remove it.
+                else: # Attribute existed before, restore its original value.
+                    setattr(current_config_module_being_restored, key, original_value)
+            
+            # Restore the original global 'config' object itself.
             config = self.original_global_config
 
     TEST_DIALOGUE_SYSTEM_LOG = "test_dialogue_system_log.txt"
@@ -582,52 +637,98 @@ if __name__ == "__main__":
     TEST_LIBRARY_LOG = "test_dialogue_library_log.json"
 
     def delete_test_files():
-        files_to_delete = [TEST_DIALOGUE_SYSTEM_LOG, TEST_PERSONA_PROFILE, TEST_ETHICS_DB, TEST_MEMORY_KG, TEST_LIBRARY_LOG]
+        """
+        Deletes predefined test files created during test execution.
+        This helps ensure a clean state for subsequent test runs.
+        Prints warnings if deletion fails.
+        """
+        files_to_delete = [
+            TEST_DIALOGUE_SYSTEM_LOG, TEST_PERSONA_PROFILE, 
+            TEST_ETHICS_DB, TEST_MEMORY_KG, TEST_LIBRARY_LOG
+        ]
         for f_path in files_to_delete:
             if os.path.exists(f_path):
-                try: os.remove(f_path)
-                except OSError as e: print(f"Warning: Could not delete test file {f_path}: {e}", file=sys.stderr)
+                try:
+                    os.remove(f_path)
+                except OSError as e:
+                    print(f"Warning: Could not delete test file {f_path}: {e}", file=sys.stderr)
 
-    def setup_test_environment(test_specific_configs=None):
-        global _dialogue_persona_instance, KNOWLEDGE_LIBRARY # For library module direct access in debug
-        if _LIBRARY_AVAILABLE and library_module: # Reset library's KNOWLEDGE_LIBRARY if library module was imported
-             library_module.KNOWLEDGE_LIBRARY = {}
+    def setup_test_environment(test_specific_configs: dict = None) -> TempConfigOverride:
+        """
+        Prepares the testing environment for dialogue module tests.
+
+        This involves:
+        1.  Resetting global states of imported modules (KNOWLEDGE_LIBRARY, _knowledge_graph,
+            _ethics_db, _dialogue_persona_instance) to ensure test isolation.
+        2.  Deleting any existing test files (logs, DBs, profiles) created from previous runs.
+        3.  Constructing a configuration dictionary for `TempConfigOverride`, including
+            paths to test-specific files and default test settings.
+
+        Args:
+            test_specific_configs (dict, optional): A dictionary of configuration settings
+                                                    specific to the current test, which will
+                                                    override or augment the base test configs.
+                                                    Defaults to None.
+
+        Returns:
+            TempConfigOverride: An instance of the context manager initialized with the
+                                combined test configurations.
+        """
+        global _dialogue_persona_instance # Allow modification of the shared persona instance.
+        
+        # Reset relevant states in imported modules to ensure test isolation.
+        # This is a simplified approach; a more robust test framework might handle
+        # module reloading or more granular fixture management.
+        if _LIBRARY_AVAILABLE and library_module: 
+             library_module.KNOWLEDGE_LIBRARY = {} # Reset in-memory library.
              library_module._library_dirty_flag = False
         
-        # Reset other relevant singletons or module-level states if necessary
-        # (e.g., memory._knowledge_graph, ethics._ethics_db if they are directly manipulated)
-        # This is a simplified approach; a full framework would manage this more cleanly.
-        if _MEMORY_MODULE_AVAILABLE and memory_module: memory_module._knowledge_graph = {"nodes": [], "edges": []}
-        if _ETHICS_MODULE_AVAILABLE and ethics_module: ethics_module._ethics_db = {}
+        if _MEMORY_MODULE_AVAILABLE and memory_module:
+            memory_module._knowledge_graph = {"nodes": [], "edges": []} # Reset in-memory graph.
+        
+        if _ETHICS_MODULE_AVAILABLE and ethics_module:
+            ethics_module._ethics_db = {} # Reset in-memory ethics database.
+        
+        delete_test_files() # Clear out any files from previous test runs.
+        _dialogue_persona_instance = None # Reset the shared persona instance for the dialogue module.
 
-
-        delete_test_files()
-        _dialogue_persona_instance = None # Reset shared persona instance for dialogue tests
-
+        # Define base configurations for testing.
         base_test_configs = {
             "SYSTEM_LOG_PATH": TEST_DIALOGUE_SYSTEM_LOG,
             "PERSONA_PROFILE_PATH": TEST_PERSONA_PROFILE,
-            "ETHICS_DB_PATH": TEST_ETHICS_DB, # Assuming ethics module uses this
-            "KNOWLEDGE_GRAPH_PATH": TEST_MEMORY_KG, # Assuming memory module uses this
-            "LIBRARY_LOG_PATH": TEST_LIBRARY_LOG, # Assuming library module uses this
-            "VERBOSE_OUTPUT": False,
-            "LOG_LEVEL": "debug", 
-            "MITIGATION_ETHICAL_THRESHOLD": 0.4, # Example for testing
-            "ETHICAL_ALIGNMENT_THRESHOLD": 0.6, # Example for testing
-            "REQUIRE_PUBLIC_STORAGE_CONSENT": False, # Simplify tests by default
-            "ensure_path": lambda path_to_ensure: os.makedirs(os.path.dirname(path_to_ensure), exist_ok=True) if os.path.dirname(path_to_ensure) else None,
+            "ETHICS_DB_PATH": TEST_ETHICS_DB, 
+            "KNOWLEDGE_GRAPH_PATH": TEST_MEMORY_KG, 
+            "LIBRARY_LOG_PATH": TEST_LIBRARY_LOG, 
+            "VERBOSE_OUTPUT": False, # Keep tests quieter by default.
+            "LOG_LEVEL": "debug",    # Capture detailed logs during tests.
+            "MITIGATION_ETHICAL_THRESHOLD": 0.4, # Example threshold for testing.
+            "ETHICAL_ALIGNMENT_THRESHOLD": 0.6,  # Example threshold for testing.
+            "REQUIRE_PUBLIC_STORAGE_CONSENT": False, # Simplify tests by disabling consent by default.
+            # Mock implementation of ensure_path for config, as the real one might depend on project structure.
+            "ensure_path": lambda path_to_ensure: os.makedirs(os.path.dirname(path_to_ensure), exist_ok=True) if os.path.dirname(path_to_ensure) and not os.path.exists(os.path.dirname(path_to_ensure)) else None,
         }
-        if test_specific_configs: base_test_configs.update(test_specific_configs)
+        # Merge with any test-specific configurations provided.
+        if test_specific_configs:
+            base_test_configs.update(test_specific_configs)
+        
         return TempConfigOverride(base_test_configs)
 
     class TestDialogueModule(unittest.TestCase):
+        """
+        Unit tests for the core.dialogue module.
+        Uses unittest.mock to isolate dependencies and simulate various scenarios.
+        """
         def setUp(self):
-            # This ensures that for each test method, we have a clean environment.
-            # The TempConfigOverride is applied per test method using `with`.
-            # Resetting the persona instance ensures each test starts fresh.
+            """
+            Sets up the test environment before each test method.
+            This involves resetting the shared dialogue persona instance and cleaning
+            up any test files that might have been created.
+            The `TempConfigOverride` is applied within each test method using a `with` statement
+            to ensure configuration changes are scoped to that specific test.
+            """
             global _dialogue_persona_instance
-            _dialogue_persona_instance = None 
-            delete_test_files() # Clean files before each test method too
+            _dialogue_persona_instance = None # Ensure a fresh persona state for each test.
+            delete_test_files() # Clean test files before each test.
 
         @mock.patch('core.dialogue.track_trends')
         @mock.patch('core.dialogue.Mitigator')
@@ -636,8 +737,12 @@ if __name__ == "__main__":
         @mock.patch('core.dialogue.Persona') 
         @mock.patch('core.dialogue.think')
         def test_generate_response_snn_success_high_ethics(self, mock_think, MockPersonaClass, mock_score_ethics, mock_store_memory, MockMitigatorClass, mock_track_trends):
-            test_configs = setup_test_environment()
-            with test_configs as current_config:
+            """
+            Tests `generate_response` for a successful SNN processing path with high ethical score.
+            Ensures no mitigation is applied and all components (think, persona, ethics, memory) are called.
+            """
+            test_configs_context = setup_test_environment() # Get the context manager instance.
+            with test_configs_context as current_config: # Enter the context.
                 # Configure Persona mock
                 mock_persona_instance = MockPersonaClass.return_value
                 mock_persona_instance.name = "TestSophia"
@@ -669,12 +774,16 @@ if __name__ == "__main__":
         @mock.patch('core.dialogue.Persona')
         @mock.patch('core.dialogue.think')
         def test_generate_response_ethical_caution(self, mock_think, MockPersonaClass, mock_score_ethics, mock_store_memory, MockMitigatorClass, mock_track_trends):
-            test_configs = setup_test_environment({"ETHICAL_ALIGNMENT_THRESHOLD": 0.6, "MITIGATION_ETHICAL_THRESHOLD": 0.3}) # Ensure threshold allows caution
-            with test_configs as current_config:
+            """
+            Tests `generate_response` when the ethical score falls into the "caution" range.
+            Ensures the response is prefixed with "[CAUTION]" and no stricter mitigation is applied.
+            """
+            test_configs_context = setup_test_environment({"ETHICAL_ALIGNMENT_THRESHOLD": 0.6, "MITIGATION_ETHICAL_THRESHOLD": 0.3}) # Ensure threshold allows caution
+            with test_configs_context as current_config:
                 mock_persona_instance = MockPersonaClass.return_value
                 mock_persona_instance.name="TestSophia"; mock_persona_instance.mode="TestMode"
                 mock_think.return_value = ([], "Ethical caution response", {"active_llm_fallback": False})
-                mock_score_ethics.return_value = 0.5 # Caution range (between 0.3 and 0.6)
+                mock_score_ethics.return_value = 0.5 # Caution range (between 0.3 and 0.6 for this test's config)
                 
                 response, _, _ = generate_response("caution input")
                 self.assertIn("[CAUTION]", response)
@@ -687,8 +796,12 @@ if __name__ == "__main__":
         @mock.patch('core.dialogue.Persona')
         @mock.patch('core.dialogue.think')
         def test_generate_response_ethical_mitigation(self, mock_think, MockPersonaClass, mock_score_ethics, mock_store_memory, MockMitigatorClass, mock_track_trends):
-            test_configs = setup_test_environment({"MITIGATION_ETHICAL_THRESHOLD": 0.4}) # Ensure mitigation triggers
-            with test_configs as current_config:
+            """
+            Tests `generate_response` when the ethical score is low enough to trigger content mitigation.
+            Ensures the Mitigator is called and the response indicates mitigation.
+            """
+            test_configs_context = setup_test_environment({"MITIGATION_ETHICAL_THRESHOLD": 0.4}) # Ensure mitigation triggers
+            with test_configs_context as current_config:
                 mock_persona_instance = MockPersonaClass.return_value
                 mock_persona_instance.name="TestSophia"; mock_persona_instance.mode="TestMode"
                 mock_mitigator_instance = MockMitigatorClass.return_value
@@ -703,8 +816,12 @@ if __name__ == "__main__":
         @mock.patch('core.dialogue.Persona')
         @mock.patch('core.dialogue.think')
         def test_generate_response_brain_error(self, mock_think, MockPersonaClass):
-            test_configs = setup_test_environment()
-            with test_configs:
+            """
+            Tests `generate_response` when the `think` function raises an exception.
+            Ensures an error message is returned, LLM fallback is indicated, and the error is logged in awareness.
+            """
+            test_configs_context = setup_test_environment()
+            with test_configs_context:
                 mock_persona_instance = MockPersonaClass.return_value
                 mock_persona_instance.name="TestSophia"; mock_persona_instance.mode="TestMode"
                 mock_think.side_effect = Exception("Simulated brain error")
@@ -713,61 +830,74 @@ if __name__ == "__main__":
                 self.assertIn("My apologies, I encountered an issue", response)
                 self.assertTrue(awareness['active_llm_fallback'])
                 self.assertEqual(awareness['snn_error'], "Simulated brain error")
-                mock_persona_instance.update_awareness.assert_called_once() # Still called
+                mock_persona_instance.update_awareness.assert_called_once() # Still called to update with error state
 
         @mock.patch('core.dialogue.get_dialogue_persona')
         def test_generate_response_persona_unavailable(self, mock_get_persona):
-            test_configs = setup_test_environment()
-            with test_configs:
-                mock_get_persona.return_value = None
-                response, _, _ = generate_response("any input")
-                self.assertIn("Error: Persona module not available", response)
+            """
+            Tests `generate_response` when the persona instance cannot be retrieved.
+            Ensures a critical error message is returned.
+            """
+            test_configs_context = setup_test_environment()
+            with test_configs_context:
+                mock_get_persona.return_value = None # Simulate persona being unavailable
+                response, _, awareness = generate_response("any input")
+                self.assertIn("Error: System persona is currently unavailable.", response)
+                self.assertIn("Persona unavailable", awareness.get("error", ""))
+
 
         @mock.patch('builtins.input')
         @mock.patch('core.dialogue.generate_response') 
         def test_dialogue_loop_commands(self, mock_generate_response, mock_input):
-            # Capture print output
+            """
+            Tests the `dialogue_loop` function's command handling capabilities.
+            Simulates user input for commands like '!stream', '!persona', '!help',
+            and verifies the expected output or behavior. Also tests regular input
+            dispatching to `generate_response`.
+            """
+            # Capture print output to check console messages.
             captured_output = io.StringIO()
-            sys.stdout = captured_output # Redirect stdout
+            sys.stdout = captured_output # Redirect stdout to the StringIO buffer.
             
-            test_configs = setup_test_environment({"VERBOSE_OUTPUT": False}) # For predictable !stream toggle
-            with test_configs:
-                # Mock persona for the loop
+            test_configs_context = setup_test_environment({"VERBOSE_OUTPUT": False}) # For predictable !stream toggle.
+            with test_configs_context:
+                # Mock persona for the loop to avoid dependency on actual Persona state.
                 mock_persona_for_loop = mock.MagicMock(spec=Persona)
                 mock_persona_for_loop.name = "LoopSophia"
                 mock_persona_for_loop.mode = "LoopMode"
                 mock_persona_for_loop.awareness = {"curiosity": 0.1, "coherence": 0.2}
                 mock_persona_for_loop.get_intro.return_value = "LoopSophia Intro"
 
+                # Patch get_dialogue_persona to return our mock.
                 with mock.patch('core.dialogue.get_dialogue_persona', return_value=mock_persona_for_loop):
-                    # Test !stream
+                    # Test !stream command (toggles twice).
                     mock_input.side_effect = ["!stream", "!stream", "quit"]
                     dialogue_loop()
                     output = captured_output.getvalue()
                     self.assertIn("Thought Streaming: ON", output)
-                    self.assertIn("Thought Streaming: OFF", output) # Toggled back
+                    self.assertIn("Thought Streaming: OFF", output) # Toggled back.
 
-                    # Test !persona
-                    captured_output.truncate(0); captured_output.seek(0) # Clear buffer
+                    # Test !persona command.
+                    captured_output.truncate(0); captured_output.seek(0) # Clear buffer for next check.
                     mock_input.side_effect = ["!persona", "quit"]
                     dialogue_loop()
                     self.assertIn("LoopSophia Intro", captured_output.getvalue())
                     
-                    # Test !help
+                    # Test !help command.
                     captured_output.truncate(0); captured_output.seek(0)
                     mock_input.side_effect = ["!help", "quit"]
                     dialogue_loop()
                     self.assertIn("Available Commands:", captured_output.getvalue())
 
-                    # Test regular input calls generate_response
+                    # Test regular input calls generate_response.
                     captured_output.truncate(0); captured_output.seek(0)
                     mock_generate_response.return_value = ("Mocked response", ["mock thought"], {})
                     mock_input.side_effect = ["hello sophia", "quit"]
-                    dialogue_loop(enable_streaming_thoughts=False) # Test with streaming off initially
+                    dialogue_loop(enable_streaming_thoughts=False) # Test with streaming off initially.
                     mock_generate_response.assert_called_with("hello sophia", stream_thought_steps=False)
                     self.assertIn("Mocked response", captured_output.getvalue())
             
-            sys.stdout = sys.__stdout__ # Restore stdout
+            sys.stdout = sys.__stdout__ # Restore stdout to its original stream.
 
     # --- Test Runner Logic ---
     print("Starting Dialogue Module Self-Tests...")

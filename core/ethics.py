@@ -256,41 +256,73 @@ def score_ethics(awareness_metrics: dict, concept_summary: str = "", action_desc
     # --- Component 1: Coherence Score ---
     # Coherence from awareness_metrics is typically -1 to 1.
     # This component score maps it to 0-1, where 1 means high coherence (abs(coherence_val) is low).
-    coherence_val = float(awareness_metrics.get("coherence", 0.0)) 
+    try:
+        coherence_val = float(awareness_metrics.get("coherence", 0.0))
+    except (ValueError, TypeError) as e:
+        _log_ethics_event("score_ethics_param_error", {"parameter": "coherence", "value": awareness_metrics.get("coherence"), "error": str(e)}, level="warning")
+        coherence_val = 0.0 # Default to neutral coherence
     scores["coherence"] = np.clip(1.0 - abs(coherence_val), 0.0, 1.0) # Closer to 0 coherence_val = higher score
-    weights["coherence"] = float(getattr(config, 'ETHICS_COHERENCE_WEIGHT', 0.2)) # Weight from config.
+    
+    try:
+        weights["coherence"] = float(getattr(config, 'ETHICS_COHERENCE_WEIGHT', 0.2)) 
+    except (ValueError, TypeError) as e:
+        _log_ethics_event("score_ethics_config_error", {"parameter": "ETHICS_COHERENCE_WEIGHT", "value": getattr(config, 'ETHICS_COHERENCE_WEIGHT', 'NotSet'), "error": str(e)}, level="warning")
+        weights["coherence"] = 0.2 # Default weight
 
     # --- Component 2: Manifold Valence Score ---
     # Based on the 'x' coordinate of the primary concept, normalized by MANIFOLD_RANGE.
     # Assumes x_coord represents valence, mapping e.g. -MANIFOLD_RANGE/2 (neg) to MANIFOLD_RANGE/2 (pos).
     primary_coord = awareness_metrics.get("primary_concept_coord")
+    
     # 'raw_t_intensity' (0-1) is expected from awareness_metrics for trend analysis and intensity preference.
-    raw_t_intensity_for_trend = float(awareness_metrics.get("raw_t_intensity", 0.0)) 
+    try:
+        raw_t_intensity_for_trend = float(awareness_metrics.get("raw_t_intensity", 0.0))
+    except (ValueError, TypeError) as e:
+        _log_ethics_event("score_ethics_param_error", {"parameter": "raw_t_intensity", "value": awareness_metrics.get("raw_t_intensity"), "error": str(e)}, level="warning")
+        raw_t_intensity_for_trend = 0.0 # Default to zero intensity
     
     if primary_coord and isinstance(primary_coord, (list, tuple)) and len(primary_coord) == 4:
         try:
-            x_valence_coord = float(primary_coord[0])
-            manifold_range = float(getattr(config, 'MANIFOLD_RANGE', 0.0)) # Avoid error if not set.
-            if manifold_range != 0:
+            x_valence_coord = float(primary_coord[0]) # This is the first element of the coord tuple
+            
+            try:
+                manifold_range = float(getattr(config, 'MANIFOLD_RANGE', 1.0)) # Default to 1.0 to avoid div by zero if not set
+                if manifold_range == 0: manifold_range = 1.0 # Explicitly ensure not zero
+            except (ValueError, TypeError) as e_range:
+                _log_ethics_event("score_ethics_config_error", {"parameter": "MANIFOLD_RANGE", "value": getattr(config, 'MANIFOLD_RANGE', 'NotSet'), "error": str(e_range)}, level="warning")
+                manifold_range = 1.0 # Default
+                
+            if manifold_range != 0: # Should always be true now with default 1.0
                 # Normalize x_coord: maps [-range/2, +range/2] to [0, 1].
                 scores["manifold_valence"] = np.clip((x_valence_coord + (manifold_range / 2.0)) / manifold_range, 0.0, 1.0)
-            else: # If range is 0, cannot normalize; assign neutral score.
-                scores["manifold_valence"] = 0.5 
-            event_data_for_log["primary_concept_t_intensity_raw"] = raw_t_intensity_for_trend # Log for trend analysis later.
-        except (ValueError, TypeError): # Handle malformed coordinate data.
-            scores["manifold_valence"] = 0.5 # Neutral score on error.
-            _log_ethics_event("score_ethics_coord_error", {"coord_received": primary_coord, "error": "Invalid format or type for primary_coord."}, level="warning")
-    else: # If coordinates are missing or invalid.
-        scores["manifold_valence"] = 0.5 # Neutral score.
-    weights["manifold_valence"] = float(getattr(config, 'ETHICS_VALENCE_WEIGHT', 0.2))
+            # No else needed as manifold_range defaults to 1.0
+            event_data_for_log["primary_concept_t_intensity_raw"] = raw_t_intensity_for_trend
+        except (ValueError, TypeError, IndexError) as e_coord_val: # Handle malformed coordinate data or access errors
+            scores["manifold_valence"] = 0.5 # Neutral score on error
+            _log_ethics_event("score_ethics_coord_processing_error", {"coord_received": primary_coord, "error": str(e_coord_val)}, level="warning")
+    else: # If coordinates are missing or invalid format
+        scores["manifold_valence"] = 0.5 # Neutral score
+    
+    try:
+        weights["manifold_valence"] = float(getattr(config, 'ETHICS_VALENCE_WEIGHT', 0.2))
+    except (ValueError, TypeError) as e:
+        _log_ethics_event("score_ethics_config_error", {"parameter": "ETHICS_VALENCE_WEIGHT", "value": getattr(config, 'ETHICS_VALENCE_WEIGHT', 'NotSet'), "error": str(e)}, level="warning")
+        weights["manifold_valence"] = 0.2 # Default weight
 
     # --- Component 3: Manifold Intensity Preference Score ---
     # Prefers concepts/actions with an intensity around a target (e.g., 0.5 on a 0-1 scale).
     # Uses a Gaussian-like function to score deviation from this ideal intensity.
-    sigma_intensity_pref = 0.25 # Controls the "width" of the preferred intensity range.
-    # Gaussian: exp(- (x - mu)^2 / (2 * sigma^2) ) where mu=0.5 (ideal intensity).
-    scores["intensity_preference"] = np.clip(np.exp(-((raw_t_intensity_for_trend - 0.5)**2) / (2 * sigma_intensity_pref**2)), 0.0, 1.0)
-    weights["intensity_preference"] = float(getattr(config, 'ETHICS_INTENSITY_WEIGHT', 0.1))
+    sigma_intensity_pref = getattr(config, 'ETHICS_INTENSITY_PREFERENCE_SIGMA', 0.25)
+    ideal_intensity_center = getattr(config, 'ETHICS_IDEAL_INTENSITY_CENTER', 0.5)
+    # Gaussian: exp(- (x - mu)^2 / (2 * sigma^2) ) where mu=ideal_intensity_center.
+    scores["intensity_preference"] = np.clip(np.exp(-((raw_t_intensity_for_trend - ideal_intensity_center)**2) / (2 * sigma_intensity_pref**2)), 0.0, 1.0)
+    
+    try:
+        weights["intensity_preference"] = float(getattr(config, 'ETHICS_INTENSITY_WEIGHT', config.DEFAULT_ETHICS_INTENSITY_WEIGHT))
+    except (ValueError, TypeError) as e:
+        _log_ethics_event("score_ethics_config_error", {"parameter": "ETHICS_INTENSITY_WEIGHT", "value": getattr(config, 'ETHICS_INTENSITY_WEIGHT', 'NotSet'), "error": str(e)}, level="warning")
+        weights["intensity_preference"] = 0.1 # Default weight
+
 
     # --- Component 4: Ethical Framework Alignment Score ---
     # Simple keyword-based analysis of concept/action text against configured positive/negative keywords.
@@ -307,7 +339,12 @@ def score_ethics(awareness_metrics: dict, concept_summary: str = "", action_desc
         scores["framework_alignment"] = np.clip(pos_score_count / (pos_score_count + neg_score_count), 0.0, 1.0)
     else: # No relevant keywords found.
         scores["framework_alignment"] = 0.5 # Neutral score.
-    weights["framework_alignment"] = float(getattr(config, 'ETHICS_FRAMEWORK_WEIGHT', 0.3))
+    
+    try:
+        weights["framework_alignment"] = float(getattr(config, 'ETHICS_FRAMEWORK_WEIGHT', 0.3))
+    except (ValueError, TypeError) as e:
+        _log_ethics_event("score_ethics_config_error", {"parameter": "ETHICS_FRAMEWORK_WEIGHT", "value": getattr(config, 'ETHICS_FRAMEWORK_WEIGHT', 'NotSet'), "error": str(e)}, level="warning")
+        weights["framework_alignment"] = 0.3 # Default weight
 
     # --- Component 5: Manifold Cluster Context Score ---
     # Assesses the ethical alignment of concepts in the manifold neighborhood of the primary concept.
@@ -318,8 +355,18 @@ def score_ethics(awareness_metrics: dict, concept_summary: str = "", action_desc
             manifold_instance = get_shared_manifold() # Fetch the (potentially mocked) manifold instance.
             if manifold_instance and hasattr(manifold_instance, 'get_conceptual_neighborhood'):
                 # Parameters for neighborhood query from config.
-                radius_factor = float(getattr(config, 'ETHICS_CLUSTER_RADIUS_FACTOR', 0.1))
-                manifold_range_for_radius = float(getattr(config, 'MANIFOLD_RANGE', 1.0)) # Use MANIFOLD_RANGE for radius scale.
+                try:
+                    radius_factor = float(getattr(config, 'ETHICS_CLUSTER_RADIUS_FACTOR', 0.1))
+                except (ValueError, TypeError) as e_rf:
+                    _log_ethics_event("score_ethics_config_error", {"parameter": "ETHICS_CLUSTER_RADIUS_FACTOR", "value": getattr(config, 'ETHICS_CLUSTER_RADIUS_FACTOR', 'NotSet'), "error": str(e_rf)}, level="warning")
+                    radius_factor = 0.1 # Default
+                try:
+                    manifold_range_for_radius = float(getattr(config, 'MANIFOLD_RANGE', 1.0))
+                    if manifold_range_for_radius == 0: manifold_range_for_radius = 1.0 # Avoid zero radius
+                except (ValueError, TypeError) as e_mr:
+                    _log_ethics_event("score_ethics_config_error", {"parameter": "MANIFOLD_RANGE", "value": getattr(config, 'MANIFOLD_RANGE', 'NotSet'), "error": str(e_mr)}, level="warning")
+                    manifold_range_for_radius = 1.0 # Default
+                
                 radius = radius_factor * manifold_range_for_radius
                 
                 neighborhood_nodes = manifold_instance.get_conceptual_neighborhood(primary_coord, radius)
@@ -329,14 +376,18 @@ def score_ethics(awareness_metrics: dict, concept_summary: str = "", action_desc
                     neighbor_valences = [] # Collect normalized valences of neighbors.
                     for node_data in neighborhood_nodes: 
                         if isinstance(node_data, dict) and isinstance(node_data.get('coordinates'), (list,tuple)) and len(node_data['coordinates']) == 4:
-                             node_x_valence = float(node_data['coordinates'][0])
-                             # Normalize neighbor's x-valence similar to how primary_concept_coord's valence was scored.
-                             current_manifold_range = float(getattr(config, 'MANIFOLD_RANGE', 1.0)) # Re-fetch for safety, could be instance specific
-                             if current_manifold_range != 0:
-                                 normalized_valence = (node_x_valence + (current_manifold_range / 2.0)) / current_manifold_range
-                                 neighbor_valences.append(np.clip(normalized_valence, 0.0, 1.0))
-                             else: # Should not happen if MANIFOLD_RANGE is well-defined.
-                                 neighbor_valences.append(0.5) # Neutral if range is zero.
+                            try:
+                                node_x_valence = float(node_data['coordinates'][0])
+                                current_manifold_range = float(getattr(config, 'MANIFOLD_RANGE', 1.0)) 
+                                if current_manifold_range == 0: current_manifold_range = 1.0 
+                                
+                                normalized_valence = (node_x_valence + (current_manifold_range / 2.0)) / current_manifold_range
+                                neighbor_valences.append(np.clip(normalized_valence, 0.0, 1.0))
+                            except (ValueError, TypeError, IndexError) as e_node_val:
+                                _log_ethics_event("score_ethics_cluster_node_processing_error", 
+                                                  {"node_id": node_data.get("id", "UnknownID"), "coord_data": node_data.get('coordinates'), "error": str(e_node_val)}, 
+                                                  level="warning")
+                                neighbor_valences.append(0.5) # Neutral for this problematic node
                     
                     if neighbor_valences: # If valid neighbors with valences were found.
                         avg_neighbor_valence = np.mean(neighbor_valences)
@@ -359,7 +410,11 @@ def score_ethics(awareness_metrics: dict, concept_summary: str = "", action_desc
             event_data_for_log["cluster_score_status"] = f"Cluster analysis error: {e_cluster}"
             
     scores["manifold_cluster_context"] = np.clip(cluster_score_val, 0.0, 1.0)
-    weights["manifold_cluster_context"] = float(getattr(config, 'ETHICS_CLUSTER_CONTEXT_WEIGHT', 0.2))
+    try:
+        weights["manifold_cluster_context"] = float(getattr(config, 'ETHICS_CLUSTER_CONTEXT_WEIGHT', 0.2))
+    except (ValueError, TypeError) as e:
+        _log_ethics_event("score_ethics_config_error", {"parameter": "ETHICS_CLUSTER_CONTEXT_WEIGHT", "value": getattr(config, 'ETHICS_CLUSTER_CONTEXT_WEIGHT', 'NotSet'), "error": str(e)}, level="warning")
+        weights["manifold_cluster_context"] = 0.2 # Default weight
 
     # --- Final Score Calculation: Weighted Average ---
     # Calculate the weighted sum of all component scores.
@@ -491,8 +546,8 @@ def track_trends() -> dict:
     # --- T-Weighting Calculation ---
     # Assign weights to scores based on their T-intensity. Higher intensity = higher weight.
     # Weight formula: (t_intensity * factor) + base_weight ensures all events have some weight.
-    t_intensity_factor = 0.9 # Contribution of intensity to the weight.
-    base_weight = 0.1        # Minimum base weight for any event.
+    t_intensity_factor = getattr(config, 'ETHICS_TREND_T_INTENSITY_FACTOR', 0.9)
+    base_weight = getattr(config, 'ETHICS_TREND_BASE_WEIGHT', 0.1)
 
     original_scores_np = np.array([s_i["score"] for s_i in scores_with_intensity])
     # Calculate weights: clip intensity to [0,1], apply factor, add base.
@@ -502,8 +557,13 @@ def track_trends() -> dict:
 
     # Define windows for short-term and long-term trend analysis.
     # These are proportions of the minimum data points required, ensuring sensible window sizes.
-    short_term_window_size = max(3, int(min_data_points * 0.2)) # At least 3 points for short term.
-    long_term_window_size = max(5, int(min_data_points * 0.5))  # At least 5 points for long term.
+    short_term_factor = getattr(config, 'ETHICS_TREND_SHORT_WINDOW_FACTOR', 0.2)
+    long_term_factor = getattr(config, 'ETHICS_TREND_LONG_WINDOW_FACTOR', 0.5)
+    min_short_window = getattr(config, 'ETHICS_TREND_MIN_SHORT_WINDOW', 3)
+    min_long_window = getattr(config, 'ETHICS_TREND_MIN_LONG_WINDOW', 5)
+
+    short_term_window_size = max(min_short_window, int(min_data_points * short_term_factor))
+    long_term_window_size = max(min_long_window, int(min_data_points * long_term_factor))
 
     # Adjust window sizes if the actual number of scores is less than the calculated window.
     short_term_window_size = min(short_term_window_size, len(original_scores_np))
@@ -574,22 +634,72 @@ _load_ethics_db()
 if __name__ == '__main__':
     # --- Test Utilities ---
     class TempConfigOverride:
-        # ... (Assume TempConfigOverride class is defined here as per previous step) ...
-        def __init__(self, temp_configs_dict):
+        """
+        A context manager for temporarily overriding attributes in the global `config` module.
+
+        This is useful for testing different configurations without permanently altering
+        the `config` object or needing to reload modules. It ensures that original
+        values are restored upon exiting the context.
+        """
+        def __init__(self, temp_configs_dict: dict):
+            """
+            Initializes the TempConfigOverride context manager.
+
+            Args:
+                temp_configs_dict (dict): A dictionary where keys are attribute names (str)
+                                          to be overridden in the `config` module, and values
+                                          are the temporary values for these attributes.
+            """
             self.temp_configs = temp_configs_dict
-            self.original_values = {}
+            self.original_values = {} # Stores original values of overridden attributes.
+
         def __enter__(self):
-            if not config: raise ImportError("Config module not loaded")
+            """
+            Sets up the temporary configuration overrides when entering the context.
+
+            Iterates through `self.temp_configs`, stores the original value of each
+            attribute from the `config` module (or a sentinel if it doesn't exist),
+            and then sets the attribute to its temporary value.
+
+            Returns:
+                self: The TempConfigOverride instance (or the config object itself).
+
+            Raises:
+                ImportError: If the global `config` module is not loaded/available.
+            """
+            if not config:  # Check if the global config object is available.
+                raise ImportError("Config module not loaded. TempConfigOverride cannot operate.")
+            
             for key, value in self.temp_configs.items():
-                self.original_values[key] = getattr(config, key, None)
+                # Store the original value if the attribute exists, otherwise store a sentinel.
+                if hasattr(config, key):
+                    self.original_values[key] = getattr(config, key)
+                else:
+                    self.original_values[key] = "__ATTR_NOT_SET__" # Sentinel for new attributes.
+                
+                # Set the temporary value.
                 setattr(config, key, value)
-            return self
+            return self # Or return config, depending on usage preference.
+
         def __exit__(self, exc_type, exc_val, exc_tb):
-            if not config: return
+            """
+            Restores the original configuration when exiting the context.
+
+            Iterates through the stored original values. If an attribute was newly added
+            during the override (original value is the sentinel), it's removed. Otherwise,
+            the attribute is restored to its original value.
+            """
+            if not config: # Should not happen if __enter__ succeeded, but good for robustness.
+                return
+
             for key, original_value in self.original_values.items():
-                if hasattr(config,key) and original_value is None and key not in self.temp_configs: pass
-                elif original_value is not None: setattr(config, key, original_value)
-                elif hasattr(config,key): delattr(config,key)
+                if original_value == "__ATTR_NOT_SET__":
+                    # If the attribute was added by this context manager, remove it.
+                    if hasattr(config, key):
+                        delattr(config, key)
+                else:
+                    # Otherwise, restore its original value.
+                    setattr(config, key, original_value)
 
     # --- Test Setup & Helper ---
     TEST_ETHICS_DB_FILENAME = "test_ethics_db.json"
@@ -600,21 +710,76 @@ if __name__ == '__main__':
     original_get_shared_manifold = None # To store the real get_shared_manifold
 
     class MockConceptualNeighborhoodManifold:
-        """Mock for SpacetimeManifold to control get_conceptual_neighborhood output."""
+        """
+        Mock for the SpacetimeManifold class (or its relevant parts for ethics tests).
+        This mock specifically controls the output of the `get_conceptual_neighborhood`
+        method, which is used by `score_ethics` for cluster context analysis.
+        """
         def __init__(self, neighborhood_data=None):
+            """
+            Initializes the mock manifold.
+
+            Args:
+                neighborhood_data (list, optional): A list of dictionaries, where each
+                                                    dictionary represents a neighboring node's
+                                                    data (e.g., including 'coordinates').
+                                                    Defaults to an empty list.
+            """
             self.neighborhood_data = neighborhood_data if neighborhood_data is not None else []
-            self.device = "cpu" # Mock device attribute
+            self.device = "cpu" # Mock device attribute, sometimes checked by other parts.
 
         def get_conceptual_neighborhood(self, concept_coord, radius):
+            """
+            Simulates retrieving concepts in the neighborhood of `concept_coord`.
+
+            Args:
+                concept_coord: The coordinates of the concept to find neighbors for.
+                radius: The radius to search within.
+
+            Returns:
+                list: The predefined `self.neighborhood_data`.
+            """
             _log_ethics_event("mock_get_conceptual_neighborhood_called", {"coord": concept_coord, "radius": radius, "returning_count": len(self.neighborhood_data)}, level="debug")
             return self.neighborhood_data # Return predefined data
 
     def mock_get_shared_manifold_for_ethics_test(neighborhood_data=None, force_recreate=False):
-        """Returns an instance of the MockConceptualNeighborhoodManifold."""
+        """
+        A factory function that returns an instance of MockConceptualNeighborhoodManifold.
+        This function is used to replace `core.brain.get_shared_manifold` during tests
+        of the ethics module, allowing control over the manifold's behavior for
+        cluster context scoring.
+
+        Args:
+            neighborhood_data (list, optional): Data to be returned by the mock manifold's
+                                                `get_conceptual_neighborhood` method.
+            force_recreate (bool, optional): Argument matching the real `get_shared_manifold`,
+                                             ignored by this mock.
+
+        Returns:
+            MockConceptualNeighborhoodManifold: An instance of the mock manifold.
+        """
         return MockConceptualNeighborhoodManifold(neighborhood_data=neighborhood_data)
 
-    def setup_test_environment(test_specific_configs=None, mock_neighborhood=None):
-        global _ethics_db, _ethics_db_dirty_flag, original_get_shared_manifold, get_shared_manifold
+    def setup_test_environment(test_specific_configs: dict = None, mock_neighborhood: list = None):
+        """
+        Prepares the testing environment for ethics module tests.
+
+        This involves:
+        1.  Cleaning up any existing test database or log files.
+        2.  Resetting the in-memory `_ethics_db` and `_ethics_db_dirty_flag`.
+        3.  Monkeypatching `get_shared_manifold` (if not already done or if mock_neighborhood changes)
+            to use `mock_get_shared_manifold_for_ethics_test` for controlling manifold interactions.
+        4.  Constructing a configuration dictionary for `TempConfigOverride`, including paths
+            to test-specific files and default test settings for ethics parameters.
+
+        Args:
+            test_specific_configs (dict, optional): Configuration overrides specific to the current test.
+            mock_neighborhood (list, optional): Data for the mock manifold's neighborhood.
+
+        Returns:
+            TempConfigOverride: An instance of the context manager with test configurations.
+        """
+        global _ethics_db, _ethics_db_dirty_flag, original_get_shared_manifold
         
         if os.path.exists(TEST_ETHICS_DB_PATH):
             os.remove(TEST_ETHICS_DB_PATH)
@@ -624,28 +789,26 @@ if __name__ == '__main__':
         _ethics_db = {"ethical_scores": [], "trend_analysis": {}}
         _ethics_db_dirty_flag = False
         
-        # Store original and monkeypatch get_shared_manifold for this test run
-        if original_get_shared_manifold is None: # Store only once
+        # Store original get_shared_manifold if not already stored, then monkeypatch.
+        if original_get_shared_manifold is None: 
             original_get_shared_manifold = sys.modules[__name__].get_shared_manifold
         
-        # Apply mock for get_shared_manifold
-        # This lambda captures the current mock_neighborhood value for this specific test setup.
-        sys.modules[__name__].get_shared_manifold = lambda force_recreate=False, current_mock_neighborhood=mock_neighborhood: mock_get_shared_manifold_for_ethics_test(neighborhood_data=current_mock_neighborhood, force_recreate=force_recreate)
+        # Apply the mock for get_shared_manifold, capturing the current mock_neighborhood.
+        sys.modules[__name__].get_shared_manifold = lambda force_recreate=False, current_mock_neighborhood=mock_neighborhood: \
+            mock_get_shared_manifold_for_ethics_test(neighborhood_data=current_mock_neighborhood, force_recreate=force_recreate)
 
-
-        # Default test configs + any test-specific overrides
         final_test_configs = {
             "ETHICS_DB_PATH": TEST_ETHICS_DB_PATH,
             "SYSTEM_LOG_PATH": TEST_SYSTEM_LOG_PATH,
-            "VERBOSE_OUTPUT": False, # Usually False for tests unless debugging a specific one
-            "ETHICS_LOG_MAX_ENTRIES": 5, # Small for testing pruning
+            "VERBOSE_OUTPUT": False,
+            "ETHICS_LOG_MAX_ENTRIES": 5,
             "ETHICS_TREND_MIN_DATAPOINTS": 3,
             "ETHICS_TREND_SIGNIFICANCE_THRESHOLD": 0.05,
-            # Default weights for testing, can be overridden by test_specific_configs
             "ETHICS_COHERENCE_WEIGHT": 0.2, "ETHICS_VALENCE_WEIGHT": 0.2,
             "ETHICS_INTENSITY_WEIGHT": 0.1, "ETHICS_FRAMEWORK_WEIGHT": 0.3,
             "ETHICS_CLUSTER_CONTEXT_WEIGHT": 0.2,
-            "MANIFOLD_RANGE": 10.0 # Default test range for normalization in score_ethics
+            "MANIFOLD_RANGE": 10.0,
+            "ensure_path": lambda path: os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) and not os.path.exists(os.path.dirname(path)) else None,
         }
         if test_specific_configs:
             final_test_configs.update(test_specific_configs)
@@ -653,170 +816,236 @@ if __name__ == '__main__':
         return TempConfigOverride(final_test_configs)
 
     def cleanup_test_environment():
-        global original_get_shared_manifold, get_shared_manifold
+        """
+        Cleans up the testing environment after ethics module tests.
+        Removes test files and restores the original `get_shared_manifold` function.
+        """
+        global original_get_shared_manifold
         if os.path.exists(TEST_ETHICS_DB_PATH):
             os.remove(TEST_ETHICS_DB_PATH)
         if os.path.exists(TEST_SYSTEM_LOG_PATH):
             os.remove(TEST_SYSTEM_LOG_PATH)
         
-        # Restore original get_shared_manifold
         if original_get_shared_manifold is not None:
             sys.modules[__name__].get_shared_manifold = original_get_shared_manifold
+            original_get_shared_manifold = None # Reset for next potential setup sequence.
 
 
-    def run_test(test_func, *args, **kwargs): # Allow kwargs for test-specific configs/mocks
+    def run_test(test_func, *args, **kwargs) -> bool:
+        """
+        Executes a given test function within a controlled test environment.
+
+        Sets up the environment using `setup_test_environment` (including config
+        overrides and manifold mocking), runs the test function, prints its status,
+        handles exceptions, and ensures cleanup via `cleanup_test_environment`.
+
+        Args:
+            test_func (callable): The test function to execute.
+            *args: Positional arguments to pass to the test function.
+            **kwargs: Keyword arguments:
+                - `test_configs` (dict, optional): Specific config overrides for this test.
+                - `mock_neighborhood_data` (list, optional): Data for the mock manifold.
+                - Other kwargs are passed to `test_func`.
+
+        Returns:
+            bool: True if the test passes, False otherwise.
+        """
         test_name = test_func.__name__
         print(f"--- Running Test: {test_name} ---")
-        test_configs = kwargs.pop("test_configs", {})
-        mock_neighborhood_data = kwargs.pop("mock_neighborhood_data", [])
         
-        with setup_test_environment(test_specific_configs=test_configs, mock_neighborhood=mock_neighborhood_data):
-            # _load_ethics_db() is called by setup_test_environment essentially by resetting _ethics_db
-            # and then subsequent functions like score_ethics will interact with this in-memory _ethics_db.
-            # If a test needs to load from a *pre-populated* test file, that needs special handling.
-            # For now, tests assume starting with an empty DB state in memory.
-            _load_ethics_db() # Ensure it loads from the overridden TEST_ETHICS_DB_PATH (likely non-existent initially)
-            result = False # Default to False
-            try:
-                result = test_func(*args, **kwargs)
+        # Extract test setup specific kwargs before passing the rest to test_func
+        test_configs_override = kwargs.pop("test_configs", {})
+        mock_neighborhood_data_for_test = kwargs.pop("mock_neighborhood_data", [])
+        
+        # Use a try-finally block to ensure cleanup_test_environment is always called.
+        try:
+            # setup_test_environment returns a TempConfigOverride instance.
+            # The `with` statement handles its __enter__ and __exit__ for config management.
+            with setup_test_environment(test_specific_configs=test_configs_override, 
+                                        mock_neighborhood=mock_neighborhood_data_for_test):
+                _load_ethics_db() # Load DB under the new temp config (likely creates empty if file missing).
+                result = test_func(*args, **kwargs) # Execute the actual test function.
                 if result:
                     print(f"PASS: {test_name}")
                 else:
                     print(f"FAIL: {test_name}")
-            except Exception as e:
-                print(f"ERROR in {test_name}: {e}")
-                traceback.print_exc()
-                result = False # Explicitly mark as fail on exception
-            finally:
-                cleanup_test_environment() # Clean up files and restore mocks
-        return result
+                return result
+        except Exception as e:
+            print(f"ERROR in {test_name}: {e}")
+            traceback.print_exc()
+            return False # Mark as fail on unexpected exception during setup or test execution.
+        finally:
+            cleanup_test_environment() # Ensure cleanup happens regardless of test outcome.
 
     # --- Test Function Definitions ---
 
-    def test_db_load_save_and_dirty_flag():
+    def test_db_load_save_and_dirty_flag() -> bool:
+        """
+        Tests the ethics database loading, saving, and dirty flag logic.
+        Verifies:
+        - Initial load of a non-existent file creates an empty DB state.
+        - Saving is skipped if the dirty flag is not set.
+        - Modifying the DB, setting the dirty flag, and saving creates the file.
+        - Reloading the saved DB correctly restores its content.
+        """
         print("Testing DB load/save and dirty flag logic...")
         global _ethics_db, _ethics_db_dirty_flag
 
         # 1. Initial load (file non-existent)
-        _load_ethics_db() 
-        if _ethics_db != {"ethical_scores": [], "trend_analysis": {}} or _ethics_db_dirty_flag:
-            print("FAIL: Initial load did not result in clean empty DB state.")
-            return False
+        # _load_ethics_db() is called by the `with setup_test_environment(...)` context manager.
+        assert _ethics_db == {"ethical_scores": [], "trend_analysis": {}}, "Initial DB state not empty."
+        assert not _ethics_db_dirty_flag, "Dirty flag not false on initial load."
         print("  PASS: Initial load non-existent file.")
 
-        # 2. Save when not dirty (should skip)
+        # 2. Save when not dirty (should skip writing the file).
         _save_ethics_db()
-        if os.path.exists(TEST_ETHICS_DB_PATH):
-            print("FAIL: DB file created on save when not dirty.")
-            return False
+        assert not os.path.exists(TEST_ETHICS_DB_PATH), "DB file created on save when not dirty."
         print("  PASS: Save skipped when not dirty.")
 
-        # 3. Modify DB and save
+        # 3. Modify DB, set dirty flag, and save.
         _ethics_db["ethical_scores"].append({"test_score": 1, "primary_concept_t_intensity_raw": 0.5, "timestamp": "2023-01-01T00:00:00Z"})
         _ethics_db_dirty_flag = True
         _save_ethics_db()
-        if not os.path.exists(TEST_ETHICS_DB_PATH) or _ethics_db_dirty_flag:
-            print("FAIL: DB not saved when dirty, or dirty flag not reset.")
-            return False
+        assert os.path.exists(TEST_ETHICS_DB_PATH), "DB not saved when dirty."
+        assert not _ethics_db_dirty_flag, "Dirty flag not reset after save."
         print("  PASS: DB saved when dirty, flag reset.")
         
-        # 4. Load saved DB
-        _ethics_db = {} 
-        _load_ethics_db()
-        if not _ethics_db.get("ethical_scores") or _ethics_db["ethical_scores"][0].get("test_score") != 1:
-            print(f"FAIL: Did not load saved DB correctly. Got: {_ethics_db}")
-            return False
+        # 4. Load saved DB.
+        _ethics_db = {} # Clear in-memory to force reload.
+        _load_ethics_db() # This will load from TEST_ETHICS_DB_PATH.
+        assert _ethics_db.get("ethical_scores"), "Ethical scores not loaded."
+        assert _ethics_db["ethical_scores"][0].get("test_score") == 1, "Loaded DB content mismatch."
         print("  PASS: Reloaded saved DB correctly.")
         return True
 
-    def test_score_ethics_basic_and_components(**kwargs): 
+    def test_score_ethics_basic_and_components(**kwargs) -> bool:
+        """
+        Tests the `score_ethics` function's basic operation and component scoring.
+        Verifies:
+        - A score is calculated and is within the valid range [0,1].
+        - The scoring event is logged to the ethics DB.
+        - Log pruning mechanism works correctly when max entries are exceeded.
+        """
         print("Testing score_ethics (basic components)...")
-        awareness_metrics_neutral = {"coherence": 0.0, "primary_concept_coord": (0,0,0,0.5 * config.MANIFOLD_RANGE / 2.0), "raw_t_intensity": 0.5}
+        awareness_metrics_neutral = {
+            "coherence": 0.0, 
+            "primary_concept_coord": (0,0,0, 0.5 * config.MANIFOLD_RANGE / 2.0), # Scaled t_coord
+            "raw_t_intensity": 0.5 # Raw 0-1 intensity
+        }
         score = score_ethics(awareness_metrics_neutral, "neutral summary", "neutral action")
         
-        if not (0.0 <= score <= 1.0):
-            print(f"FAIL: Basic score out of range [0,1]. Score: {score}")
-            return False
-        if len(_ethics_db["ethical_scores"]) != 1:
-            print(f"FAIL: Score event not logged. Count: {len(_ethics_db['ethical_scores'])}")
-            return False
+        assert 0.0 <= score <= 1.0, f"Basic score out of range [0,1]. Score: {score}"
+        assert len(_ethics_db["ethical_scores"]) == 1, f"Score event not logged. Count: {len(_ethics_db['ethical_scores'])}"
         print(f"  PASS: Basic score calculated: {score:.2f}, event logged.")
         
         max_entries = config.ETHICS_LOG_MAX_ENTRIES 
-        for i in range(max_entries + 2): 
+        for i in range(max_entries + 2): # Add more entries to trigger pruning.
             score_ethics(awareness_metrics_neutral, f"summary {i}", f"action {i}")
-        if len(_ethics_db["ethical_scores"]) != max_entries:
-            print(f"FAIL: Log pruning failed. Count: {len(_ethics_db['ethical_scores'])}, Expected: {max_entries}")
-            return False
+        
+        assert len(_ethics_db["ethical_scores"]) == max_entries, \
+            f"Log pruning failed. Count: {len(_ethics_db['ethical_scores'])}, Expected: {max_entries}"
         print(f"  PASS: Log pruning to {max_entries} entries.")
         return True
 
-    def test_score_ethics_cluster_context(mock_neighborhood_data_for_test, **kwargs): # Renamed arg
+    def test_score_ethics_cluster_context(mock_neighborhood_data_for_test: list, **kwargs) -> bool:
+        """
+        Tests the `score_ethics` function's manifold cluster context component.
+        Uses a mock manifold (via `mock_neighborhood_data_for_test`) to provide
+        controlled neighborhood data. Verifies that the cluster context score
+        reflects the average valence of the mock neighbors.
+
+        Args:
+            mock_neighborhood_data_for_test (list): Data for the mock manifold's neighbors.
+        
+        Returns:
+            bool: True if the test passes, False otherwise.
+        """
         print("Testing score_ethics with manifold cluster context...")
-        awareness_metrics = {"coherence": 0.8, "primary_concept_coord": (config.MANIFOLD_RANGE/4, 0,0,0.7), "raw_t_intensity": 0.7}
+        awareness_metrics = {
+            "coherence": 0.8, 
+            "primary_concept_coord": (config.MANIFOLD_RANGE / 4, 0, 0, 0.7 * config.MANIFOLD_RANGE / 2.0), # Scaled t_coord
+            "raw_t_intensity": 0.7 # Raw 0-1 intensity
+        }
         score = score_ethics(awareness_metrics, "concept affecting cluster", "action related to cluster")
         
         last_score_event = _ethics_db["ethical_scores"][-1]
         cluster_comp_score = last_score_event["component_scores"]["manifold_cluster_context"]
         
-        expected_mock_avg_valence = 0.5 # Default if no data or error
+        expected_mock_avg_valence = 0.5 # Default if no valid neighbors or error.
         if mock_neighborhood_data_for_test: 
             norm_valences = []
             for n_data in mock_neighborhood_data_for_test:
                 node_coords = n_data.get("coordinates")
                 if isinstance(node_coords, (list,tuple)) and len(node_coords)==4:
                      node_x_val = float(node_coords[0])
-                     # Ensure MANIFOLD_RANGE is not zero for normalization
                      current_manifold_range = float(getattr(config, 'MANIFOLD_RANGE', 1.0))
-                     if current_manifold_range == 0: current_manifold_range = 1.0 # Avoid div by zero
+                     current_manifold_range = current_manifold_range if current_manifold_range != 0 else 1.0
                      norm_val = (node_x_val + (current_manifold_range / 2.0)) / current_manifold_range
                      norm_valences.append(np.clip(norm_val, 0.0, 1.0))
-            if norm_valences: expected_mock_avg_valence = np.mean(norm_valences)
+            if norm_valences: 
+                expected_mock_avg_valence = np.mean(norm_valences)
         
-        if abs(cluster_comp_score - expected_mock_avg_valence) > 0.01 : 
-            print(f"FAIL: Cluster context score {cluster_comp_score:.2f} ({last_score_event['cluster_avg_valence']}) doesn't match expected from mock {expected_mock_avg_valence:.2f}")
-            return False
+        assert abs(cluster_comp_score - expected_mock_avg_valence) < 0.01, \
+            f"Cluster context score {cluster_comp_score:.2f} (logged avg: {last_score_event.get('cluster_avg_valence', 'N/A')}) " \
+            f"doesn't match expected from mock {expected_mock_avg_valence:.2f}"
         print(f"  PASS: Cluster context score ({cluster_comp_score:.2f}) matches mock expectation.")
         return True
 
 
-    def test_track_trends_scenarios(**kwargs):
+    def test_track_trends_scenarios(**kwargs) -> bool:
+        """
+        Tests the `track_trends` function under various scenarios:
+        - Insufficient data (0 scores, fewer than min_data_points).
+        - Stable trend (scores are consistent).
+        - Improving trend (scores generally increase).
+        - Declining trend (scores generally decrease).
+        Verifies the `trend_direction` output.
+        """
         print("Testing track_trends...")
         global _ethics_db
         
         min_points = config.ETHICS_TREND_MIN_DATAPOINTS 
-        _ethics_db["ethical_scores"] = [] 
+        _ethics_db["ethical_scores"] = [] # Ensure DB is empty for this test.
         trends = track_trends()
-        if trends["trend_direction"] != "insufficient_data": return False
+        assert trends["trend_direction"] == "insufficient_data", "Trend not 'insufficient_data' for 0 scores."
         print("  PASS: Insufficient data (0 scores).")
 
+        # Populate with fewer than min_points.
         for i in range(min_points - 1):
              _ethics_db["ethical_scores"].append({"final_score": 0.5, "primary_concept_t_intensity_raw": 0.5, "timestamp": f"2023-01-01T00:0{i}:00Z"})
         trends = track_trends()
-        if trends["trend_direction"] != "insufficient_data": return False
+        assert trends["trend_direction"] == "insufficient_data", f"Trend not 'insufficient_data' for {min_points-1} scores."
         print(f"  PASS: Insufficient data ({min_points-1} scores).")
 
+        # Stable trend.
         _ethics_db["ethical_scores"] = [] 
         for i in range(min_points + 2): 
             _ethics_db["ethical_scores"].append({"final_score": 0.5, "primary_concept_t_intensity_raw": 0.5, "timestamp": f"2023-01-01T00:0{i}:00Z"})
         trends_stable = track_trends()
-        if trends_stable["trend_direction"] != "stable": return False
+        assert trends_stable["trend_direction"] == "stable", f"Stable trend not detected. Avg: {trends_stable.get('t_weighted_short_term_avg'):.2f}"
         print(f"  PASS: Stable trend detected (avg: {trends_stable.get('t_weighted_short_term_avg'):.2f}).")
 
+        # Improving trend.
         _ethics_db["ethical_scores"] = []
         base_scores_improve = [0.2, 0.3, 0.4, 0.7, 0.8]; intensities_improve = [0.2, 0.3, 0.4, 0.9, 1.0]
+        # Ensure enough data points for trend calculation based on min_points.
+        while len(base_scores_improve) < min_points: base_scores_improve.append(0.8); intensities_improve.append(1.0) 
         for i, score_val in enumerate(base_scores_improve):
             _ethics_db["ethical_scores"].append({"final_score": score_val, "primary_concept_t_intensity_raw": intensities_improve[i], "timestamp": f"2023-01-01T00:0{i}:00Z"})
         trends_improve = track_trends()
-        if trends_improve["trend_direction"] != "improving": return False
+        assert trends_improve["trend_direction"] == "improving", \
+            f"Improving trend not detected. Short: {trends_improve.get('t_weighted_short_term_avg'):.2f}, Long: {trends_improve.get('t_weighted_long_term_avg'):.2f}"
         print(f"  PASS: Improving trend (Short: {trends_improve.get('t_weighted_short_term_avg'):.2f}, Long: {trends_improve.get('t_weighted_long_term_avg'):.2f}).")
         
+        # Declining trend.
         _ethics_db["ethical_scores"] = []
-        base_scores_decline = [0.8, 0.7, 0.6, 0.3, 0.2]; intensities_decline = [1.0, 0.9, 0.4, 0.3, 0.2] 
+        base_scores_decline = [0.8, 0.7, 0.6, 0.3, 0.2]; intensities_decline = [1.0, 0.9, 0.4, 0.3, 0.2]
+        while len(base_scores_decline) < min_points: base_scores_decline.append(0.2); intensities_decline.append(0.2)
         for i, score_val in enumerate(base_scores_decline):
             _ethics_db["ethical_scores"].append({"final_score": score_val, "primary_concept_t_intensity_raw": intensities_decline[i], "timestamp": f"2023-01-01T00:0{i}:00Z"})
         trends_decline = track_trends()
-        if trends_decline["trend_direction"] != "declining": return False
+        assert trends_decline["trend_direction"] == "declining", \
+            f"Declining trend not detected. Short: {trends_decline.get('t_weighted_short_term_avg'):.2f}, Long: {trends_decline.get('t_weighted_long_term_avg'):.2f}"
         print(f"  PASS: Declining trend (Short: {trends_decline.get('t_weighted_short_term_avg'):.2f}, Long: {trends_decline.get('t_weighted_long_term_avg'):.2f}).")
 
         return True

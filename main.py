@@ -165,7 +165,7 @@ def main_logic(cli_args):
                 # Generate a single response and print it.
                 response_text, thought_steps, awareness_metrics = core_dialogue.generate_response(
                     cli_args.query, 
-                    stream_thought_steps=False # Thought streaming usually not desired for single query.
+                    stream_thought_steps=getattr(config, 'DEFAULT_SINGLE_QUERY_STREAM_THOUGHTS', False)
                 )
                 print("\nSophia's Response:")
                 print(response_text)

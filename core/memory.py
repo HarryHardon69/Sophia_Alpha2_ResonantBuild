@@ -247,13 +247,17 @@ def calculate_novelty(concept_coord: tuple, concept_summary: str) -> float:
     # Validate input: concept_coord should be a 4-tuple of numeric values.
     if not isinstance(concept_coord, tuple) or len(concept_coord) != 4:
         _log_memory_event("calculate_novelty_error", {"error": "Invalid concept_coord format (must be 4-tuple).", "coord_received": str(concept_coord)}, level="warning")
-        return 0.0 
-    try:
-        # Convert coordinates to a NumPy array of floats for vectorized operations.
-        current_coord_np = np.array([float(c) for c in concept_coord])
-    except (ValueError, TypeError) as e: # Handle non-numeric coordinates
-        _log_memory_event("calculate_novelty_error", {"error": f"Invalid coordinate values (must be numeric): {str(e)}", "coord_received": str(concept_coord)}, level="warning")
         return 0.0
+    
+    # Safely convert coordinates to a NumPy array of floats.
+    processed_coords = []
+    for i, c in enumerate(concept_coord):
+        try:
+            processed_coords.append(float(c))
+        except (ValueError, TypeError) as e:
+            _log_memory_event("calculate_novelty_error", {"error": f"Invalid value in concept_coord at index {i} ('{c}'). Must be numeric. Error: {e}", "coord_received": str(concept_coord)}, level="warning")
+            return 0.0 # Return 0.0 novelty if any coordinate part is invalid.
+    current_coord_np = np.array(processed_coords)
 
     # --- Spatial Novelty Calculation ---
     # Spatial novelty is based on the minimum normalized Euclidean distance to existing nodes in the KG.
@@ -265,9 +269,9 @@ def calculate_novelty(concept_coord: tuple, concept_summary: str) -> float:
         
         # Normalization factor for coordinates. MANIFOLD_RANGE from config defines the typical
         # extent of a single dimension in the coordinate space. Distances are normalized by this range.
-        norm_factor = config.MANIFOLD_RANGE 
+        norm_factor = getattr(config, 'MANIFOLD_RANGE', 1000.0) # Use default if not in config
         if norm_factor == 0: # Prevent division by zero if MANIFOLD_RANGE is misconfigured.
-            _log_memory_event("calculate_novelty_warning", {"warning": "MANIFOLD_RANGE is 0. Spatial distance normalization will be ineffective."}, level="warning")
+            _log_memory_event("calculate_novelty_warning", {"warning": "MANIFOLD_RANGE is 0 or not configured. Spatial distance normalization will be ineffective using 1.0."}, level="warning")
             norm_factor = 1.0 # Use 1.0 to avoid error, though normalization becomes identity.
 
         processed_node_coords = 0 # Counter for nodes with valid coordinates.
@@ -275,15 +279,32 @@ def calculate_novelty(concept_coord: tuple, concept_summary: str) -> float:
             node_coord_data = node.get("coordinates") # Existing node's coordinates
             if isinstance(node_coord_data, (list, tuple)) and len(node_coord_data) == 4:
                 try:
-                    node_coord_np = np.array([float(c) for c in node_coord_data])
+                    # Safely convert node coordinates
+                    processed_node_coord_parts = []
+                    valid_node_coord = True
+                    for i_node_c, node_c_part in enumerate(node_coord_data):
+                        try:
+                            processed_node_coord_parts.append(float(node_c_part))
+                        except (ValueError, TypeError) as e_node_c:
+                            _log_memory_event("calculate_novelty_node_coord_part_error", 
+                                              {"node_id": node.get("id"), "coord_data": str(node_coord_data), 
+                                               "part_index": i_node_c, "part_value": node_c_part, "error": str(e_node_c)}, 
+                                              level="debug")
+                            valid_node_coord = False
+                            break
+                    if not valid_node_coord:
+                        continue # Skip this node if its coordinates are malformed
+
+                    node_coord_np = np.array(processed_node_coord_parts)
                     # Calculate squared Euclidean distance, normalized by norm_factor for each dimension.
-                    # diff_sq_normalized = sum(((current_coord_dim - node_coord_dim) / norm_factor)^2)
                     diff_sq_normalized = np.sum(((current_coord_np - node_coord_np) / norm_factor)**2)
                     min_dist_sq_normalized = min(min_dist_sq_normalized, diff_sq_normalized)
                     processed_node_coords += 1
-                except (ValueError, TypeError): # Skip nodes with malformed coordinates.
-                    _log_memory_event("calculate_novelty_node_coord_error", {"node_id": node.get("id"), "coord_data": str(node_coord_data)}, level="debug")
-                    continue 
+                except Exception as e_inner_spatial: # Catch any other unexpected error in loop
+                    _log_memory_event("calculate_novelty_spatial_loop_error", 
+                                      {"node_id": node.get("id"), "error": str(e_inner_spatial)}, 
+                                      level="warning")
+                    continue # Skip this node
 
         if processed_node_coords > 0 and min_dist_sq_normalized != float('inf'):
             # Convert minimum squared normalized distance to actual distance.
@@ -307,7 +328,7 @@ def calculate_novelty(concept_coord: tuple, concept_summary: str) -> float:
         current_tokens = set(current_summary_lower.split()) # Tokenize summary into a set of words.
 
         if not current_tokens: # If current summary is empty or only whitespace.
-            textual_novelty_score = 0.5 # Assign neutral novelty.
+            textual_novelty_score = getattr(config, 'TEXTUAL_NOVELTY_EMPTY_SUMMARY_SCORE', 0.5)
         else:
             processed_text_nodes = 0
             for node in _knowledge_graph["nodes"]:
@@ -338,8 +359,8 @@ def calculate_novelty(concept_coord: tuple, concept_summary: str) -> float:
     # --- Combine Spatial and Textual Novelties ---
     # Weighted average of spatial and textual novelty scores.
     # Weights are sourced from config, defaulting to 0.5 each.
-    spatial_weight = float(getattr(config, 'SPATIAL_NOVELTY_WEIGHT', 0.5))
-    textual_weight = float(getattr(config, 'TEXTUAL_NOVELTY_WEIGHT', 0.5))
+    spatial_weight = float(getattr(config, 'SPATIAL_NOVELTY_WEIGHT', config.DEFAULT_SPATIAL_NOVELTY_WEIGHT))
+    textual_weight = float(getattr(config, 'TEXTUAL_NOVELTY_WEIGHT', config.DEFAULT_TEXTUAL_NOVELTY_WEIGHT))
     
     # Normalize weights to ensure they sum to 1, or handle sum of 0.
     total_weight = spatial_weight + textual_weight
@@ -404,15 +425,42 @@ def store_memory(concept_name: str, concept_coord: tuple, summary: str,
                           {"concept_name": concept_name, "reason": "Missing or invalid format for core inputs (name, coord, summary)."}, 
                           level="warning")
         return False
+    
+    # Safely convert numeric inputs
     try:
-        # Convert potentially stringified numeric inputs to their correct types.
-        numeric_coord = tuple(float(c) for c in concept_coord)
-        float_intensity = float(intensity)
-        float_ethical_alignment = float(ethical_alignment)
-    except (ValueError, TypeError) as e: # Handle errors if conversion fails.
-        _log_memory_event("store_memory_invalid_input_type", 
-                          {"concept_name": concept_name, "error": f"Type conversion failed for numeric fields: {str(e)}"}, 
+        numeric_coord_parts = []
+        for i_c, c_part in enumerate(concept_coord):
+            try:
+                numeric_coord_parts.append(float(c_part))
+            except (ValueError, TypeError) as e_c:
+                _log_memory_event("store_memory_invalid_coord_part", 
+                                  {"concept_name": concept_name, "coord_part_index": i_c, "value": c_part, "error": str(e_c)}, 
+                                  level="warning")
+                return False # Reject if coordinate part is invalid
+        numeric_coord = tuple(numeric_coord_parts)
+    except Exception as e_coord_processing: # Catch any other issue with coord processing
+        _log_memory_event("store_memory_invalid_coord_processing",
+                          {"concept_name": concept_name, "coord_value": str(concept_coord), "error": str(e_coord_processing)},
                           level="warning")
+        return False
+
+    try:
+        float_intensity = float(intensity)
+    except (ValueError, TypeError) as e_intensity:
+        _log_memory_event("store_memory_invalid_intensity", 
+                          {"concept_name": concept_name, "intensity_value": intensity, "error": str(e_intensity)}, 
+                          level="warning")
+        float_intensity = 0.0 # Default intensity to 0.0 if invalid
+    
+    try:
+        float_ethical_alignment = float(ethical_alignment)
+    except (ValueError, TypeError) as e_ethics:
+        _log_memory_event("store_memory_invalid_ethical_alignment", 
+                          {"concept_name": concept_name, "ethical_value": ethical_alignment, "error": str(e_ethics)}, 
+                          level="warning")
+        # Reject if ethical alignment is invalid, as it's a critical filter.
+        # Alternatively, could default to a very low score to ensure rejection by threshold.
+        # For now, let's reject directly.
         return False
 
     # --- 2. Calculate Novelty Score ---
@@ -421,8 +469,8 @@ def store_memory(concept_name: str, concept_coord: tuple, summary: str,
 
     # --- 3. Check Thresholds for Storage ---
     # Retrieve thresholds from config, with defaults if not specified.
-    novelty_threshold = float(getattr(config, 'MEMORY_NOVELTY_THRESHOLD', 0.5))
-    ethical_threshold = float(getattr(config, 'MEMORY_ETHICAL_THRESHOLD', 0.5))
+    novelty_threshold = float(getattr(config, 'MEMORY_NOVELTY_THRESHOLD', config.DEFAULT_MEMORY_NOVELTY_THRESHOLD))
+    ethical_threshold = float(getattr(config, 'MEMORY_ETHICAL_THRESHOLD', config.DEFAULT_MEMORY_ETHICAL_THRESHOLD))
 
     # Reject if novelty is below threshold.
     if novelty_score < novelty_threshold:
@@ -455,12 +503,13 @@ def store_memory(concept_name: str, concept_coord: tuple, summary: str,
             "ethical_alignment_at_storage": float_ethical_alignment,
             "novelty_at_storage": novelty_score,
             "timestamp": timestamp,
-            "type": "concept_memory" # Categorize the node type (can be expanded).
+            "type": getattr(config, 'MEMORY_NODE_TYPE_CONCEPT', "concept_memory")
         }
         _knowledge_graph["nodes"].append(new_node) # Add the new node to the in-memory graph.
         
         # Handle relationships to other concepts if `related_concepts` is provided.
         if related_concepts and isinstance(related_concepts, list):
+            default_relation_type = getattr(config, 'MEMORY_DEFAULT_RELATION_TYPE', "related_to")
             for related_item_specifier in related_concepts:
                 target_node_id = None
                 if isinstance(related_item_specifier, str):
@@ -495,7 +544,7 @@ def store_memory(concept_name: str, concept_coord: tuple, summary: str,
                         "id": uuid.uuid4().hex, # Unique ID for the edge itself.
                         "source": memory_id, # ID of the new memory node.
                         "target": target_node_id, # ID of the related memory node.
-                        "relation_type": "related_to", # Default relationship type.
+                        "relation_type": default_relation_type, 
                         "timestamp": timestamp # Timestamp of relationship creation.
                     }
                     _knowledge_graph["edges"].append(new_edge) # Add edge to in-memory graph.
@@ -614,10 +663,17 @@ def get_recent_memories(limit: int = 10) -> list:
     """
     if not isinstance(limit, int) or limit < 0:
         _log_memory_event("get_recent_memories_invalid_limit", {"limit": limit}, level="warning")
-        # Default to 10 if limit is invalid, or could return empty list.
-        # For now, let's proceed with a default limit, or a very small one if limit was negative.
-        limit = 10 if limit >=0 else 0 
-        if limit == 0: return []
+        limit = getattr(config, 'DEFAULT_RECENT_MEMORIES_LIMIT', 10)
+        if limit <= 0: # Ensure limit is positive after fetching from config or if default is bad
+            return []
+            
+    # If limit was valid or corrected, use it.
+    # If it was initially None, it will be handled by the function logic to return all.
+    # However, the signature default is 10, so it won't be None unless explicitly passed.
+    # For safety, if somehow it became non-positive after config, ensure it's a sensible default.
+    if limit <= 0: 
+        limit = getattr(config, 'DEFAULT_RECENT_MEMORIES_LIMIT', 10)
+        if limit <= 0: limit = 10 # Ultimate fallback if config default is also bad.
 
 
     try:
@@ -711,22 +767,72 @@ _load_knowledge_graph()
 if __name__ == '__main__':
     # --- Test Utilities ---
     class TempConfigOverride:
-        # ... (Assume TempConfigOverride class is defined here as per previous step) ...
-        def __init__(self, temp_configs_dict):
+        """
+        A context manager for temporarily overriding attributes in the global `config` module.
+
+        This is useful for testing different configurations without permanently altering
+        the `config` object or needing to reload modules. It ensures that original
+        values are restored upon exiting the context.
+        """
+        def __init__(self, temp_configs_dict: dict):
+            """
+            Initializes the TempConfigOverride context manager.
+
+            Args:
+                temp_configs_dict (dict): A dictionary where keys are attribute names (str)
+                                          to be overridden in the `config` module, and values
+                                          are the temporary values for these attributes.
+            """
             self.temp_configs = temp_configs_dict
-            self.original_values = {}
+            self.original_values = {} # Stores original values of overridden attributes.
+
         def __enter__(self):
-            if not config: raise ImportError("Config module not loaded")
+            """
+            Sets up the temporary configuration overrides when entering the context.
+
+            Iterates through `self.temp_configs`, stores the original value of each
+            attribute from the `config` module (or a sentinel if it doesn't exist),
+            and then sets the attribute to its temporary value.
+
+            Returns:
+                self: The TempConfigOverride instance (or the config object itself).
+
+            Raises:
+                ImportError: If the global `config` module is not loaded/available.
+            """
+            if not config:  # Check if the global config object is available.
+                raise ImportError("Config module not loaded. TempConfigOverride cannot operate.")
+            
             for key, value in self.temp_configs.items():
-                self.original_values[key] = getattr(config, key, None)
+                # Store the original value if the attribute exists, otherwise store a sentinel.
+                if hasattr(config, key):
+                    self.original_values[key] = getattr(config, key)
+                else:
+                    self.original_values[key] = "__ATTR_NOT_SET__" # Sentinel for new attributes.
+                
+                # Set the temporary value.
                 setattr(config, key, value)
-            return self
+            return self # Or return config, depending on usage preference.
+
         def __exit__(self, exc_type, exc_val, exc_tb):
-            if not config: return
+            """
+            Restores the original configuration when exiting the context.
+
+            Iterates through the stored original values. If an attribute was newly added
+            during the override (original value is the sentinel), it's removed. Otherwise,
+            the attribute is restored to its original value.
+            """
+            if not config: # Should not happen if __enter__ succeeded, but good for robustness.
+                return
+
             for key, original_value in self.original_values.items():
-                if hasattr(config,key) and original_value is None and key not in self.temp_configs: pass
-                elif original_value is not None: setattr(config, key, original_value)
-                elif hasattr(config,key): delattr(config,key)
+                if original_value == "__ATTR_NOT_SET__":
+                    # If the attribute was added by this context manager, remove it.
+                    if hasattr(config, key):
+                        delattr(config, key)
+                else:
+                    # Otherwise, restore its original value.
+                    setattr(config, key, original_value)
 
     # --- Test Setup & Helper ---
     TEST_KG_FILENAME = "test_knowledge_graph.json" # In the same dir as memory.py for simplicity during test
@@ -736,37 +842,69 @@ if __name__ == '__main__':
         print("CRITICAL (memory.py __main__): Config module not loaded. Tests cannot proceed.", file=sys.stderr)
         sys.exit(1)
 
-    # Set VERBOSE_OUTPUT to True for test visibility, can be overridden per test.
     # Store original verbose setting if it exists, to restore it later.
     original_verbose_output = getattr(config, 'VERBOSE_OUTPUT', None)
-    config.VERBOSE_OUTPUT = True # Default for tests
+    # Set VERBOSE_OUTPUT to True for test visibility if needed, or manage via TempConfigOverride.
+    # For these tests, TempConfigOverride will handle VERBOSE_OUTPUT.
 
-    # Ensure paths are set up for test file (using current dir for test KG file)
-    # Test KG path will be relative to where memory.py is, or use absolute.
-    # For simplicity, let memory.py's dir be the base for TEST_KG_FILENAME
     module_dir = os.path.dirname(os.path.abspath(__file__))
     TEST_KNOWLEDGE_GRAPH_PATH = os.path.join(module_dir, TEST_KG_FILENAME)
+    TEST_SYSTEM_LOG_PATH = os.path.join(module_dir, "test_memory_system_log.json")
+
 
     def setup_test_environment():
-        """Clears the test KG file and resets in-memory graph state."""
+        """
+        Prepares the testing environment for memory module tests.
+
+        This involves:
+        1.  Deleting any existing test knowledge graph file.
+        2.  Resetting the in-memory `_knowledge_graph` and `_kg_dirty_flag` to a clean state.
+        """
         global _knowledge_graph, _kg_dirty_flag
         if os.path.exists(TEST_KNOWLEDGE_GRAPH_PATH):
             os.remove(TEST_KNOWLEDGE_GRAPH_PATH)
+        if os.path.exists(TEST_SYSTEM_LOG_PATH): # Also clean up system log for tests
+            os.remove(TEST_SYSTEM_LOG_PATH)
+            
         _knowledge_graph = {"nodes": [], "edges": []}
         _kg_dirty_flag = False
-        # _load_knowledge_graph() will be called implicitly by store_memory or explicitly in tests
-        # under TempConfigOverride if path is changed. For default path, this reset is key.
 
 
-    def run_test(test_func, *args):
+    def run_test(test_func, *args) -> bool:
+        """
+        Executes a given test function within a controlled test environment.
+
+        Sets up the environment (cleans state, uses temporary config for paths),
+        runs the test function, prints its status, handles exceptions, and ensures
+        test file cleanup.
+
+        Args:
+            test_func (callable): The test function to execute.
+            *args: Arguments to pass to the test function.
+
+        Returns:
+            bool: True if the test passes, False otherwise.
+        """
         test_name = test_func.__name__
         print(f"--- Running Test: {test_name} ---")
-        setup_test_environment() # Ensure clean slate for each test using the default test KG path
+        setup_test_environment() # Ensure clean slate for each test.
+        
+        # Default test config for paths, can be augmented by specific tests if needed.
+        test_run_config = {
+            "KNOWLEDGE_GRAPH_PATH": TEST_KNOWLEDGE_GRAPH_PATH, 
+            "SYSTEM_LOG_PATH": TEST_SYSTEM_LOG_PATH,
+            "MANIFOLD_RANGE": 100.0, # Example range for novelty calculation tests
+            "VERBOSE_OUTPUT": False # Keep tests quiet unless specifically testing verbose logs
+        }
+
         try:
-            with TempConfigOverride({"KNOWLEDGE_GRAPH_PATH": TEST_KNOWLEDGE_GRAPH_PATH, "SYSTEM_LOG_PATH": os.path.join(module_dir, "test_system_log.json")}):
-                 # Re-call _load_knowledge_graph with the new path if the test needs a fresh load from (non-existent) file
-                 _load_knowledge_graph()
+            with TempConfigOverride(test_run_config):
+                 # _load_knowledge_graph might be called by the test function itself
+                 # or by other functions it calls (e.g., store_memory).
+                 # Ensure it uses the overridden path by calling it after TempConfigOverride.
+                 _load_knowledge_graph() 
                  result = test_func(*args)
+            
             if result:
                 print(f"PASS: {test_name}")
             else:
@@ -777,275 +915,280 @@ if __name__ == '__main__':
             traceback.print_exc()
             return False
         finally:
-            # Clean up test files after each test
+            # Clean up test files after each test run.
             if os.path.exists(TEST_KNOWLEDGE_GRAPH_PATH):
                 os.remove(TEST_KNOWLEDGE_GRAPH_PATH)
-            if os.path.exists(os.path.join(module_dir, "test_system_log.json")):
-                os.remove(os.path.join(module_dir, "test_system_log.json"))
+            if os.path.exists(TEST_SYSTEM_LOG_PATH):
+                os.remove(TEST_SYSTEM_LOG_PATH)
 
 
     # --- Test Function Definitions ---
 
-    def test_load_knowledge_graph_logic():
+    def test_load_knowledge_graph_logic() -> bool:
+        """
+        Tests the `_load_knowledge_graph` function under various conditions:
+        - Non-existent knowledge graph file.
+        - Empty knowledge graph file.
+        - Malformed JSON in the file.
+        - Valid JSON but incorrect internal structure.
+        - Correctly formatted and structured knowledge graph file.
+        Verifies that the in-memory `_knowledge_graph` and `_kg_dirty_flag` are
+        set appropriately in each case.
+        """
         print("Testing _load_knowledge_graph scenarios...")
         global _knowledge_graph, _kg_dirty_flag
         
-        # 1. Non-existent file (should create empty graph)
-        if os.path.exists(TEST_KNOWLEDGE_GRAPH_PATH): os.remove(TEST_KNOWLEDGE_GRAPH_PATH)
-        _load_knowledge_graph()
-        if _knowledge_graph != {"nodes": [], "edges": []} or _kg_dirty_flag:
-            print("FAIL: Load non-existent file did not result in clean empty graph.")
-            return False
-        print("  PASS: Non-existent file.")
+        # Scenario 1: Non-existent file.
+        # `setup_test_environment` (called by `run_test`) already deletes this.
+        # `_load_knowledge_graph` is called within `run_test`'s TempConfigOverride context.
+        # Test function will typically call _load_knowledge_graph itself
+        # after TempConfigOverride sets up the path.
+        assert _knowledge_graph == {"nodes": [], "edges": []}, \
+            f"Load non-existent file: Graph not empty. Got: {_knowledge_graph}"
+        assert not _kg_dirty_flag, "Load non-existent file: Dirty flag True."
+        print("  PASS: Non-existent file results in clean empty graph.")
 
-        # 2. Empty file
+        # Scenario 2: Empty file.
         with open(TEST_KNOWLEDGE_GRAPH_PATH, 'w') as f: f.write("")
-        _load_knowledge_graph()
-        if _knowledge_graph != {"nodes": [], "edges": []} or _kg_dirty_flag:
-            print("FAIL: Load empty file did not result in clean empty graph.")
-            return False
-        print("  PASS: Empty file.")
+        _load_knowledge_graph() # Explicitly call load after creating the file.
+        assert _knowledge_graph == {"nodes": [], "edges": []}, "Load empty file: Graph not empty."
+        assert not _kg_dirty_flag, "Load empty file: Dirty flag True."
+        print("  PASS: Empty file results in clean empty graph.")
 
-        # 3. Malformed JSON
+        # Scenario 3: Malformed JSON.
         with open(TEST_KNOWLEDGE_GRAPH_PATH, 'w') as f: f.write("{malformed_json: ")
         _load_knowledge_graph()
-        if _knowledge_graph != {"nodes": [], "edges": []} or _kg_dirty_flag:
-            print("FAIL: Load malformed JSON did not result in clean empty graph.")
-            return False
-        print("  PASS: Malformed JSON.")
+        assert _knowledge_graph == {"nodes": [], "edges": []}, "Load malformed JSON: Graph not empty."
+        assert not _kg_dirty_flag, "Load malformed JSON: Dirty flag True."
+        print("  PASS: Malformed JSON results in clean empty graph.")
 
-        # 4. Incorrect structure (valid JSON, wrong content)
+        # Scenario 4: Incorrect structure (valid JSON, but not the expected graph format).
         with open(TEST_KNOWLEDGE_GRAPH_PATH, 'w') as f: json.dump({"not_nodes": [], "not_edges": []}, f)
         _load_knowledge_graph()
-        if _knowledge_graph != {"nodes": [], "edges": []} or _kg_dirty_flag:
-            print("FAIL: Load incorrect structure did not result in clean empty graph.")
-            return False
-        print("  PASS: Incorrect structure.")
+        assert _knowledge_graph == {"nodes": [], "edges": []}, "Load incorrect structure: Graph not empty."
+        assert not _kg_dirty_flag, "Load incorrect structure: Dirty flag True."
+        print("  PASS: Incorrect structure results in clean empty graph.")
 
-        # 5. Correctly formatted file
+        # Scenario 5: Correctly formatted file.
         correct_data = {"nodes": [{"id": "1", "label": "test"}], "edges": []}
         with open(TEST_KNOWLEDGE_GRAPH_PATH, 'w') as f: json.dump(correct_data, f)
         _load_knowledge_graph()
-        if _knowledge_graph != correct_data or _kg_dirty_flag:
-            print(f"FAIL: Load correct file failed. Got: {_knowledge_graph}, Dirty: {_kg_dirty_flag}")
-            return False
-        print("  PASS: Correctly formatted file.")
+        assert _knowledge_graph == correct_data, f"Load correct file: Data mismatch. Got: {_knowledge_graph}"
+        assert not _kg_dirty_flag, "Load correct file: Dirty flag True."
+        print("  PASS: Correctly formatted file loaded successfully.")
         return True
 
-    def test_save_on_change_mechanism():
+    def test_save_on_change_mechanism() -> bool:
+        """
+        Tests the `_save_knowledge_graph` function and `_kg_dirty_flag` logic.
+        Verifies:
+        - Saving is skipped if `_kg_dirty_flag` is False.
+        - Saving occurs if `_kg_dirty_flag` is True, creates the file, and resets the flag.
+        - Subsequent save is skipped if no new changes (flag remains False).
+        - Atomic write behavior (temp file cleanup).
+        """
         print("Testing save-on-change (_kg_dirty_flag logic)...")
         global _knowledge_graph, _kg_dirty_flag
         
-        # Initial state: no file, graph empty, flag false
-        if os.path.exists(TEST_KNOWLEDGE_GRAPH_PATH): os.remove(TEST_KNOWLEDGE_GRAPH_PATH)
-        _knowledge_graph = {"nodes": [], "edges": []}
-        _kg_dirty_flag = False
+        # Initial state (handled by setup_test_environment and _load_knowledge_graph in run_test).
+        assert not os.path.exists(TEST_KNOWLEDGE_GRAPH_PATH), "Test KG file exists at start of save test."
+        assert _knowledge_graph == {"nodes": [], "edges": []}, "KG not empty at start."
+        assert not _kg_dirty_flag, "Dirty flag True at start."
 
-        _save_knowledge_graph() # Should skip (not dirty)
-        if os.path.exists(TEST_KNOWLEDGE_GRAPH_PATH):
-            print("FAIL: Save occurred when not dirty (initial).")
-            return False
+        _save_knowledge_graph() # Should skip (not dirty).
+        assert not os.path.exists(TEST_KNOWLEDGE_GRAPH_PATH), "Save occurred when not dirty (initial)."
         print("  PASS: Initial save correctly skipped.")
 
-        # Modify graph (e.g. by a simplified store_memory action)
         _knowledge_graph["nodes"].append({"id": "test_node", "label": "Test"})
-        _kg_dirty_flag = True # Manually set for this test part
+        _kg_dirty_flag = True # Manually set for this part of the test.
         
-        _save_knowledge_graph() # Should save now (dirty)
-        if not os.path.exists(TEST_KNOWLEDGE_GRAPH_PATH):
-            print("FAIL: Save did not occur when dirty.")
-            return False
-        if _kg_dirty_flag: # Should be false after save
-            print("FAIL: Dirty flag not reset after save.")
-            return False
+        _save_knowledge_graph() # Should save now.
+        assert os.path.exists(TEST_KNOWLEDGE_GRAPH_PATH), "Save did not occur when dirty."
+        assert not _kg_dirty_flag, "Dirty flag not reset after save."
         mtime1 = os.path.getmtime(TEST_KNOWLEDGE_GRAPH_PATH)
         print("  PASS: Save occurred when dirty, flag reset.")
 
-        time.sleep(0.01) # Ensure modification time can change if file is rewritten
+        time.sleep(0.01) # Ensure enough time for mtime to differ if file is rewritten.
 
-        _save_knowledge_graph() # Should skip again (not dirty)
+        _save_knowledge_graph() # Should skip again (not dirty).
         mtime2 = os.path.getmtime(TEST_KNOWLEDGE_GRAPH_PATH)
-        if mtime1 != mtime2 : # Modification time should NOT change
-            print(f"FAIL: Save occurred when not dirty (subsequent). mtime1={mtime1}, mtime2={mtime2}")
-            # This check can be flaky on some systems/resolutions of mtime.
-            # A more robust check would be to read content, but that's more involved here.
-            # For now, mtime is a reasonable proxy.
-            # print("  INFO: mtime check for no-rewrite can be flaky. Verify logs if this fails unexpectedly.")
-        else:
-             print("  PASS: Subsequent save correctly skipped (mtime unchanged).")
+        # This mtime check can be flaky. A content check would be more robust but adds complexity.
+        assert mtime1 == mtime2, f"Save occurred when not dirty (subsequent). mtime1={mtime1}, mtime2={mtime2}"
+        print("  PASS: Subsequent save correctly skipped (mtime unchanged).")
         
-        # Test atomic write: check if temp file is absent after successful write
         temp_path = TEST_KNOWLEDGE_GRAPH_PATH + ".tmp"
-        if os.path.exists(temp_path):
-            print(f"FAIL: Temporary file {temp_path} still exists after save operations.")
-            return False
+        assert not os.path.exists(temp_path), f"Temporary file {temp_path} still exists."
         print("  PASS: Temporary file cleanup appears successful.")
-            
         return True
 
 
-    def test_calculate_novelty_scenarios():
+    def test_calculate_novelty_scenarios() -> bool:
+        """
+        Tests the `calculate_novelty` function across various scenarios:
+        - Empty knowledge graph (should result in maximum novelty).
+        - Identical concept (should result in very low novelty).
+        - Spatially close but textually different concept.
+        - Spatially distant but textually similar concept.
+        - Completely novel concept (spatially and textually).
+        - Malformed input coordinates.
+        """
         print("Testing calculate_novelty...")
         global _knowledge_graph
-        _knowledge_graph = {"nodes": [], "edges": []} # Start with empty graph
+        _knowledge_graph = {"nodes": [], "edges": []} # Start with empty graph for this test.
 
-        # 1. Empty graph (max novelty)
-        novelty = calculate_novelty((0,0,0,0), "summary1")
-        if not (0.99 <= novelty <= 1.0): # Allow for float precision
-            print(f"FAIL: Novelty on empty graph was {novelty}, expected ~1.0")
-            return False
-        print(f"  PASS: Empty graph novelty: {novelty:.2f}")
+        # Scenario 1: Empty graph.
+        novelty1 = calculate_novelty((0,0,0,0), "summary1")
+        assert 0.99 <= novelty1 <= 1.0, f"Novelty on empty graph was {novelty1}, expected ~1.0"
+        print(f"  PASS: Empty graph novelty: {novelty1:.2f}")
 
-        # Add a node
-        node1_coord = (10, 20, 30, 0.5) # Using larger coords to test normalization effect
+        # Add a node for comparison. MANIFOLD_RANGE is 100.0 from test_run_config.
+        node1_coord = (10, 20, 30, 0.5 * config.MANIFOLD_RANGE) # Using scaled t_coord for storage example
         node1_summary = "initial test summary for node one"
         _knowledge_graph["nodes"].append({"id": "n1", "coordinates": node1_coord, "summary": node1_summary, "label":"n1"})
 
-        # 2. Identical concept (very low novelty)
+        # Scenario 2: Identical concept.
         novelty_identical = calculate_novelty(node1_coord, node1_summary)
-        if novelty_identical > 0.1: # Should be very close to 0
-            print(f"FAIL: Novelty for identical concept was {novelty_identical}, expected close to 0.")
-            return False
+        assert novelty_identical <= 0.1, f"Novelty for identical concept was {novelty_identical}, expected close to 0."
         print(f"  PASS: Identical concept novelty: {novelty_identical:.4f}")
         
-        # 3. Spatially close, textually different
-        close_coord = (node1_coord[0]+0.1, node1_coord[1]-0.1, node1_coord[2], node1_coord[3]) # Small spatial diff
+        # Scenario 3: Spatially close, textually different.
+        close_coord = (node1_coord[0]+0.1, node1_coord[1]-0.1, node1_coord[2], node1_coord[3])
         novelty_sp_close_txt_diff = calculate_novelty(close_coord, "completely different summary text")
-        # Expect higher novelty than identical, dominated by text if weights are equal
-        if not (novelty_identical < novelty_sp_close_txt_diff <= 1.0):
-             print(f"FAIL: Spatially close/textually different check failed. N_ident={novelty_identical}, N_sp_close={novelty_sp_close_txt_diff}")
-             return False
+        assert novelty_identical < novelty_sp_close_txt_diff <= 1.0, \
+            f"Spatially close/textually different check failed. N_ident={novelty_identical}, N_sp_close={novelty_sp_close_txt_diff}"
         print(f"  PASS: Spatially close, textually different novelty: {novelty_sp_close_txt_diff:.2f}")
 
-        # 4. Spatially distant, textually similar
+        # Scenario 4: Spatially distant, textually similar.
         distant_coord = (node1_coord[0] + config.MANIFOLD_RANGE, node1_coord[1], node1_coord[2], node1_coord[3])
         novelty_sp_dist_txt_sim = calculate_novelty(distant_coord, node1_summary + " slight change")
-        if not (novelty_identical < novelty_sp_dist_txt_sim <= 1.0):
-             print(f"FAIL: Spatially distant/textually similar check failed. N_ident={novelty_identical}, N_sp_dist={novelty_sp_dist_txt_sim}")
-             return False
+        assert novelty_identical < novelty_sp_dist_txt_sim <= 1.0, \
+            f"Spatially distant/textually similar check failed. N_ident={novelty_identical}, N_sp_dist={novelty_sp_dist_txt_sim}"
         print(f"  PASS: Spatially distant, textually similar novelty: {novelty_sp_dist_txt_sim:.2f}")
 
-        # 5. Completely novel
+        # Scenario 5: Completely novel.
         novel_coord = (node1_coord[0] + config.MANIFOLD_RANGE, node1_coord[1] + config.MANIFOLD_RANGE, node1_coord[2], node1_coord[3])
         novelty_full = calculate_novelty(novel_coord, "brand new unique summary phrase")
-        if not (0.9 <= novelty_full <= 1.0): # Expect high novelty
-            print(f"FAIL: Fully novel concept was {novelty_full}, expected ~1.0")
-            return False
+        assert 0.9 <= novelty_full <= 1.0, f"Fully novel concept was {novelty_full}, expected ~1.0"
         print(f"  PASS: Fully novel concept novelty: {novelty_full:.2f}")
 
-        # 6. Malformed input coordinates
-        novelty_malformed = calculate_novelty(("bad", 1, 2, 3), "summary")
-        if novelty_malformed != 0.0:
-            print(f"FAIL: Malformed coord novelty was {novelty_malformed}, expected 0.0")
-            return False
-        novelty_malformed_len = calculate_novelty((1,2,3), "summary")
-        if novelty_malformed_len != 0.0:
-            print(f"FAIL: Malformed coord length novelty was {novelty_malformed_len}, expected 0.0")
-            return False
+        # Scenario 6: Malformed input coordinates.
+        novelty_malformed_type = calculate_novelty(("bad", 1, 2, 3), "summary")
+        assert novelty_malformed_type == 0.0, f"Malformed coord (type) novelty was {novelty_malformed_type}, expected 0.0"
+        novelty_malformed_len = calculate_novelty((1,2,3), "summary") # Wrong length
+        assert novelty_malformed_len == 0.0, f"Malformed coord (length) novelty was {novelty_malformed_len}, expected 0.0"
         print("  PASS: Malformed coordinate input handling.")
         return True
 
-    def test_store_and_retrieve_memory():
+    def test_store_and_retrieve_memory() -> bool:
+        """
+        Tests the `store_memory` function and various retrieval functions:
+        - `get_memory_by_id`
+        - `get_memories_by_concept_name` (exact and substring match)
+        - `get_recent_memories`
+        - `read_memory` (all and limited)
+        Covers successful storage, novelty rejection, ethical rejection, and relationship creation.
+        """
         print("Testing store_memory and retrieval functions...")
-        global _knowledge_graph, _kg_dirty_flag
+        global _knowledge_graph, _kg_dirty_flag # Test operates on global KG state
         
-        # Use TempConfigOverride for thresholds
-        with TempConfigOverride({"MEMORY_NOVELTY_THRESHOLD": 0.5, "MEMORY_ETHICAL_THRESHOLD": 0.6}):
-            # 1. Successful store
-            res_store1 = store_memory("concept1", (1,1,1,0.8), "summary one", 0.8, 0.7)
-            if not res_store1 or len(_knowledge_graph["nodes"]) != 1 or not _kg_dirty_flag: # Dirty flag should be true before save, then false after
-                print(f"FAIL: Successful store failed. Result: {res_store1}, Nodes: {len(_knowledge_graph['nodes'])}, Dirty: {_kg_dirty_flag}")
-                return False
+        # Config for thresholds is applied by TempConfigOverride in run_test.
+        # Here, we assume MEMORY_NOVELTY_THRESHOLD=0.5 and MEMORY_ETHICAL_THRESHOLD=0.6
+        # based on typical test setup, but it's better if tests explicitly set these if critical.
+        with TempConfigOverride({"MEMORY_NOVELTY_THRESHOLD": 0.5, "MEMORY_ETHICAL_THRESHOLD": 0.6, "VERBOSE_OUTPUT": False}):
+            # Scenario 1: Successful store of a new concept.
+            # Note: store_memory expects a 4-tuple for concept_coord.
+            # The 4th element is raw t_intensity (0-1) as per its docstring.
+            res_store1 = store_memory("concept1", (1,1,1,0.8), "summary one", intensity=0.8, ethical_alignment=0.7)
+            assert res_store1, "S1: Successful store failed."
+            assert len(_knowledge_graph["nodes"]) == 1, f"S1: Node count after store is {len(_knowledge_graph['nodes'])}, expected 1."
+            # _kg_dirty_flag is reset by _save_knowledge_graph called within store_memory.
+            assert not _kg_dirty_flag, "S1: Dirty flag not reset after successful store."
             node1_id = _knowledge_graph["nodes"][0]["id"]
             print(f"  PASS: Successful store (node1_id: {node1_id}).")
-            _kg_dirty_flag = True # Simulate change for next save test inside store_memory itself
 
-            # 2. Novelty Rejection (identical to concept1, novelty should be ~0)
-            res_store_low_novelty = store_memory("concept1_again", (1,1,1,0.8), "summary one", 0.8, 0.7)
-            if res_store_low_novelty or len(_knowledge_graph["nodes"]) != 1:
-                print(f"FAIL: Low novelty rejection failed. Stored: {res_store_low_novelty}, Nodes: {len(_knowledge_graph['nodes'])}")
-                return False
+            # Scenario 2: Attempt to store identical concept (should be rejected by novelty).
+            # calculate_novelty will compare to "concept1" and find it very similar.
+            res_store_low_novelty = store_memory("concept1_again", (1,1,1,0.8), "summary one", intensity=0.8, ethical_alignment=0.7)
+            assert not res_store_low_novelty, "S2: Low novelty rejection failed (item was stored)."
+            assert len(_knowledge_graph["nodes"]) == 1, f"S2: Node count changed after low novelty rejection. Expected 1, got {len(_knowledge_graph['nodes'])}."
             print("  PASS: Low novelty rejection.")
 
-            # 3. Ethical Rejection
-            res_store_low_ethics = store_memory("concept_unethical", (2,2,2,0.7), "summary two", 0.7, 0.5) # ethical 0.5 < threshold 0.6
-            if res_store_low_ethics or len(_knowledge_graph["nodes"]) != 1:
-                print(f"FAIL: Low ethical rejection failed. Stored: {res_store_low_ethics}, Nodes: {len(_knowledge_graph['nodes'])}")
-                return False
+            # Scenario 3: Attempt to store concept with low ethical score.
+            # This concept needs to be novel enough to pass the novelty check first.
+            res_store_low_ethics = store_memory("concept_unethical", (2,2,2,0.7), "summary two - novel", intensity=0.7, ethical_alignment=0.5) # ethical 0.5 < threshold 0.6
+            assert not res_store_low_ethics, "S3: Low ethical rejection failed (item was stored)."
+            assert len(_knowledge_graph["nodes"]) == 1, f"S3: Node count changed after low ethical rejection. Expected 1, got {len(_knowledge_graph['nodes'])}."
             print("  PASS: Low ethical rejection.")
             
-            # 4. Store another for relation testing
-            time.sleep(0.01) # ensure different timestamp
-            res_store2 = store_memory("concept2", (10,10,10,0.6), "summary for concept two", 0.6, 0.8)
-            if not res_store2 or len(_knowledge_graph["nodes"]) != 2:
-                print(f"FAIL: Store concept2 failed. Nodes: {len(_knowledge_graph['nodes'])}")
-                return False
-            node2_id = _knowledge_graph["nodes"][1]["id"]
+            # Scenario 4: Store another concept for relationship testing.
+            time.sleep(0.01) # Ensure different timestamp for recency tests.
+            res_store2 = store_memory("concept2", (10,10,10,0.6), "summary for concept two", intensity=0.6, ethical_alignment=0.8)
+            assert res_store2, "S4: Store concept2 failed."
+            assert len(_knowledge_graph["nodes"]) == 2, f"S4: Node count after store2 is {len(_knowledge_graph['nodes'])}, expected 2."
+            node2_id = _knowledge_graph["nodes"][1]["id"] # Assumes order of append. More robust: find by label.
+            if _knowledge_graph["nodes"][0]["label"] == "concept2": node2_id = _knowledge_graph["nodes"][0]["id"] # Adjust if order changed
+            elif _knowledge_graph["nodes"][1]["label"] == "concept2": node2_id = _knowledge_graph["nodes"][1]["id"]
+            else: assert False, "S4: Could not find concept2 to get its ID."
             print("  PASS: Successful store (concept2).")
 
-            # 5. Store with relations
+            # Scenario 5: Store a third concept with relationships to the first two.
             time.sleep(0.01)
-            res_store3 = store_memory("concept3_related", (5,5,5,0.5), "summary three related to 1 and 2", 0.5, 0.9, related_concepts=[node1_id, "concept2"]) # Mix ID and name
-            if not res_store3 or len(_knowledge_graph["nodes"]) != 3 or len(_knowledge_graph["edges"]) != 2:
-                print(f"FAIL: Store with relations failed. Nodes: {len(_knowledge_graph['nodes'])}, Edges: {len(_knowledge_graph['edges'])}")
-                return False
+            res_store3 = store_memory("concept3_related", (5,5,5,0.5), "summary three related to 1 and 2", 0.5, 0.9, related_concepts=[node1_id, "concept2"]) # Mix ID and name for relation.
+            assert res_store3, "S5: Store with relations failed."
+            assert len(_knowledge_graph["nodes"]) == 3, f"S5: Node count after store3 is {len(_knowledge_graph['nodes'])}, expected 3."
+            assert len(_knowledge_graph["edges"]) == 2, f"S5: Edge count after store3 is {len(_knowledge_graph['edges'])}, expected 2."
             print("  PASS: Store with relations.")
 
-            # Test retrieval functions
+            # --- Test Retrieval Functions ---
             ret_by_id = get_memory_by_id(node1_id)
-            if not ret_by_id or ret_by_id["label"] != "concept1":
-                print(f"FAIL: get_memory_by_id failed. Got: {ret_by_id}")
-                return False
+            assert ret_by_id and ret_by_id["label"] == "concept1", f"Retrieval by ID failed for concept1. Got: {ret_by_id}"
             print("  PASS: get_memory_by_id.")
 
             ret_by_name_exact = get_memories_by_concept_name("concept2")
-            if not ret_by_name_exact or len(ret_by_name_exact) != 1 or ret_by_name_exact[0]["id"] != node2_id:
-                print(f"FAIL: get_memories_by_concept_name (exact) failed. Got: {ret_by_name_exact}")
-                return False
+            assert ret_by_name_exact and len(ret_by_name_exact) == 1 and ret_by_name_exact[0]["id"] == node2_id, \
+                f"Exact name search for 'concept2' failed. Got: {ret_by_name_exact}"
             print("  PASS: get_memories_by_concept_name (exact).")
             
             ret_by_name_substr = get_memories_by_concept_name("concept", exact_match=False)
-            if len(ret_by_name_substr) != 3: # concept1, concept2, concept3_related
-                print(f"FAIL: get_memories_by_concept_name (substring) failed. Count: {len(ret_by_name_substr)}, Expected 3.")
-                return False
+            assert len(ret_by_name_substr) == 3, f"Substring search for 'concept' failed. Count: {len(ret_by_name_substr)}, Expected 3."
             print("  PASS: get_memories_by_concept_name (substring).")
 
-            recent_2 = get_recent_memories(2)
-            if len(recent_2) != 2 or recent_2[0]["label"] != "concept3_related" or recent_2[1]["label"] != "concept2":
-                print(f"FAIL: get_recent_memories(2) failed. Got: {[n['label'] for n in recent_2]}")
-                return False
+            recent_2 = get_recent_memories(2) # concept3_related, then concept2
+            assert len(recent_2) == 2, f"get_recent_memories(2) count mismatch. Expected 2, got {len(recent_2)}"
+            assert recent_2[0]["label"] == "concept3_related", f"get_recent_memories(2) order error - first: {recent_2[0]['label']}"
+            assert recent_2[1]["label"] == "concept2", f"get_recent_memories(2) order error - second: {recent_2[1]['label']}"
             print("  PASS: get_recent_memories(2).")
 
             all_mem_read = read_memory()
-            if len(all_mem_read) != 3 or all_mem_read[0]["label"] != "concept3_related":
-                print(f"FAIL: read_memory() all failed. Count: {len(all_mem_read)}, First: {all_mem_read[0]['label'] if all_mem_read else 'None'}")
-                return False
+            assert len(all_mem_read) == 3, f"read_memory() all count mismatch. Expected 3, got {len(all_mem_read)}."
+            assert all_mem_read[0]["label"] == "concept3_related", f"read_memory() all order error - first: {all_mem_read[0]['label'] if all_mem_read else 'None'}"
             print("  PASS: read_memory() all.")
             
             one_mem_read = read_memory(n=1)
-            if len(one_mem_read) != 1 or one_mem_read[0]['label'] != "concept3_related":
-                print(f"FAIL: read_memory(1) failed. Got: {[n['label'] for n in one_mem_read]}")
-                return False
+            assert len(one_mem_read) == 1, f"read_memory(1) count mismatch. Expected 1, got {len(one_mem_read)}."
+            assert one_mem_read[0]['label'] == "concept3_related", f"read_memory(1) content error: {one_mem_read[0]['label'] if one_mem_read else 'None'}"
             print("  PASS: read_memory(1).")
-
         return True
         
-    def test_retrieval_empty_graph():
+    def test_retrieval_empty_graph() -> bool:
+        """
+        Tests all retrieval functions on an empty knowledge graph.
+        Ensures they correctly return empty results or None without errors.
+        """
         print("Testing retrieval functions on an empty/cleared graph...")
         global _knowledge_graph
-        _knowledge_graph = {"nodes": [], "edges": []} # Ensure it's empty for this test
+        _knowledge_graph = {"nodes": [], "edges": []} # Ensure graph is empty.
 
-        if get_memory_by_id("any_id") is not None: return False
-        if get_memories_by_concept_name("any_name") != []: return False
-        if get_recent_memories(5) != []: return False
-        if read_memory() != []: return False
-        if read_memory(5) != []: return False
+        assert get_memory_by_id("any_id") is None, "get_memory_by_id not None on empty graph."
+        assert get_memories_by_concept_name("any_name") == [], "get_memories_by_concept_name not empty list on empty graph."
+        assert get_recent_memories(5) == [], "get_recent_memories not empty list on empty graph."
+        assert read_memory() == [], "read_memory() not empty list on empty graph."
+        assert read_memory(5) == [], "read_memory(5) not empty list on empty graph."
         print("  PASS: All retrieval functions correctly returned empty on empty graph.")
         return True
 
     # --- Main Test Execution Logic ---
     print("\n--- Starting Core Memory Self-Tests ---")
-    # Ensure config.KNOWLEDGE_GRAPH_PATH is set to the test path for all tests implicitly via run_test
     
     tests_to_run = [
         test_load_knowledge_graph_logic,
@@ -1057,25 +1200,22 @@ if __name__ == '__main__':
     
     results = []
     for test_fn in tests_to_run:
-        # run_test already calls setup_test_environment which uses TEST_KNOWLEDGE_GRAPH_PATH
-        results.append(run_test(test_fn))
-        time.sleep(0.05) # Small delay for file system ops if any and for log readability
+        results.append(run_test(test_fn)) # run_test handles setup and temp config
+        time.sleep(0.05) 
 
     print("\n--- Core Memory Self-Test Summary ---")
     passed_count = sum(1 for r in results if r)
     total_count = len(results)
     print(f"Tests Passed: {passed_count}/{total_count}")
 
-    # Restore original VERBOSE_OUTPUT if it was changed
     if original_verbose_output is not None:
         config.VERBOSE_OUTPUT = original_verbose_output
-    else: # If it didn't exist, remove the one we added for tests
-        if hasattr(config, 'VERBOSE_OUTPUT'): delattr(config, 'VERBOSE_OUTPUT')
+    elif hasattr(config, 'VERBOSE_OUTPUT'): 
+        delattr(config, 'VERBOSE_OUTPUT')
 
 
     if passed_count == total_count:
         print("All core memory tests PASSED successfully!")
-        # sys.exit(0) # In a CI environment, this would be appropriate.
     else:
         print("One or more core memory tests FAILED. Please review logs above.")
-        sys.exit(1) # Exit with error code if any test failed
+        sys.exit(1)

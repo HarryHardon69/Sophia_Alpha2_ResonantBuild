@@ -112,9 +112,6 @@ def get_shared_manifold(force_recreate: bool = False):
             _log_system_event("manifold_recreation_forced", 
                               {"message": "Forcing recreation of SpacetimeManifold instance."})
         
-        # Placeholder for SpacetimeManifold class definition
-        # This will be defined in a subsequent step.
-        # For now, to make this runnable, we can assign a dummy or check for its existence.
         if 'SpacetimeManifold' in globals():
             _shared_manifold_instance = SpacetimeManifold()
             _log_system_event("manifold_instance_created", 
@@ -146,6 +143,39 @@ class SpacetimeManifold:
     Manages SNN operations, concept bootstrapping, learning, and awareness metrics.
     """
     def __init__(self):
+        """
+        Initializes the SpacetimeManifold instance.
+
+        The initialization process involves:
+        1.  **Device Configuration**: Determines whether to use a GPU (if available and configured)
+            or CPU for tensor operations.
+        2.  **Parameter Loading**: Loads various operational parameters from the `config` module,
+            including manifold range, SNN resource profile settings (max neurons, resolution,
+            time steps), SNN input/output sizes, learning rates (STDP, Hebbian),
+            LIF neuron parameters (beta, threshold, surrogate gradient slope), and
+            optimizer settings (learning rate).
+        3.  **SNN Component Initialization**:
+            -   Sets up a fully connected linear layer (`nn.Linear`) to map input features
+                (e.g., embeddings) to the SNN's neuron layer.
+            -   Initializes Leaky Integrate-and-Fire (LIF) neurons (`snn.Leaky`) with
+                configurable beta (decay rate), threshold, and surrogate gradient function.
+                Learnable parameters like beta may be enabled.
+            -   Initializes membrane potential (`self.mem`) and output spike tensor (`self.spk`)
+                for the LIF neurons.
+        4.  **Optimizer Setup**: Configures an Adam optimizer (`torch.optim.Adam`) to adjust
+            the parameters of the fully connected layer and any learnable parameters within
+            the LIF neuron layer.
+        5.  **State Variable Initialization**: Sets up internal state variables such as:
+            -   `self.coordinates`: A dictionary to store concept names and their associated
+                4D coordinates (x, y, z, t_intensity).
+            -   `self.coherence`: A global metric representing the manifold's coherence.
+            -   `self.last_avg_stdp_weight_change`: Tracks the average weight change due to STDP
+                for monitoring self-evolution.
+
+        Raises:
+            ImportError: If the `config` module is not loaded, as it's critical for
+                         parameterizing the SpacetimeManifold.
+        """
         _log_system_event("manifold_initialization_start", {"message": "Initializing SpacetimeManifold..."})
 
         if not config:
@@ -174,33 +204,82 @@ class SpacetimeManifold:
 
 
         # --- Load Parameters from Config ---
-        self.range = float(config.MANIFOLD_RANGE)
+        try:
+            self.range = float(config.MANIFOLD_RANGE)
+        except (ValueError, TypeError) as e:
+            _log_system_event("manifold_init_param_error", {"parameter": "MANIFOLD_RANGE", "value": getattr(config, 'MANIFOLD_RANGE', 'NotSet'), "error": str(e)}, level="warning")
+            self.range = 1000.0 # Default
         
         # Resource Profile parameters
-        self.max_neurons = int(config.RESOURCE_PROFILE["MAX_NEURONS"])
-        self.resolution = float(config.RESOURCE_PROFILE["RESOLUTION"]) # May be used for coordinate scaling or grid density
-        self.snn_time_steps = int(config.RESOURCE_PROFILE["SNN_TIME_STEPS"])
+        try:
+            self.max_neurons = int(config.RESOURCE_PROFILE["MAX_NEURONS"])
+        except (ValueError, TypeError, KeyError) as e:
+            _log_system_event("manifold_init_param_error", {"parameter": "MAX_NEURONS", "value": config.RESOURCE_PROFILE.get("MAX_NEURONS") if isinstance(getattr(config, 'RESOURCE_PROFILE', None), dict) else 'N/A', "error": str(e)}, level="warning")
+            self.max_neurons = 200000 # Default
+        try:
+            self.resolution = float(config.RESOURCE_PROFILE["RESOLUTION"])
+        except (ValueError, TypeError, KeyError) as e:
+            _log_system_event("manifold_init_param_error", {"parameter": "RESOLUTION", "value": config.RESOURCE_PROFILE.get("RESOLUTION") if isinstance(getattr(config, 'RESOURCE_PROFILE', None), dict) else 'N/A', "error": str(e)}, level="warning")
+            self.resolution = 0.75 # Default
+        try:
+            self.snn_time_steps = int(config.RESOURCE_PROFILE["SNN_TIME_STEPS"])
+        except (ValueError, TypeError, KeyError) as e:
+            _log_system_event("manifold_init_param_error", {"parameter": "SNN_TIME_STEPS", "value": config.RESOURCE_PROFILE.get("SNN_TIME_STEPS") if isinstance(getattr(config, 'RESOURCE_PROFILE', None), dict) else 'N/A', "error": str(e)}, level="warning")
+            self.snn_time_steps = 250 # Default
 
         # SNN Architecture & Input
-        self.snn_input_size = int(config.SNN_INPUT_SIZE) # Dimension of input vectors (e.g., LLM embeddings)
-        # For now, output size of the SNN is equivalent to max_neurons (each neuron is an output feature)
-        self.snn_output_size = self.max_neurons 
+        try:
+            self.snn_input_size = int(config.SNN_INPUT_SIZE)
+        except (ValueError, TypeError) as e:
+            _log_system_event("manifold_init_param_error", {"parameter": "SNN_INPUT_SIZE", "value": getattr(config, 'SNN_INPUT_SIZE', 'NotSet'), "error": str(e)}, level="warning")
+            self.snn_input_size = config.DEFAULT_SNN_INPUT_SIZE 
+        
+        self.snn_output_size = self.max_neurons # For now, output size of the SNN is equivalent to max_neurons
 
         # Learning Parameters
-        # STDP window in seconds (config is in ms)
-        self.tau_stdp_s = float(config.STDP_WINDOW_MS) / 1000.0 
-        # Using HEBBIAN_LEARNING_RATE as the primary STDP learning rate as per task spec
-        self.lr_stdp = float(config.HEBBIAN_LEARNING_RATE) 
-        self.stdp_depression_factor = float(config.STDP_DEPRESSION_FACTOR)
-        # self.stdp_dt_threshold_s = float(config.STDP_DT_THRESHOLD_MS) / 1000.0 if hasattr(config, 'STDP_DT_THRESHOLD_MS') else 0.01 # Example if needed
+        try:
+            self.tau_stdp_s = float(config.STDP_WINDOW_MS) / 1000.0
+        except (ValueError, TypeError) as e:
+            _log_system_event("manifold_init_param_error", {"parameter": "STDP_WINDOW_MS", "value": getattr(config, 'STDP_WINDOW_MS', 'NotSet'), "error": str(e)}, level="warning")
+            self.tau_stdp_s = config.DEFAULT_STDP_WINDOW_MS / 1000.0
+        try:
+            self.lr_stdp = float(config.HEBBIAN_LEARNING_RATE)
+        except (ValueError, TypeError) as e:
+            _log_system_event("manifold_init_param_error", {"parameter": "HEBBIAN_LEARNING_RATE", "value": getattr(config, 'HEBBIAN_LEARNING_RATE', 'NotSet'), "error": str(e)}, level="warning")
+            self.lr_stdp = config.DEFAULT_HEBBIAN_LEARNING_RATE
+        try:
+            self.stdp_depression_factor = float(config.STDP_DEPRESSION_FACTOR)
+        except (ValueError, TypeError) as e:
+            _log_system_event("manifold_init_param_error", {"parameter": "STDP_DEPRESSION_FACTOR", "value": getattr(config, 'STDP_DEPRESSION_FACTOR', 'NotSet'), "error": str(e)}, level="warning")
+            self.stdp_depression_factor = config.DEFAULT_STDP_DEPRESSION_FACTOR
 
         # LIF Neuron Parameters
-        self.lif_beta = float(config.SNN_LIF_BETA) # Decay rate
-        self.lif_threshold = float(config.SNN_LIF_THRESHOLD) # Firing threshold
-        self.spike_grad = surrogate.fast_sigmoid(slope=float(config.SNN_SURROGATE_SLOPE))
+        try:
+            self.lif_beta = float(config.SNN_LIF_BETA)
+        except (ValueError, TypeError) as e:
+            _log_system_event("manifold_init_param_error", {"parameter": "SNN_LIF_BETA", "value": getattr(config, 'SNN_LIF_BETA', 'NotSet'), "error": str(e)}, level="warning")
+            self.lif_beta = config.DEFAULT_SNN_LIF_BETA
+        try:
+            self.lif_threshold = float(config.SNN_LIF_THRESHOLD)
+        except (ValueError, TypeError) as e:
+            _log_system_event("manifold_init_param_error", {"parameter": "SNN_LIF_THRESHOLD", "value": getattr(config, 'SNN_LIF_THRESHOLD', 'NotSet'), "error": str(e)}, level="warning")
+            self.lif_threshold = config.DEFAULT_SNN_LIF_THRESHOLD
+        try:
+            self.spike_grad = surrogate.fast_sigmoid(slope=float(config.SNN_SURROGATE_SLOPE))
+        except (ValueError, TypeError) as e:
+            _log_system_event("manifold_init_param_error", {"parameter": "SNN_SURROGATE_SLOPE", "value": getattr(config, 'SNN_SURROGATE_SLOPE', 'NotSet'), "error": str(e)}, level="warning")
+            self.spike_grad = surrogate.fast_sigmoid(slope=config.DEFAULT_SNN_SURROGATE_SLOPE)
 
         # Optimizer
-        self.optimizer_lr = float(config.SNN_OPTIMIZER_LR)
+        try:
+            self.optimizer_lr = float(config.SNN_OPTIMIZER_LR)
+        except (ValueError, TypeError) as e:
+            _log_system_event("manifold_init_param_error", {"parameter": "SNN_OPTIMIZER_LR", "value": getattr(config, 'SNN_OPTIMIZER_LR', 'NotSet'), "error": str(e)}, level="warning")
+            self.optimizer_lr = config.DEFAULT_SNN_OPTIMIZER_LR
+        
+        # Batch Size
+        self.batch_size = config.SNN_BATCH_SIZE
+
 
         # --- Initialize SNN Components ---
         # Fully connected layer: input_size -> output_size (max_neurons)
@@ -216,8 +295,6 @@ class SpacetimeManifold:
         ).to(self.device)
 
         # Initialize membrane potential and spikes
-        # Batch size is assumed to be 1 (processing one concept/input at a time)
-        self.batch_size = 1 
         # Initialize LIF membrane potential using snnTorch's utility for the defined LIF layer
         self.mem = self.lif1.init_leaky() 
         # Initialize spike tensor (output spikes) for the first step
@@ -476,12 +553,28 @@ class SpacetimeManifold:
 
         half_range = self.range / 2.0 # Pre-calculate for efficiency
         
+        # Helper to safely convert llm_data values to float
+        def _safe_float_convert(key_name, default_value=0.0):
+            val = llm_data.get(key_name, default_value)
+            try:
+                return float(val)
+            except (ValueError, TypeError) as e:
+                _log_system_event("llm_data_conversion_error", 
+                                  {"concept_name": concept_name, "key": key_name, "value": val, "error": str(e)}, 
+                                  level="warning")
+                return default_value
+
         # Clip values to expected ranges before scaling
-        x = np.clip(float(llm_data["valence"]), -1.0, 1.0) * half_range
-        y = np.clip(float(llm_data["abstraction"]), 0.0, 1.0) * half_range 
-        z = np.clip(float(llm_data["relevance"]), 0.0, 1.0) * half_range
+        x_valence = _safe_float_convert("valence", 0.0) # Default to neutral valence
+        y_abstraction = _safe_float_convert("abstraction", 0.5) # Default to mid-abstraction
+        z_relevance = _safe_float_convert("relevance", 0.0) # Default to no relevance
+        raw_intensity = _safe_float_convert("intensity", 0.1) # Default to low intensity
+
+        x = np.clip(x_valence, -1.0, 1.0) * half_range
+        y = np.clip(y_abstraction, 0.0, 1.0) * half_range 
+        z = np.clip(z_relevance, 0.0, 1.0) * half_range
         
-        raw_intensity = np.clip(float(llm_data["intensity"]), 0.0, 1.0) # This is the (0-1) intensity
+        raw_intensity = np.clip(raw_intensity, 0.0, 1.0) # This is the (0-1) intensity
         t_coord_intensity = raw_intensity * half_range # This is the scaled 't' coordinate
 
         coordinates = (x, y, z, t_coord_intensity) # Store as a tuple
@@ -658,8 +751,8 @@ class SpacetimeManifold:
             # This is a simplified representation; more complex mappings from concept features to SNN inputs are possible.
             input_features = torch.zeros(self.batch_size, self.snn_input_size, device=self.device)
             if self.snn_input_size > 0:
-                # Activate a portion of input neurons (e.g., first 10% or at least one)
-                num_active_inputs = min(self.snn_input_size, max(1, self.snn_input_size // 10)) 
+                # Activate a portion of input neurons
+                num_active_inputs = min(self.snn_input_size, max(1, int(self.snn_input_size * config.SNN_INPUT_ACTIVE_FRACTION)))
                 activation_value = concept_raw_intensity # Modulate activation by concept's raw intensity
                 input_features[0, :num_active_inputs] = activation_value
             
@@ -765,15 +858,12 @@ class SpacetimeManifold:
         
         thought_steps = [] # Initialize list to store logs of thought process
         response_text = ""
-        awareness_metrics = {
-            "curiosity": 0.1, # Default: Low curiosity
-            "context_stability": 0.5, # Default: Moderate stability
-            "self_evolution_rate": 0.0, # Default: No evolution detected
-            "coherence": 0.0, # Default: Neutral coherence
-            "active_llm_fallback": True, # Assume LLM fallback is active by default
-            "primary_concept_coord": (0.0, 0.0, 0.0, 0.0), # Default coordinates
-            "snn_error": None # Placeholder for any SNN processing errors
-        }
+        # Initialize with default awareness metrics from config
+        awareness_metrics = getattr(config, 'DEFAULT_BRAIN_AWARENESS_METRICS', {
+            "curiosity": 0.1, "context_stability": 0.5, "self_evolution_rate": 0.0,
+            "coherence": 0.0, "active_llm_fallback": True,
+            "primary_concept_coord": (0.0, 0.0, 0.0, 0.0), "snn_error": None
+        }).copy() # Use .copy() to avoid modifying the global default dict
 
         snn_processed_successfully = False # Flag to track if SNN processing completed
 
@@ -801,22 +891,24 @@ class SpacetimeManifold:
                     # Normalize mean_spikes_overall to a 0-1 range. Max possible is 1.0 (all neurons fire at every step).
                     normalized_mean_spikes = np.clip(mean_spikes_overall, 0.0, 1.0) 
                     # Combine normalized activity with a measure of dissonance (1 - abs(coherence)).
-                    awareness_metrics["curiosity"] = np.clip((normalized_mean_spikes + (1.0 - abs(self.coherence))) / 2.0, 0.0, 1.0)
+                    curiosity_coherence_factor = getattr(config, 'CURIOSITY_COHERENCE_FACTOR', 0.5)
+                    awareness_metrics["curiosity"] = np.clip((normalized_mean_spikes + (1.0 - abs(self.coherence))) * curiosity_coherence_factor, 0.0, 1.0)
                 else: # No spikes recorded, curiosity driven only by coherence/dissonance
-                    awareness_metrics["curiosity"] = np.clip((1.0 - abs(self.coherence)) / 2.0, 0.0, 1.0)
+                    curiosity_coherence_factor = getattr(config, 'CURIOSITY_COHERENCE_FACTOR', 0.5)
+                    awareness_metrics["curiosity"] = np.clip((1.0 - abs(self.coherence)) * curiosity_coherence_factor, 0.0, 1.0)
 
                 # Calculate Context Stability metric:
                 # Based on the standard deviation of SNN activity levels over time.
                 # Lower std_dev implies more stable activity.
                 if activity_levels and len(activity_levels) > 1:
                     std_dev_activity = np.std(activity_levels)
+                    context_stability_std_dev_factor = getattr(config, 'CONTEXT_STABILITY_STD_DEV_FACTOR', 2.0)
                     # Normalize stability: 1.0 for zero std_dev, decreasing as std_dev increases.
-                    # Max std_dev for 0/1 data is ~0.5. (2*std_dev) maps this to a 0-1 range for stability.
-                    awareness_metrics["context_stability"] = np.clip(1.0 - (2 * std_dev_activity), 0.0, 1.0) 
+                    awareness_metrics["context_stability"] = np.clip(1.0 - (context_stability_std_dev_factor * std_dev_activity), 0.0, 1.0) 
                 elif activity_levels and len(activity_levels) == 1: # Single activity reading
-                     awareness_metrics["context_stability"] = 0.75 # Moderately stable by default
+                     awareness_metrics["context_stability"] = getattr(config, 'DEFAULT_CONTEXT_STABILITY_SINGLE_READING', 0.75)
                 else: # No activity levels recorded
-                    awareness_metrics["context_stability"] = 0.25 # Low stability
+                    awareness_metrics["context_stability"] = getattr(config, 'DEFAULT_CONTEXT_STABILITY_NO_READING', 0.25)
 
                 snn_processed_successfully = True # Mark SNN path as successful
                 _log_system_event("think_snn_path_complete", {"input_text": input_text, "metrics": awareness_metrics})
@@ -871,28 +963,76 @@ class SpacetimeManifold:
 if __name__ == '__main__':
     # --- Test Utilities ---
     class TempConfigOverride:
-        # ... (previously defined TempConfigOverride class code) ...
-        # Ensure this class definition is present here.
-        # For brevity in this prompt, assuming it's correctly defined from Step 8.
-        def __init__(self, temp_configs):
+        """
+        A context manager for temporarily overriding attributes in the global `config` module.
+
+        This is useful for testing different configurations without permanently altering
+        the `config` object or needing to reload modules.
+        """
+        def __init__(self, temp_configs: dict):
+            """
+            Initializes the TempConfigOverride context manager.
+
+            Args:
+                temp_configs (dict): A dictionary where keys are attribute names (str)
+                                     to be overridden in the `config` module, and values
+                                     are the temporary values for these attributes.
+            """
             self.temp_configs = temp_configs
-            self.original_values = {}
+            self.original_values = {} # Stores original values of overridden attributes.
+
         def __enter__(self):
-            if not config: raise ImportError("Config module not loaded")
+            """
+            Sets up the temporary configuration overrides when entering the context.
+
+            Iterates through `self.temp_configs`, stores the original value of each
+            attribute from the `config` module (or a sentinel if it doesn't exist),
+            and then sets the attribute to its temporary value.
+
+            Returns:
+                self: The TempConfigOverride instance.
+
+            Raises:
+                ImportError: If the global `config` module is not loaded/available.
+            """
+            if not config:  # Check if the global config object is available.
+                raise ImportError("Config module not loaded. TempConfigOverride cannot operate.")
+            
             for key, value in self.temp_configs.items():
-                self.original_values[key] = getattr(config, key, None)
+                # Store the original value if the attribute exists, otherwise store a sentinel.
+                if hasattr(config, key):
+                    self.original_values[key] = getattr(config, key)
+                else:
+                    self.original_values[key] = "__ATTR_NOT_SET__" # Sentinel for new attributes
+                
+                # Set the temporary value.
                 setattr(config, key, value)
             return self
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            if not config: return
-            for key, original_value in self.original_values.items():
-                if hasattr(config, key) and original_value is None and key not in self.temp_configs:
-                    pass # Attribute was likely created by the test, not originally present
-                elif original_value is not None:
-                    setattr(config, key, original_value)
-                elif hasattr(config, key): # Attribute was created by test, and no original value to restore
-                    delattr(config, key)
 
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            """
+            Restores the original configuration when exiting the context.
+
+            Iterates through the stored original values. If an attribute was newly added
+            during the override (original value is the sentinel), it's removed. Otherwise,
+            the attribute is restored to its original value.
+
+            Args:
+                exc_type: The type of exception that caused the context to be exited, if any.
+                exc_val: The exception instance, if any.
+                exc_tb: The traceback object, if any.
+            """
+            if not config: # Should not happen if __enter__ succeeded, but good for robustness.
+                return
+
+            for key, original_value in self.original_values.items():
+                if original_value == "__ATTR_NOT_SET__":
+                    # If the attribute was added by this context manager, remove it.
+                    if hasattr(config, key):
+                        delattr(config, key)
+                else:
+                    # Otherwise, restore its original value.
+                    setattr(config, key, original_value)
 
     # --- Original __main__ preamble ---
     print("core/brain.py loaded as main.")
@@ -912,7 +1052,17 @@ if __name__ == '__main__':
 
 
     # --- Test Function Definitions ---
-    def run_test(test_func, *args):
+    def run_test(test_func, *args) -> bool:
+        """
+        Executes a given test function, prints its status, and handles exceptions.
+
+        Args:
+            test_func (callable): The test function to execute.
+            *args: Arguments to pass to the test function.
+
+        Returns:
+            bool: True if the test passes, False otherwise (or if an error occurs).
+        """
         test_name = test_func.__name__
         print(f"--- Running Test: {test_name} ---")
         try:
@@ -928,7 +1078,18 @@ if __name__ == '__main__':
             traceback.print_exc()
             return False
 
-    def test_snn_processing_and_stpd():
+    def test_snn_processing_and_stpd() -> bool:
+        """
+        Tests the SNN processing pathway, including STDP learning.
+        It configures the system to use a mock LLM for concept bootstrapping to ensure
+        predictability and speed, and enables the SNN. It checks if the SNN path
+        is taken (i.e., no LLM fallback), verifies that STDP causes weight changes
+        (or notes if no changes occur due to lack of spikes), and validates the
+        structure of the returned awareness metrics.
+
+        Returns:
+            bool: True if the test passes, False otherwise.
+        """
         print("Testing SNN processing path (SNN enabled, LLM mock for speed)...")
         # Ensure LLM is mocked to avoid actual API calls and ensure predictability
         # Also ensure SNN is enabled.
@@ -959,7 +1120,15 @@ if __name__ == '__main__':
             print(f"Awareness metrics (SNN path): {metrics}")
         return True
 
-    def test_llm_fallback_snn_disabled():
+    def test_llm_fallback_snn_disabled() -> bool:
+        """
+        Tests the LLM fallback mechanism when the SNN is explicitly disabled in config.
+        It uses a mock LLM. The test verifies that the `active_llm_fallback` metric
+        is True and that no SNN error is reported.
+
+        Returns:
+            bool: True if the test passes, False otherwise.
+        """
         print("Testing LLM fallback (SNN disabled, LLM mock)...")
         with TempConfigOverride({"ENABLE_SNN": False, "LLM_PROVIDER": "mock_for_snn_test", "VERBOSE_OUTPUT": False}):
             manifold = get_shared_manifold(force_recreate=True)
@@ -975,7 +1144,18 @@ if __name__ == '__main__':
             print(f"Awareness metrics (LLM fallback / SNN disabled): {metrics}")
         return True
 
-    def test_llm_fallback_snn_error():
+    def test_llm_fallback_snn_error() -> bool:
+        """
+        Tests the LLM fallback mechanism when an SNN error is simulated.
+        This test attempts to induce an error by setting SNN_TIME_STEPS to 0.
+        It verifies that `active_llm_fallback` is True and checks if an SNN error
+        is reported in the metrics. The effectiveness of error simulation depends
+        on how SNN_TIME_STEPS=0 is handled internally (error vs. no-op).
+
+        Returns:
+            bool: True if the test passes or if the behavior is as expected for no-op,
+                  False otherwise.
+        """
         print("Testing LLM fallback due to simulated SNN error (LLM mock)...")
         # To simulate an error, we can temporarily break something warp_manifold relies on
         # For example, by setting snn_time_steps to zero or an invalid value if not caught by __init__
@@ -1005,7 +1185,16 @@ if __name__ == '__main__':
         return True
 
 
-    def test_empty_input():
+    def test_empty_input() -> bool:
+        """
+        Tests how the system handles an empty input string.
+        It uses the SNN-enabled path with a mock LLM. It expects the system
+        to bootstrap a default or "unknown" concept and produce a response.
+
+        Returns:
+            bool: True if a response is generated and the concept seems to be a
+                  default/unknown one, False otherwise.
+        """
         print("Testing empty input string...")
         with TempConfigOverride({"ENABLE_SNN": True, "LLM_PROVIDER": "mock_for_snn_test", "VERBOSE_OUTPUT": False}):
             manifold = get_shared_manifold(force_recreate=True)
@@ -1023,7 +1212,15 @@ if __name__ == '__main__':
             print(f"Response for empty input: {response[:100]}...")
         return True
 
-    def test_awareness_metrics_structure():
+    def test_awareness_metrics_structure() -> bool:
+        """
+        Tests the structure of the awareness metrics dictionary returned by `think()`.
+        It runs the test for both SNN-enabled and LLM fallback paths.
+        It checks if all expected keys are present in the metrics dictionary.
+
+        Returns:
+            bool: True if the metrics structure is correct for both paths, False otherwise.
+        """
         print("Testing structure of awareness metrics dictionary...")
         # Test with SNN enabled first
         with TempConfigOverride({"ENABLE_SNN": True, "LLM_PROVIDER": "mock_for_snn_test", "VERBOSE_OUTPUT": False}):

@@ -35,16 +35,26 @@ def think(input_text: str, stream_thought_steps: bool = False) -> tuple[list, st
     if manifold:
         return manifold.think(input_text, stream_thought_steps=stream_thought_steps)
     else:
-        error_message = "CRITICAL: SpacetimeManifold not available. Cannot process thought."
+        # Try to import config to get default error messages, with a hardcoded fallback if unavailable
+        cfg = None
+        try:
+            from .. import config as cfg
+        except ImportError:
+            pass # cfg remains None
+
+        error_message = getattr(cfg, 'CRITICAL_MANIFOLD_ERROR_MSG', "CRITICAL: SpacetimeManifold not available. Cannot process thought.")
+        user_facing_error = getattr(cfg, 'USER_FACING_MANIFOLD_ERROR_MSG', "I am currently unable to process thoughts due to an internal initialization issue.")
+        default_awareness = getattr(cfg, 'AWARENESS_ERROR_DEFAULTS', {
+            "curiosity": 0, "context_stability": 0, "self_evolution_rate": 0,
+            "coherence": 0, "active_llm_fallback": True,
+            "primary_concept_coord": (0,0,0,0), "snn_error": "Manifold not initialized"
+        })
+        
         print(error_message, file=sys.stderr)
         return (
             [error_message], 
-            "I am currently unable to process thoughts due to an internal initialization issue.", 
-            {
-                "curiosity": 0, "context_stability": 0, "self_evolution_rate": 0, 
-                "coherence": 0, "active_llm_fallback": True, 
-                "primary_concept_coord": (0,0,0,0), "snn_error": "Manifold not initialized"
-            }
+            user_facing_error, 
+            default_awareness.copy() # Return a copy to prevent modification of the default
         )
 
 # --- Memory Exports ---

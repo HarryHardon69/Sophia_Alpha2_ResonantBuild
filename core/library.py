@@ -110,17 +110,24 @@ def summarize_text(text: str, max_length: int = 100) -> str:
     if not text: # Handles None or empty string
         return ""
     
+    # Determine actual max_length from config or use provided default
+    # This function is generic, so the parameter `max_length` is kept.
+    # Specific uses of this function will pass config-driven max_length.
+    
     if not isinstance(text, str):
         # Optionally, convert to string or raise an error
         # For now, assume we want to try converting it
         try:
             text = str(text)
-        except:
+        except: # pylint: disable=bare-except
             return "" # Or raise TypeError
 
     if len(text) <= max_length:
         return text
     else:
+        # Ensure max_length is at least 3 for "..."
+        if max_length < 3: 
+            return text[:max_length] # Or handle error, or return "..." if max_length > 0
         return text[:max_length - 3] + "..."
 
 # --- Data Validation Utilities ---
@@ -146,19 +153,22 @@ class Mitigator:
         """
         Initializes the Mitigator with thresholds and predefined keywords/phrases.
         """
-        self.alignment_threshold = 0.7
-        self.mitigation_threshold = 0.85 # Stricter than alignment_threshold for triggering moderation
-        self.sensitive_keywords_config_key = "LIBRARY_SENSITIVE_KEYWORDS" # Example key if made configurable
-        self.reframing_phrases_config_key = "LIBRARY_REFRAMING_PHRASES" # Example key
+        self.alignment_threshold = getattr(config, 'ETHICAL_ALIGNMENT_THRESHOLD', 0.7)
+        self.mitigation_threshold = getattr(config, 'MITIGATION_ETHICAL_THRESHOLD', 0.85)
+        self.sensitive_keywords_config_key = "LIBRARY_SENSITIVE_KEYWORDS" 
+        self.reframing_phrases_config_key = "LIBRARY_REFRAMING_PHRASES"
 
         # Load thresholds from config if available, otherwise use class defaults.
         if config:
-            self.alignment_threshold = getattr(config, 'ETHICAL_ALIGNMENT_THRESHOLD', self.alignment_threshold)
-            self.mitigation_threshold = getattr(config, 'MITIGATION_ETHICAL_THRESHOLD', self.mitigation_threshold)
-            # Log if defaults are used due to missing specific config values.
-            if not hasattr(config, 'ETHICAL_ALIGNMENT_THRESHOLD') or not hasattr(config, 'MITIGATION_ETHICAL_THRESHOLD'):
+            # These are already fetched using getattr with class defaults above.
+            # The logging checks if the attribute was specifically found in config.
+            if not hasattr(config, 'ETHICAL_ALIGNMENT_THRESHOLD'):
                 _log_library_event("mitigator_config_warning", 
-                                   {"message": "Mitigator using default ethical/mitigation thresholds; specific values not in config."}, 
+                                   {"message": f"Mitigator using default ETHICAL_ALIGNMENT_THRESHOLD ({self.alignment_threshold}); specific value not in config."}, 
+                                   level="warning")
+            if not hasattr(config, 'MITIGATION_ETHICAL_THRESHOLD'):
+                 _log_library_event("mitigator_config_warning", 
+                                   {"message": f"Mitigator using default MITIGATION_ETHICAL_THRESHOLD ({self.mitigation_threshold}); specific value not in config."}, 
                                    level="warning")
         else: # Config module itself is not loaded.
             _log_library_event("mitigator_config_warning", 
@@ -274,7 +284,8 @@ class Mitigator:
 
         # If any condition triggered mitigation:
         if trigger_mitigation:
-            content_summary_for_log = summarize_text(original_text, 75) # Create a brief summary for logs.
+            summary_max_len = getattr(config, 'MITIGATION_LOG_SUMMARY_MAX_LENGTH', 75)
+            content_summary_for_log = summarize_text(original_text, summary_max_len) # Create a brief summary for logs.
             log_data = {
                 "original_content_snippet": content_summary_for_log,
                 "ethical_score_at_mitigation": ethical_score,
@@ -295,8 +306,11 @@ class Mitigator:
             
             # Determine the severity of the response based on score and keywords.
             # Very low scores or specific keyword combinations in strict mode might lead to a generic placeholder.
-            # This is an example of tiered response logic.
-            if ethical_score < 0.3 or (strict_mode and ethical_score < 0.5 and keywords_found): 
+            severe_threshold = getattr(config, 'MITIGATION_SEVERE_ETHICAL_SCORE_THRESHOLD', 0.3)
+            strict_caution_threshold = getattr(config, 'MITIGATION_STRICT_CAUTION_ETHICAL_SCORE_THRESHOLD', 0.5)
+
+            if ethical_score < severe_threshold or \
+               (strict_mode and ethical_score < strict_caution_threshold and keywords_found): 
                 return f"[Content Moderated due to significant ethical concerns (Score: {ethical_score:.2f}). Please rephrase or seek assistance if needed.]"
             
             # Standard moderated response with reframing.
@@ -536,14 +550,17 @@ def store_knowledge(content: str, is_public: bool = False, source_uri: str = Non
     entry_id = hashlib.sha256(content.encode('utf-8')).hexdigest()
     timestamp = datetime.datetime.utcnow().isoformat() + "Z" # ISO 8601 UTC timestamp.
     content_hash = entry_id # Alias for clarity, as entry_id is the hash.
-    content_preview = summarize_text(content, max_length=150) # Short preview for logs or listings.
+    
+    preview_max_len = getattr(config, 'KNOWLEDGE_PREVIEW_MAX_LENGTH', 150)
+    content_preview = summarize_text(content, max_length=preview_max_len) # Short preview for logs or listings.
 
     # --- Manifold Coordinate Generation (Interaction with core.brain) ---
     # Attempt to get coordinates and related data for the content by treating its preview as a concept name.
     # This requires the brain module and its `bootstrap_concept_from_llm` method to be available.
-    concept_name_for_coord = summarize_text(content_preview, max_length=20).strip().replace('...', '')
+    coord_concept_name_max_len = getattr(config, 'KNOWLEDGE_COORD_CONCEPT_NAME_MAX_LENGTH', 20)
+    concept_name_for_coord = summarize_text(content_preview, max_length=coord_concept_name_max_len).strip().replace('...', '')
     if not concept_name_for_coord: # Ensure a non-empty concept name for bootstrapping.
-        concept_name_for_coord = "generic library content" # Fallback concept name.
+        concept_name_for_coord = getattr(config, 'KNOWLEDGE_DEFAULT_COORD_CONCEPT_NAME', "generic library content")
     
     manifold = get_shared_manifold() # Get the shared SpacetimeManifold instance.
     coordinates = None      # Default: (x,y,z,t_coord), where t_coord is scaled.
@@ -635,7 +652,7 @@ def store_knowledge(content: str, is_public: bool = False, source_uri: str = Non
         "coordinates": coordinates, # 4D tuple (x,y,z,t_coord from brain) or None.
         "raw_t_intensity": intensity_val, # Float (0-1) intensity from brain, or default.
         "ethics_score": ethics_score_value, # Calculated ethical score (0-1).
-        "version": "1.0" # Version of this entry structure.
+        "version": getattr(config, 'KNOWLEDGE_ENTRY_SCHEMA_VERSION', "1.0")
     }
 
     # --- Public Storage Consent (Placeholder for CLI Interaction) ---
@@ -766,12 +783,25 @@ if __name__ == "__main__":
     
     # To make this __main__ block runnable for quick checks, we might need a mock config.
     class MockConfig:
+        """
+        A mock configuration class for standalone testing of library.py.
+        Provides minimal necessary attributes that `library.py` expects from a config object
+        when it's run directly and the main application config isn't available.
+        """
         # Define attributes expected by library.py for basic operation
         LIBRARY_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_knowledge_library.json")
         SYSTEM_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_system_log.txt")
         LOG_LEVEL = "debug"
         
-        def ensure_path(self, path):
+        def ensure_path(self, path: str):
+            """
+            Mock version of the config.ensure_path utility.
+            Ensures that the directory for the given path exists.
+
+            Args:
+                path (str): The file or directory path for which the parent directory
+                            (if a file path) or the directory itself needs to exist.
+            """
             dir_name = os.path.dirname(path)
             if dir_name and not os.path.exists(dir_name):
                 os.makedirs(dir_name, exist_ok=True)
@@ -861,59 +891,92 @@ if __name__ == "__main__":
     # --- Test Utilities ---
     class TempConfigOverride:
         """
-        Temporarily overrides attributes in the 'config' module (or a mock object if 'config' is None).
-        Restores original values or removes attributes upon exit.
+        A context manager for temporarily overriding attributes in the global `config` module
+        or a mock `config` object if the global `config` is None.
+
+        This is useful for testing different configurations without permanently altering
+        the `config` object or needing to reload modules. It handles cases where the
+        global `config` might be None (e.g., during standalone module testing before
+        full application initialization).
         """
-        def __init__(self, temp_configs_dict):
+        def __init__(self, temp_configs_dict: dict):
+            """
+            Initializes the TempConfigOverride context manager.
+
+            Args:
+                temp_configs_dict (dict): A dictionary where keys are attribute names (str)
+                                          to be overridden in the `config` module, and values
+                                          are the temporary values for these attributes.
+            """
             self.temp_configs = temp_configs_dict
-            self.original_values = {}
-            self.config_module_was_none = False
-            self.original_global_config = None # To store the original global 'config'
+            self.original_values = {} # Stores original values of overridden attributes.
+            self.config_module_was_none = False # Flag if global `config` was initially None.
+            self.original_global_config = None # Stores the reference to the original global `config`.
 
         def __enter__(self):
-            global config # We need to modify the global 'config' directly
-            self.original_global_config = config # Store the original global config
+            """
+            Sets up the temporary configuration overrides when entering the context.
 
-            if config is None:
+            If the global `config` is None, a temporary dummy `config` object is created
+            for the duration of the context. Original attribute values are stored, and
+            temporary values are set.
+
+            Returns:
+                The `config` object (either the original or the temporary dummy)
+                with overrides applied.
+            """
+            global config # Allow modification of the global 'config' variable.
+            self.original_global_config = config # Store the original global config.
+
+            if config is None: # If global 'config' is not loaded.
                 self.config_module_was_none = True
-                # Create a dummy config object if it's None
-                class DummyConfig: pass
-                config = DummyConfig() # Assign new dummy to global 'config'
-                # print("TempConfigOverride: Global 'config' was None, created dummy config module for test.", file=sys.stderr)
+                class DummyConfig: pass # Create a simple placeholder class.
+                config = DummyConfig() # Assign the dummy to the global 'config'.
             
+            # Apply temporary configurations.
             for key, value in self.temp_configs.items():
-                if hasattr(config, key):
+                if hasattr(config, key): # If attribute exists.
                     self.original_values[key] = getattr(config, key)
-                else:
-                    self.original_values[key] = "__ATTR_NOT_SET__" # Sentinel
-                setattr(config, key, value)
-            return config # Return the (potentially modified) global config
+                else: # Attribute does not exist, will be added temporarily.
+                    self.original_values[key] = "__ATTR_NOT_SET__" # Sentinel.
+                setattr(config, key, value) # Set the temporary value.
+            return config # Return the modified config object.
 
         def __exit__(self, exc_type, exc_val, exc_tb):
-            global config # Ensure we're referencing the global 'config'
-            
-            current_config_module = config # This is the module we modified (or the dummy)
+            """
+            Restores the original configuration when exiting the context.
 
+            Reverts changes made to the `config` object, removing temporarily added
+            attributes or restoring original values. If a dummy `config` was used,
+            the global `config` is restored to its original state (e.g., None).
+            """
+            global config # Allow modification of the global 'config' variable.
+            
+            current_config_module_being_restored = config # The config object that was modified.
+
+            # Restore original attribute values.
             for key, original_value in self.original_values.items():
-                if original_value == "__ATTR_NOT_SET__":
-                    if hasattr(current_config_module, key):
-                        delattr(current_config_module, key)
-                else:
-                    setattr(current_config_module, key, original_value)
+                if original_value == "__ATTR_NOT_SET__": # If attribute was temporarily added.
+                    if hasattr(current_config_module_being_restored, key):
+                        delattr(current_config_module_being_restored, key) # Remove it.
+                else: # Attribute existed before, restore its original value.
+                    setattr(current_config_module_being_restored, key, original_value)
             
-            # Restore the original global 'config' reference
+            # Restore the original global 'config' object itself.
             config = self.original_global_config
-            
-            # If we created a dummy config and the original was None,
-            # 'config' is now restored to None.
-            # If the original was a module and we used it, it's restored to that module.
-            # print(f"TempConfigOverride: Restored global 'config' to its original state: {type(config)}", file=sys.stderr)
 
 
     TEST_LIBRARY_LOG_FILENAME = "test_library_log.json"
     TEST_SYSTEM_LOG_FILENAME = "test_library_system_log.txt" # For _log_library_event testing
 
-    def delete_test_files(test_path=None, system_log_path=None):
+    def delete_test_files(test_path: str = None, system_log_path: str = None):
+        """
+        Deletes specified test files if they exist. Used for cleaning up before/after tests.
+
+        Args:
+            test_path (str, optional): Path to the main test data file (e.g., library log).
+            system_log_path (str, optional): Path to the test system log file.
+        """
         if test_path and os.path.exists(test_path):
             try:
                 os.remove(test_path)
@@ -925,36 +988,47 @@ if __name__ == "__main__":
             except OSError as e:
                 print(f"Warning: Could not delete test system log {system_log_path}: {e}", file=sys.stderr)
 
-    def setup_test_environment(test_specific_configs=None, test_run_id="default"):
+    def setup_test_environment(test_specific_configs: dict = None, test_run_id: str = "default") -> tuple[dict, str, str]:
         """
-        Sets up the test environment: deletes old test files, resets library state,
-        and applies temporary config overrides.
-        Returns the path to the test library file.
+        Sets up the test environment for library module tests.
+
+        This involves:
+        1.  Generating unique paths for test library and system log files based on `test_run_id`.
+        2.  Deleting any existing test files at these paths.
+        3.  Resetting global library state variables (`KNOWLEDGE_LIBRARY`, `_library_dirty_flag`, `_LIBRARY_FILE_PATH`).
+        4.  Constructing a configuration dictionary for `TempConfigOverride`, including
+            paths to test-specific files and default test settings.
+
+        Args:
+            test_specific_configs (dict, optional): Configuration overrides specific to the current test.
+            test_run_id (str, optional): An identifier for the test run, used to create unique
+                                         filenames for test outputs. Defaults to "default".
+
+        Returns:
+            tuple[dict, str, str]: A tuple containing:
+                - The dictionary of configurations to be used with `TempConfigOverride`.
+                - The path to the test library file for this environment setup.
+                - The path to the test system log file for this environment setup.
         """
         global KNOWLEDGE_LIBRARY, _library_dirty_flag, _LIBRARY_FILE_PATH
         
-        # Generate unique filenames for this test run to allow parallel tests if ever needed
-        # For now, simple fixed names are fine, but cleanup is important.
         current_dir = os.path.dirname(os.path.abspath(__file__))
         test_lib_path = os.path.join(current_dir, f"test_library_log_{test_run_id}.json")
         test_sys_log_path = os.path.join(current_dir, f"test_library_system_log_{test_run_id}.txt")
 
         delete_test_files(test_lib_path, test_sys_log_path)
 
-        # Reset module-level state
         KNOWLEDGE_LIBRARY = {}
         _library_dirty_flag = False
-        _LIBRARY_FILE_PATH = None # Will be reset by _initialize_library_path
+        _LIBRARY_FILE_PATH = None # Will be reset by _initialize_library_path within TempConfigOverride context
 
-        # Default configs for testing
         base_test_configs = {
             "LIBRARY_LOG_PATH": test_lib_path,
             "SYSTEM_LOG_PATH": test_sys_log_path,
-            "VERBOSE_OUTPUT": False, # Keep tests quieter unless specifically testing verbose output
-            "LOG_LEVEL": "debug", # Capture all logs for tests
-            "REQUIRE_PUBLIC_STORAGE_CONSENT": True, # Default to True for testing consent path
-            "ensure_path": lambda path_to_ensure: os.makedirs(os.path.dirname(path_to_ensure), exist_ok=True) if os.path.dirname(path_to_ensure) else None,
-            # Mitigator defaults (can be overridden by test_specific_configs)
+            "VERBOSE_OUTPUT": False, 
+            "LOG_LEVEL": "debug", 
+            "REQUIRE_PUBLIC_STORAGE_CONSENT": True,
+            "ensure_path": lambda path_to_ensure: os.makedirs(os.path.dirname(path_to_ensure), exist_ok=True) if os.path.dirname(path_to_ensure) and not os.path.exists(os.path.dirname(path_to_ensure)) else None,
             "ETHICAL_ALIGNMENT_THRESHOLD": 0.6, 
             "MITIGATION_ETHICAL_THRESHOLD": 0.7,
             "LIBRARY_SENSITIVE_KEYWORDS": ["test_sensitive"],
@@ -963,48 +1037,61 @@ if __name__ == "__main__":
         if test_specific_configs:
             base_test_configs.update(test_specific_configs)
         
-        # TempConfigOverride will handle applying these.
-        # The actual _initialize_library_path and _load_knowledge_library calls
-        # should happen *within* each test function's TempConfigOverride context.
         return base_test_configs, test_lib_path, test_sys_log_path
 
 
     # --- Test Scenario Implementations ---
     test_results = {"passed": 0, "failed": 0, "details": []}
 
-    def _run_test(test_func, test_name, *args):
+    def _run_test(test_func, test_name: str, *args):
+        """
+        Wrapper function to execute a single test case.
+        Manages printing test status, accumulating results, and error handling.
+        Restores mocked global functions after each test.
+
+        Args:
+            test_func (callable): The test function to execute.
+            test_name (str): The name of the test, for reporting.
+            *args: Arguments to pass to the test function.
+        """
         print(f"\n--- Running {test_name} ---")
+        # Store original global functions that might be patched by tests.
         original_get_shared_manifold = globals().get('get_shared_manifold')
         original_score_ethics = globals().get('score_ethics')
-        original_input = __builtins__.input if hasattr(__builtins__, 'input') else None
+        original_input = __builtins__.get('input') # Use .get for safety if input somehow removed.
 
         try:
-            test_func(*args)
+            test_func(*args) # Execute the actual test function.
             test_results["passed"] += 1
             test_results["details"].append(f"[PASS] {test_name}")
             print(f"[PASS] {test_name}")
-        except AssertionError as e:
+        except AssertionError as e_assert: # Catch assertion errors specifically.
             test_results["failed"] += 1
             error_info = traceback.format_exc()
-            test_results["details"].append(f"[FAIL] {test_name}: {e}\n{error_info}")
-            print(f"[FAIL] {test_name}: Assertion Error: {e}\n{error_info}", file=sys.stderr)
-        except Exception as e:
+            test_results["details"].append(f"[FAIL] {test_name}: AssertionError: {e_assert}\n{error_info}")
+            print(f"[FAIL] {test_name}: AssertionError: {e_assert}\n{error_info}", file=sys.stderr)
+        except Exception as e_general: # Catch any other exceptions.
             test_results["failed"] += 1
             error_info = traceback.format_exc()
-            test_results["details"].append(f"[FAIL] {test_name}: Exception: {e}\n{error_info}")
-            print(f"[FAIL] {test_name}: Exception: {e}\n{error_info}", file=sys.stderr)
+            test_results["details"].append(f"[FAIL] {test_name}: Exception: {e_general}\n{error_info}")
+            print(f"[FAIL] {test_name}: Exception: {e_general}\n{error_info}", file=sys.stderr)
         finally:
-            # Restore original functions if they were patched globally by a test
-            # This is a basic way; proper test frameworks handle fixtures and cleanup better.
-            globals()['get_shared_manifold'] = original_get_shared_manifold
-            globals()['score_ethics'] = original_score_ethics
+            # Restore any globally patched objects to their original state.
+            # This is crucial for test isolation if tests modify shared global resources.
+            if 'get_shared_manifold' in globals() and original_get_shared_manifold is not None:
+                globals()['get_shared_manifold'] = original_get_shared_manifold
+            if 'score_ethics' in globals() and original_score_ethics is not None:
+                globals()['score_ethics'] = original_score_ethics
             if original_input is not None and hasattr(__builtins__, 'input'):
-                 __builtins__.input = original_input
-            elif hasattr(__builtins__, 'input') and original_input is None: # if it was added by a test
-                 del __builtins__.input
+                 __builtins__['input'] = original_input
+            elif hasattr(__builtins__, 'input') and original_input is None and 'input' in __builtins__:
+                 # If 'input' was added by a test and wasn't there originally (less common for builtins).
+                 del __builtins__['input']
+
 
     # Test Functions
     def test_text_utilities():
+        """Tests text utility functions `sanitize_text` and `summarize_text`."""
         assert sanitize_text("  hello world  ") == "hello world"
         assert sanitize_text("hello \t\n world") == "hello world"
         assert sanitize_text("") == ""
@@ -1018,6 +1105,7 @@ if __name__ == "__main__":
         assert summarize_text("exactlengthplus1", 11) == "exactlen..."
 
     def test_is_valid_coordinate():
+        """Tests the `is_valid_coordinate` validation function."""
         assert is_valid_coordinate((1,2,3)) == True
         assert is_valid_coordinate([1,2,3,4.0]) == True
         assert is_valid_coordinate((1,2)) == False # Too short
@@ -1026,6 +1114,7 @@ if __name__ == "__main__":
         assert is_valid_coordinate("1,2,3") == False # Wrong type
 
     def test_mitigator_class():
+        """Tests the `Mitigator` class for content moderation logic."""
         test_configs, _, _ = setup_test_environment({"ETHICAL_ALIGNMENT_THRESHOLD": 0.5, "MITIGATION_ETHICAL_THRESHOLD": 0.6, "LIBRARY_SENSITIVE_KEYWORDS": ["danger", "badword"]}, test_run_id="mitigator")
         with TempConfigOverride(test_configs):
             _initialize_library_path() # Mitigator uses _log_library_event which might need config
@@ -1041,43 +1130,42 @@ if __name__ == "__main__":
 
             # Low ethical score
             moderated = mitigator.moderate_ethically_flagged_content("low score content", 0.4)
-            assert "[Content Under Review" in moderated or "[Content Moderated" in moderated
+            assert "[Content Under Review" in moderated or "[Content Moderated" in moderated # Check for either prefix
             
             # High score but sensitive keyword
             moderated = mitigator.moderate_ethically_flagged_content("high score but danger word", 0.9)
             assert "[Content Under Review" in moderated or "[Content Moderated" in moderated
             
-            # Strict mode, score below alignment but above mitigation_threshold (if thresholds are different enough)
-            # With current test_configs: alignment=0.5, mitigation=0.6. So score 0.55 + strict_mode
+            # Strict mode, score below alignment but above mitigation_threshold
             moderated = mitigator.moderate_ethically_flagged_content("strict mode test content", 0.55, strict_mode=True)
             assert "[Content Under Review" in moderated or "[Content Moderated" in moderated
             
-             # Very low score -> generic placeholder
-            moderated = mitigator.moderate_ethically_flagged_content("very bad content", 0.1)
-            assert "[Content Moderated due to Ethical Concerns" in moderated
-            assert "Please rephrase or contact support" in moderated
+             # Very low score -> generic placeholder (stronger mitigation)
+            moderated_low_score = mitigator.moderate_ethically_flagged_content("very bad content", 0.1)
+            assert "[Content Moderated due to significant ethical concerns" in moderated_low_score
 
-            # High score, no keywords
+            # High score, no keywords (should return original text)
             original = "perfectly fine content"
             moderated = mitigator.moderate_ethically_flagged_content(original, 0.95)
             assert moderated == original
 
     def test_knowledge_library_persistence():
+        """Tests the persistence (_load, _save) of the knowledge library."""
         test_configs, test_lib_path, _ = setup_test_environment(test_run_id="persistence")
         with TempConfigOverride(test_configs):
-            _initialize_library_path() # Sets _LIBRARY_FILE_PATH based on temp config
-            _load_knowledge_library() # Should load empty or create new
+            _initialize_library_path() 
+            _load_knowledge_library() 
             assert len(KNOWLEDGE_LIBRARY) == 0, "Library not empty at start of persistence test"
 
             KNOWLEDGE_LIBRARY["test001"] = {"data": "my test data", "timestamp": "now"}
-            global _library_dirty_flag # Make sure we're affecting the global
+            global _library_dirty_flag 
             _library_dirty_flag = True
             _save_knowledge_library()
             
             assert os.path.exists(test_lib_path), "Library file not created by save"
             assert _library_dirty_flag == False, "Dirty flag not reset after save"
 
-            KNOWLEDGE_LIBRARY.clear() # Clear in-memory
+            KNOWLEDGE_LIBRARY.clear() 
             _load_knowledge_library()
             assert len(KNOWLEDGE_LIBRARY) == 1, "Library not loaded correctly"
             assert KNOWLEDGE_LIBRARY["test001"]["data"] == "my test data", "Loaded data mismatch"
@@ -1086,116 +1174,120 @@ if __name__ == "__main__":
 
     @mock.patch('core.library.score_ethics')
     @mock.patch('core.library.get_shared_manifold')
-    @mock.patch('builtins.input')
+    @mock.patch('builtins.input') # Mock the built-in input function
     def test_store_knowledge(mock_input, mock_get_manifold, mock_score_ethics_func):
-        # Setup mock manifold and its methods
+        """
+        Tests the `store_knowledge` function including interactions with mocks
+        for manifold, ethics scoring, and user input (for consent).
+        Covers scenarios: private storage, public storage with consent granted/denied,
+        and handling of failures in brain/ethics module interactions.
+        """
         mock_manifold_instance = mock.MagicMock()
-        mock_manifold_instance.bootstrap_concept_from_llm = mock.MagicMock(return_value=((0.1, 0.2, 0.3, 0.4), 0.5, "Mock summary from LLM"))
+        mock_manifold_instance.bootstrap_concept_from_llm.return_value = ((0.1, 0.2, 0.3, 0.4), 0.5, "Mock summary from LLM")
         mock_get_manifold.return_value = mock_manifold_instance
         
         test_run_id = "store"
-        test_configs, test_lib_path, test_sys_log_path = setup_test_environment({"REQUIRE_PUBLIC_STORAGE_CONSENT": True}, test_run_id=test_run_id)
+        # REQUIRE_PUBLIC_STORAGE_CONSENT is True by default in setup_test_environment
+        test_configs, test_lib_path, test_sys_log_path = setup_test_environment(test_run_id=test_run_id)
 
         with TempConfigOverride(test_configs):
             _initialize_library_path()
             _load_knowledge_library()
 
-            # Scenario 1: Store private item
+            # Scenario 1: Store private item (no consent needed)
             mock_score_ethics_func.return_value = 0.9
             entry_id1 = store_knowledge("Test private content", is_public=False, author="Test Author")
-            assert entry_id1 is not None
-            assert entry_id1 in KNOWLEDGE_LIBRARY
-            assert KNOWLEDGE_LIBRARY[entry_id1]["is_public"] == False
-            assert KNOWLEDGE_LIBRARY[entry_id1]["author"] == "Test Author"
-            assert KNOWLEDGE_LIBRARY[entry_id1]["coordinates"] == (0.1, 0.2, 0.3, 0.4) # from mock_bootstrap
-            assert KNOWLEDGE_LIBRARY[entry_id1]["raw_t_intensity"] == 0.5
-            assert KNOWLEDGE_LIBRARY[entry_id1]["ethics_score"] == 0.9
+            assert entry_id1 is not None, "S1: Entry ID is None"
+            assert entry_id1 in KNOWLEDGE_LIBRARY, "S1: Entry not in library"
+            assert KNOWLEDGE_LIBRARY[entry_id1]["is_public"] == False, "S1: is_public mismatch"
+            assert KNOWLEDGE_LIBRARY[entry_id1]["author"] == "Test Author", "S1: author mismatch"
+            assert KNOWLEDGE_LIBRARY[entry_id1]["coordinates"] == (0.1, 0.2, 0.3, 0.4), "S1: coordinates mismatch"
+            assert KNOWLEDGE_LIBRARY[entry_id1]["raw_t_intensity"] == 0.5, "S1: raw_t_intensity mismatch"
+            assert KNOWLEDGE_LIBRARY[entry_id1]["ethics_score"] == 0.9, "S1: ethics_score mismatch"
             mock_manifold_instance.bootstrap_concept_from_llm.assert_called_once()
             mock_score_ethics_func.assert_called_once()
-            mock_input.assert_not_called() # Private, no consent needed
+            mock_input.assert_not_called() 
 
-            # Scenario 2: Store public item with consent
+            # Reset mocks for next scenario
             mock_input.reset_mock(); mock_manifold_instance.bootstrap_concept_from_llm.reset_mock(); mock_score_ethics_func.reset_mock()
+            mock_manifold_instance.bootstrap_concept_from_llm.return_value = ((0.1, 0.2, 0.3, 0.4), 0.5, "Mock summary from LLM") # Re-set return value if needed
+
+            # Scenario 2: Store public item with consent granted
             mock_input.return_value = "yes"
             mock_score_ethics_func.return_value = 0.8
             entry_id2 = store_knowledge("Test public content with consent", is_public=True)
-            assert entry_id2 is not None
-            assert entry_id2 in KNOWLEDGE_LIBRARY
-            assert KNOWLEDGE_LIBRARY[entry_id2]["is_public"] == True
+            assert entry_id2 is not None, "S2: Entry ID is None"
+            assert entry_id2 in KNOWLEDGE_LIBRARY, "S2: Entry not in library"
+            assert KNOWLEDGE_LIBRARY[entry_id2]["is_public"] == True, "S2: is_public mismatch"
             mock_input.assert_called_once()
 
             # Scenario 3: Store public item, consent denied
             mock_input.reset_mock(); mock_manifold_instance.bootstrap_concept_from_llm.reset_mock(); mock_score_ethics_func.reset_mock()
+            mock_manifold_instance.bootstrap_concept_from_llm.return_value = ((0.1, 0.2, 0.3, 0.4), 0.5, "Mock summary from LLM")
             mock_input.return_value = "no"
             entry_id3 = store_knowledge("Test public consent denied", is_public=True)
-            assert entry_id3 is None
-            assert entry_id3 not in KNOWLEDGE_LIBRARY
+            assert entry_id3 is None, "S3: Entry ID should be None (consent denied)"
+            assert entry_id3 not in KNOWLEDGE_LIBRARY, "S3: Entry should not be in library"
             mock_input.assert_called_once()
             
-            # Scenario 4: Brain/Ethics module failure handling
+            # Scenario 4: Brain module failure (bootstrap_concept_from_llm fails)
             mock_input.reset_mock(); mock_manifold_instance.bootstrap_concept_from_llm.reset_mock(); mock_score_ethics_func.reset_mock()
-            mock_input.return_value = "yes" # Assume consent for simplicity
+            mock_manifold_instance.bootstrap_concept_from_llm.side_effect = Exception("Simulated brain failure")
+            mock_score_ethics_func.return_value = 0.7 # Ethics module still works
+            entry_id4 = store_knowledge("Content with brain failure", is_public=False) # Private to skip consent
+            assert entry_id4 is not None, "S4: Entry ID is None (brain failure)"
+            assert KNOWLEDGE_LIBRARY[entry_id4]["coordinates"] is None, "S4: Coordinates should be None"
+            assert KNOWLEDGE_LIBRARY[entry_id4]["raw_t_intensity"] == 0.0, "S4: Intensity should be default"
+            assert KNOWLEDGE_LIBRARY[entry_id4]["ethics_score"] == 0.7, "S4: Ethics score mismatch"
             
-            # Brain failure
-            mock_manifold_instance.bootstrap_concept_from_llm.side_effect = Exception("Brain is down")
-            mock_score_ethics_func.return_value = 0.7 # Ethics still works
-            entry_id4_brain_fail = store_knowledge("Content with brain failure", is_public=False)
-            assert entry_id4_brain_fail is not None
-            assert KNOWLEDGE_LIBRARY[entry_id4_brain_fail]["coordinates"] is None
-            assert KNOWLEDGE_LIBRARY[entry_id4_brain_fail]["raw_t_intensity"] == 0.0 # Default fallback
-            assert KNOWLEDGE_LIBRARY[entry_id4_brain_fail]["ethics_score"] == 0.7 # Score from ethics
-            
-            # Ethics failure
-            mock_manifold_instance.bootstrap_concept_from_llm.side_effect = None # Reset brain mock
+            # Scenario 5: Ethics module failure (score_ethics fails)
+            mock_input.reset_mock(); mock_manifold_instance.bootstrap_concept_from_llm.reset_mock(); mock_score_ethics_func.reset_mock()
+            mock_manifold_instance.bootstrap_concept_from_llm.side_effect = None # Reset side effect
             mock_manifold_instance.bootstrap_concept_from_llm.return_value = ((0.1,0.2,0.3,0.4), 0.5, "Mock summary")
-            mock_score_ethics_func.side_effect = Exception("Ethics is down")
-            entry_id5_ethics_fail = store_knowledge("Content with ethics failure", is_public=False)
-            assert entry_id5_ethics_fail is not None
-            assert KNOWLEDGE_LIBRARY[entry_id5_ethics_fail]["ethics_score"] == 0.5 # Default fallback for ethics
+            mock_score_ethics_func.side_effect = Exception("Simulated ethics failure")
+            entry_id5 = store_knowledge("Content with ethics failure", is_public=False) # Private
+            assert entry_id5 is not None, "S5: Entry ID is None (ethics failure)"
+            assert KNOWLEDGE_LIBRARY[entry_id5]["ethics_score"] == 0.5, "S5: Ethics score should be default"
         
-        delete_test_files(test_lib_path, test_sys_log_path)
+        delete_test_files(test_lib_path, test_sys_log_path) # Clean up after this complex test
 
     def test_retrieval_functions():
+        """
+        Tests knowledge retrieval functions: `retrieve_knowledge_by_id` and
+        `retrieve_knowledge_by_keyword`.
+        """
         test_run_id = "retrieval"
         test_configs, test_lib_path, test_sys_log_path = setup_test_environment(test_run_id=test_run_id)
         with TempConfigOverride(test_configs):
             _initialize_library_path()
-            _load_knowledge_library() # Ensure KNOWLEDGE_LIBRARY is empty
+            _load_knowledge_library()
 
-            # Populate KNOWLEDGE_LIBRARY directly for this test
             entry1 = {"id": "id1", "full_content": "Public entry about apples", "content_preview": "apples", "is_public": True}
             entry2 = {"id": "id2", "full_content": "Private entry about bananas", "content_preview": "bananas", "is_public": False}
             entry3 = {"id": "id3", "full_content": "Another public entry about apples and oranges", "content_preview": "apples oranges", "is_public": True}
             global KNOWLEDGE_LIBRARY, _library_dirty_flag
-            KNOWLEDGE_LIBRARY = {"id1": entry1, "id2": entry2, "id3": entry3}
-            _library_dirty_flag = False # Assume it's loaded like this
+            KNOWLEDGE_LIBRARY = {"id1": entry1, "id2": entry2, "id3": entry3} # Directly populate for test
+            _library_dirty_flag = False 
 
-            # Test retrieve_knowledge_by_id
-            assert retrieve_knowledge_by_id("id1") == entry1
-            assert retrieve_knowledge_by_id("nonexistent") is None
+            assert retrieve_knowledge_by_id("id1") == entry1, "Retrieval by ID failed for id1"
+            assert retrieve_knowledge_by_id("nonexistent") is None, "Retrieval by non-existent ID did not return None"
 
-            # Test retrieve_knowledge_by_keyword
-            # Keyword in public item, search_public=True
-            results = retrieve_knowledge_by_keyword("apples", search_public=True, search_private=False)
-            assert len(results) == 2
-            assert entry1 in results and entry3 in results
+            results_public_apples = retrieve_knowledge_by_keyword("apples", search_public=True, search_private=False)
+            assert len(results_public_apples) == 2, "Keyword search for 'apples' (public only) wrong count"
+            assert entry1 in results_public_apples and entry3 in results_public_apples, "Keyword search for 'apples' (public only) content mismatch"
             
-            # Keyword in private item, search_private=True
-            results = retrieve_knowledge_by_keyword("bananas", search_public=False, search_private=True)
-            assert len(results) == 1
-            assert entry2 in results
+            results_private_bananas = retrieve_knowledge_by_keyword("bananas", search_public=False, search_private=True)
+            assert len(results_private_bananas) == 1, "Keyword search for 'bananas' (private only) wrong count"
+            assert entry2 in results_private_bananas, "Keyword search for 'bananas' (private only) content mismatch"
             
-            # Keyword present, but flags mismatch
-            results = retrieve_knowledge_by_keyword("bananas", search_public=True, search_private=False)
-            assert len(results) == 0
+            results_public_bananas = retrieve_knowledge_by_keyword("bananas", search_public=True, search_private=False)
+            assert len(results_public_bananas) == 0, "Keyword search for 'bananas' (public only, expected 0) wrong count"
             
-            # Keyword not present
-            results = retrieve_knowledge_by_keyword("kiwi")
-            assert len(results) == 0
+            results_kiwi = retrieve_knowledge_by_keyword("kiwi")
+            assert len(results_kiwi) == 0, "Keyword search for 'kiwi' (expected 0) wrong count"
             
-            # Case insensitivity
-            results = retrieve_knowledge_by_keyword("APPLES", search_public=True, search_private=True)
-            assert len(results) == 2
+            results_case_insensitive_apples = retrieve_knowledge_by_keyword("APPLES", search_public=True, search_private=True)
+            assert len(results_case_insensitive_apples) == 2, "Case-insensitive keyword search for 'APPLES' wrong count"
 
         delete_test_files(test_lib_path, test_sys_log_path)
 
@@ -1203,16 +1295,12 @@ if __name__ == "__main__":
     # --- Test Runner Logic ---
     print("Starting Core Library Self-Tests...")
     
-    # Explicitly manage globals for mocks if not using @patch on the test function itself
-    # This is more complex than direct patching, but shown for variance.
-    # However, for simplicity and robustness, patching the functions directly in the
-    # test_store_knowledge function (as done) is generally preferred.
-
     _run_test(test_text_utilities, "test_text_utilities")
     _run_test(test_is_valid_coordinate, "test_is_valid_coordinate")
     _run_test(test_mitigator_class, "test_mitigator_class")
     _run_test(test_knowledge_library_persistence, "test_knowledge_library_persistence")
-    _run_test(test_store_knowledge, "test_store_knowledge") # Patches are applied via decorators here
+    # Note: test_store_knowledge uses @mock decorators for its dependencies.
+    _run_test(test_store_knowledge, "test_store_knowledge") 
     _run_test(test_retrieval_functions, "test_retrieval_functions")
 
 

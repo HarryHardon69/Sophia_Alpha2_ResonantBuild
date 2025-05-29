@@ -274,10 +274,11 @@ def render_main_interface():
                 if not response_words: # Handle empty response string.
                     response_display_placeholder.markdown(sophia_response_text.strip())
                 else:
+                    streaming_delay = getattr(config, 'GUI_RESPONSE_STREAMING_DELAY', 0.05)
                     for word_chunk in response_words:
                         full_response_for_streaming += word_chunk + " "
                         response_display_placeholder.markdown(full_response_for_streaming + "▌") # Use a cursor-like char.
-                        time.sleep(0.05) # Short delay to simulate typing.
+                        time.sleep(streaming_delay) # Short delay to simulate typing.
                     response_display_placeholder.markdown(full_response_for_streaming.strip()) # Final response without cursor.
                 
                 # Add final assistant response to dialogue history.

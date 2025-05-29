@@ -151,7 +151,14 @@ RESOURCE_PROFILE = _RESOURCE_PROFILES[RESOURCE_PROFILE_TYPE]
 # This could influence how concepts are mapped or how far associations can spread.
 # Example: A range of 1000 could mean coordinates from -500 to +500.
 # This is more conceptual and might be used by various modules mapping to the SNN.
-MANIFOLD_RANGE = 1000.0 # Example value, can be adjusted based on SNN design.
+# MANIFOLD_RANGE = 1000.0 # Example value, can be adjusted based on SNN design. # Original
+_DEFAULT_MANIFOLD_RANGE = 1000.0
+try:
+    MANIFOLD_RANGE = float(os.getenv('MANIFOLD_RANGE', _DEFAULT_MANIFOLD_RANGE))
+except ValueError as e:
+    print(f"Warning: Invalid value for MANIFOLD_RANGE env var ('{os.getenv('MANIFOLD_RANGE')}'). Using default: {_DEFAULT_MANIFOLD_RANGE}. Error: {e}", file=sys.stderr)
+    MANIFOLD_RANGE = _DEFAULT_MANIFOLD_RANGE
+
 
 # --- End of Resource Management ---
 
@@ -165,24 +172,92 @@ ENABLE_SNN = os.getenv('ENABLE_SNN', 'True').lower() == 'true' # Master switch f
 # SNN Specific Parameters
 # These values are placeholders and should be tuned based on SNN model and research.
 # Learning rates and STDP (Spike-Timing-Dependent Plasticity) parameters
-HEBBIAN_LEARNING_RATE = float(os.getenv('HEBBIAN_LEARNING_RATE', 0.005)) # General Hebbian learning rate
-STDP_LEARNING_RATE = float(os.getenv('STDP_LEARNING_RATE', 0.004)) # More specific STDP rate
-STDP_WINDOW_MS = float(os.getenv('STDP_WINDOW_MS', 20.0)) # Time window for STDP in milliseconds
-STDP_DEPRESSION_FACTOR = float(os.getenv('STDP_DEPRESSION_FACTOR', 0.0015)) # Factor for LTD in STDP
+DEFAULT_HEBBIAN_LEARNING_RATE = 0.005
+try:
+    HEBBIAN_LEARNING_RATE = float(os.getenv('HEBBIAN_LEARNING_RATE', DEFAULT_HEBBIAN_LEARNING_RATE))
+except ValueError as e:
+    print(f"Warning: Invalid value for HEBBIAN_LEARNING_RATE env var ('{os.getenv('HEBBIAN_LEARNING_RATE')}'). Using default: {DEFAULT_HEBBIAN_LEARNING_RATE}. Error: {e}", file=sys.stderr)
+    HEBBIAN_LEARNING_RATE = DEFAULT_HEBBIAN_LEARNING_RATE
+
+DEFAULT_STDP_LEARNING_RATE = 0.004
+try:
+    STDP_LEARNING_RATE = float(os.getenv('STDP_LEARNING_RATE', DEFAULT_STDP_LEARNING_RATE))
+except ValueError as e:
+    print(f"Warning: Invalid value for STDP_LEARNING_RATE env var ('{os.getenv('STDP_LEARNING_RATE')}'). Using default: {DEFAULT_STDP_LEARNING_RATE}. Error: {e}", file=sys.stderr)
+    STDP_LEARNING_RATE = DEFAULT_STDP_LEARNING_RATE
+
+DEFAULT_STDP_WINDOW_MS = 20.0
+try:
+    STDP_WINDOW_MS = float(os.getenv('STDP_WINDOW_MS', DEFAULT_STDP_WINDOW_MS))
+except ValueError as e:
+    print(f"Warning: Invalid value for STDP_WINDOW_MS env var ('{os.getenv('STDP_WINDOW_MS')}'). Using default: {DEFAULT_STDP_WINDOW_MS}. Error: {e}", file=sys.stderr)
+    STDP_WINDOW_MS = DEFAULT_STDP_WINDOW_MS
+
+DEFAULT_STDP_DEPRESSION_FACTOR = 0.0015
+try:
+    STDP_DEPRESSION_FACTOR = float(os.getenv('STDP_DEPRESSION_FACTOR', DEFAULT_STDP_DEPRESSION_FACTOR))
+except ValueError as e:
+    print(f"Warning: Invalid value for STDP_DEPRESSION_FACTOR env var ('{os.getenv('STDP_DEPRESSION_FACTOR')}'). Using default: {DEFAULT_STDP_DEPRESSION_FACTOR}. Error: {e}", file=sys.stderr)
+    STDP_DEPRESSION_FACTOR = DEFAULT_STDP_DEPRESSION_FACTOR
 
 # Coherence and Resonance Parameters
-COHERENCE_UPDATE_FACTOR = float(os.getenv('COHERENCE_UPDATE_FACTOR', 0.1)) # How much resonance influences coherence
+DEFAULT_COHERENCE_UPDATE_FACTOR = 0.1
+try:
+    COHERENCE_UPDATE_FACTOR = float(os.getenv('COHERENCE_UPDATE_FACTOR', DEFAULT_COHERENCE_UPDATE_FACTOR))
+except ValueError as e:
+    print(f"Warning: Invalid value for COHERENCE_UPDATE_FACTOR env var ('{os.getenv('COHERENCE_UPDATE_FACTOR')}'). Using default: {DEFAULT_COHERENCE_UPDATE_FACTOR}. Error: {e}", file=sys.stderr)
+    COHERENCE_UPDATE_FACTOR = DEFAULT_COHERENCE_UPDATE_FACTOR
 
 # SNN/Surrogate Gradient Parameters (relevant for SNNTorch or similar frameworks)
-SNN_SURROGATE_SLOPE = float(os.getenv('SNN_SURROGATE_SLOPE', 25.0)) # Slope of the surrogate gradient
-SNN_LIF_BETA = float(os.getenv('SNN_LIF_BETA', 0.9)) # Decay rate for Leaky Integrate-and-Fire neurons (beta or 1/tau)
-SNN_LIF_THRESHOLD = float(os.getenv('SNN_LIF_THRESHOLD', 1.0)) # Firing threshold for LIF neurons
-SNN_OPTIMIZER_LR = float(os.getenv('SNN_OPTIMIZER_LR', 5e-4)) # Learning rate for SNN optimizer (e.g., Adam)
+DEFAULT_SNN_SURROGATE_SLOPE = 25.0
+try:
+    SNN_SURROGATE_SLOPE = float(os.getenv('SNN_SURROGATE_SLOPE', DEFAULT_SNN_SURROGATE_SLOPE))
+except ValueError as e:
+    print(f"Warning: Invalid value for SNN_SURROGATE_SLOPE env var ('{os.getenv('SNN_SURROGATE_SLOPE')}'). Using default: {DEFAULT_SNN_SURROGATE_SLOPE}. Error: {e}", file=sys.stderr)
+    SNN_SURROGATE_SLOPE = DEFAULT_SNN_SURROGATE_SLOPE
 
-# Input size for the SNN, typically corresponds to embedding vector dimension
-# For example, if using OpenAI embeddings, this might be 1536 (text-embedding-ada-002)
-# Or if using a sentence transformer, could be 384, 768, etc.
-SNN_INPUT_SIZE = int(os.getenv('SNN_INPUT_SIZE', 768)) # Example, adjust to your embedding model
+DEFAULT_SNN_LIF_BETA = 0.9
+try:
+    SNN_LIF_BETA = float(os.getenv('SNN_LIF_BETA', DEFAULT_SNN_LIF_BETA))
+except ValueError as e:
+    print(f"Warning: Invalid value for SNN_LIF_BETA env var ('{os.getenv('SNN_LIF_BETA')}'). Using default: {DEFAULT_SNN_LIF_BETA}. Error: {e}", file=sys.stderr)
+    SNN_LIF_BETA = DEFAULT_SNN_LIF_BETA
+
+DEFAULT_SNN_LIF_THRESHOLD = 1.0
+try:
+    SNN_LIF_THRESHOLD = float(os.getenv('SNN_LIF_THRESHOLD', DEFAULT_SNN_LIF_THRESHOLD))
+except ValueError as e:
+    print(f"Warning: Invalid value for SNN_LIF_THRESHOLD env var ('{os.getenv('SNN_LIF_THRESHOLD')}'). Using default: {DEFAULT_SNN_LIF_THRESHOLD}. Error: {e}", file=sys.stderr)
+    SNN_LIF_THRESHOLD = DEFAULT_SNN_LIF_THRESHOLD
+
+DEFAULT_SNN_OPTIMIZER_LR = 5e-4
+try:
+    SNN_OPTIMIZER_LR = float(os.getenv('SNN_OPTIMIZER_LR', DEFAULT_SNN_OPTIMIZER_LR))
+except ValueError as e:
+    print(f"Warning: Invalid value for SNN_OPTIMIZER_LR env var ('{os.getenv('SNN_OPTIMIZER_LR')}'). Using default: {DEFAULT_SNN_OPTIMIZER_LR}. Error: {e}", file=sys.stderr)
+    SNN_OPTIMIZER_LR = DEFAULT_SNN_OPTIMIZER_LR
+
+DEFAULT_SNN_INPUT_SIZE = 768
+try:
+    SNN_INPUT_SIZE = int(os.getenv('SNN_INPUT_SIZE', DEFAULT_SNN_INPUT_SIZE))
+except ValueError as e:
+    print(f"Warning: Invalid value for SNN_INPUT_SIZE env var ('{os.getenv('SNN_INPUT_SIZE')}'). Using default: {DEFAULT_SNN_INPUT_SIZE}. Error: {e}", file=sys.stderr)
+    SNN_INPUT_SIZE = DEFAULT_SNN_INPUT_SIZE
+
+DEFAULT_SNN_BATCH_SIZE = 1
+try:
+    SNN_BATCH_SIZE = int(os.getenv('SNN_BATCH_SIZE', DEFAULT_SNN_BATCH_SIZE))
+except ValueError as e:
+    print(f"Warning: Invalid value for SNN_BATCH_SIZE env var ('{os.getenv('SNN_BATCH_SIZE')}'). Using default: {DEFAULT_SNN_BATCH_SIZE}. Error: {e}", file=sys.stderr)
+    SNN_BATCH_SIZE = DEFAULT_SNN_BATCH_SIZE
+
+DEFAULT_SNN_INPUT_ACTIVE_FRACTION = 0.1
+try:
+    SNN_INPUT_ACTIVE_FRACTION = float(os.getenv('SNN_INPUT_ACTIVE_FRACTION', DEFAULT_SNN_INPUT_ACTIVE_FRACTION))
+except ValueError as e:
+    print(f"Warning: Invalid value for SNN_INPUT_ACTIVE_FRACTION env var ('{os.getenv('SNN_INPUT_ACTIVE_FRACTION')}'). Using default: {DEFAULT_SNN_INPUT_ACTIVE_FRACTION}. Error: {e}", file=sys.stderr)
+    SNN_INPUT_ACTIVE_FRACTION = DEFAULT_SNN_INPUT_ACTIVE_FRACTION
+
 
 # --- End of System Behavior ---
 
@@ -193,19 +268,45 @@ ENABLE_LLM_API = os.getenv('ENABLE_LLM_API', 'True').lower() == 'true'
 
 # Select LLM Provider: "openai", "lm_studio", "ollama", "mock_for_snn_test"
 # Mock provider can be used for testing SNN without actual LLM calls.
-LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'lm_studio').lower()
-LLM_TEMPERATURE = float(os.getenv('LLM_TEMPERATURE', 0.7))
-LLM_CONNECTION_TIMEOUT = int(os.getenv('LLM_CONNECTION_TIMEOUT', 10)) # seconds
-LLM_REQUEST_TIMEOUT = int(os.getenv('LLM_REQUEST_TIMEOUT', 120)) # seconds
+DEFAULT_LLM_PROVIDER = 'lm_studio'
+LLM_PROVIDER = os.getenv('LLM_PROVIDER', DEFAULT_LLM_PROVIDER).lower()
+
+DEFAULT_LLM_TEMPERATURE = 0.7
+try:
+    LLM_TEMPERATURE = float(os.getenv('LLM_TEMPERATURE', DEFAULT_LLM_TEMPERATURE))
+except ValueError as e:
+    print(f"Warning: Invalid value for LLM_TEMPERATURE env var ('{os.getenv('LLM_TEMPERATURE')}'). Using default: {DEFAULT_LLM_TEMPERATURE}. Error: {e}", file=sys.stderr)
+    LLM_TEMPERATURE = DEFAULT_LLM_TEMPERATURE
+
+DEFAULT_LLM_CONNECTION_TIMEOUT = 10
+try:
+    LLM_CONNECTION_TIMEOUT = int(os.getenv('LLM_CONNECTION_TIMEOUT', DEFAULT_LLM_CONNECTION_TIMEOUT)) # seconds
+except ValueError as e:
+    print(f"Warning: Invalid value for LLM_CONNECTION_TIMEOUT env var ('{os.getenv('LLM_CONNECTION_TIMEOUT')}'). Using default: {DEFAULT_LLM_CONNECTION_TIMEOUT}. Error: {e}", file=sys.stderr)
+    LLM_CONNECTION_TIMEOUT = DEFAULT_LLM_CONNECTION_TIMEOUT
+
+DEFAULT_LLM_REQUEST_TIMEOUT = 120
+try:
+    LLM_REQUEST_TIMEOUT = int(os.getenv('LLM_REQUEST_TIMEOUT', DEFAULT_LLM_REQUEST_TIMEOUT)) # seconds
+except ValueError as e:
+    print(f"Warning: Invalid value for LLM_REQUEST_TIMEOUT env var ('{os.getenv('LLM_REQUEST_TIMEOUT')}'). Using default: {DEFAULT_LLM_REQUEST_TIMEOUT}. Error: {e}", file=sys.stderr)
+    LLM_REQUEST_TIMEOUT = DEFAULT_LLM_REQUEST_TIMEOUT
 
 # Define configurations for each LLM provider
 # Sensitive information like API keys should ideally be set as environment variables.
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_OPENAI_MODEL = "gpt-3.5-turbo"
+DEFAULT_LM_STUDIO_BASE_URL = "http://localhost:1234/v1"
+DEFAULT_LM_STUDIO_MODEL = "local-model"
+DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434/api"
+DEFAULT_OLLAMA_MODEL = "llama2"
+
 _LLM_CONFIG = {
     "openai": {
         "API_KEY": os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY_HERE_IF_NOT_SET_AS_ENV"),
-        "BASE_URL": os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        "MODEL": os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"), # or "gpt-4", "text-embedding-ada-002" for embeddings
-        "CONCEPT_PROMPT_TEMPLATE": {
+        "BASE_URL": os.getenv("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
+        "MODEL": os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
+        "CONCEPT_PROMPT_TEMPLATE": { # Default prompts, consider making these configurable as well if needed
             "system": "You are an AI assistant helping to define and elaborate on concepts. Provide a concise and informative summary for the given concept. Focus on its core meaning and key aspects.",
             "user": "Concept: {concept_name}\n\nProvide a detailed explanation of this concept, including its primary definition, key characteristics, and typical applications or examples. If the concept is abstract, try to provide analogies."
         }
@@ -220,19 +321,19 @@ _LLM_CONFIG = {
         }
     },
     "ollama": {
-        "API_KEY": os.getenv("OLLAMA_API_KEY", "not_required"), # Typically not required for local Ollama
-        "BASE_URL": os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/api"), # Default Ollama API endpoint (note: path might vary based on usage, e.g. /api/generate or /api/chat)
-        "MODEL": os.getenv("OLLAMA_MODEL", "llama2"), # Specify the Ollama model to use
+        "API_KEY": os.getenv("OLLAMA_API_KEY", "not_required"), 
+        "BASE_URL": os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL), 
+        "MODEL": os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL), 
         "CONCEPT_PROMPT_TEMPLATE": {
             "system": "You are an AI model. Explain the following concept clearly and concisely. Provide its definition, main attributes, and some examples if applicable.",
             "user": "Concept: {concept_name}. Please provide a comprehensive explanation."
         }
     },
-    "mock_for_snn_test": {
+    "mock_for_snn_test": { # Mock provider settings
         "API_KEY": "mock_key",
-        "BASE_URL": "http://localhost:8000/mock_api", # Dummy endpoint
+        "BASE_URL": "http://localhost:8000/mock_api", 
         "MODEL": "mock_model",
-        "CONCEPT_PROMPT_TEMPLATE": { # Simple template for mock testing
+        "CONCEPT_PROMPT_TEMPLATE": { 
             "system": "Mock system prompt for {concept_name}.",
             "user": "Mock user prompt for {concept_name}."
         }
@@ -243,11 +344,15 @@ _LLM_CONFIG = {
 if LLM_PROVIDER not in _LLM_CONFIG:
     print(
         f"Warning: Unknown LLM_PROVIDER '{LLM_PROVIDER}'. "
-        f"Defaulting to 'lm_studio'. Available providers: {list(_LLM_CONFIG.keys())}"
+        f"Defaulting to '{DEFAULT_LLM_PROVIDER}'. Available providers: {list(_LLM_CONFIG.keys())}"
     )
-    LLM_PROVIDER = 'lm_studio' # Fallback to a default if invalid provider is set
+    LLM_PROVIDER = DEFAULT_LLM_PROVIDER
 
-CURRENT_LLM_SETTINGS = _LLM_CONFIG[LLM_PROVIDER]
+CURRENT_LLM_SETTINGS = _LLM_CONFIG.get(LLM_PROVIDER) # Use .get for safety, though fallback above should ensure key exists
+if CURRENT_LLM_SETTINGS is None: # Should not happen due to fallback, but as an ultimate safeguard
+    print(f"CRITICAL: LLM_PROVIDER '{LLM_PROVIDER}' resolved to None in _LLM_CONFIG. This should not happen. Using mock as emergency fallback.", file=sys.stderr)
+    CURRENT_LLM_SETTINGS = _LLM_CONFIG["mock_for_snn_test"] # Emergency fallback
+    LLM_PROVIDER = "mock_for_snn_test"
 LLM_API_KEY = CURRENT_LLM_SETTINGS["API_KEY"]
 LLM_BASE_URL = CURRENT_LLM_SETTINGS["BASE_URL"]
 LLM_MODEL = CURRENT_LLM_SETTINGS["MODEL"]
@@ -270,25 +375,86 @@ ETHICAL_FRAMEWORK = {
 }
 
 # Threshold for overall ethical alignment. Actions below this may be flagged or modified.
-ETHICAL_ALIGNMENT_THRESHOLD = float(os.getenv('ETHICAL_ALIGNMENT_THRESHOLD', 0.7))
+DEFAULT_ETHICAL_ALIGNMENT_THRESHOLD = 0.7
+try:
+    ETHICAL_ALIGNMENT_THRESHOLD = float(os.getenv('ETHICAL_ALIGNMENT_THRESHOLD', DEFAULT_ETHICAL_ALIGNMENT_THRESHOLD))
+except ValueError as e:
+    print(f"Warning: Invalid value for ETHICAL_ALIGNMENT_THRESHOLD env var ('{os.getenv('ETHICAL_ALIGNMENT_THRESHOLD')}'). Using default: {DEFAULT_ETHICAL_ALIGNMENT_THRESHOLD}. Error: {e}", file=sys.stderr)
+    ETHICAL_ALIGNMENT_THRESHOLD = DEFAULT_ETHICAL_ALIGNMENT_THRESHOLD
 
 # Weights for combining different ethical assessment dimensions (e.g., in an ethics score)
-ETHICS_COHERENCE_WEIGHT = float(os.getenv('ETHICS_COHERENCE_WEIGHT', 0.25))
-ETHICS_VALENCE_WEIGHT = float(os.getenv('ETHICS_VALENCE_WEIGHT', 0.25)) # Positive/negative sentiment
-ETHICS_INTENSITY_WEIGHT = float(os.getenv('ETHICS_INTENSITY_WEIGHT', 0.20)) # Strength of sentiment/ethical load
-ETHICS_FRAMEWORK_WEIGHT = float(os.getenv('ETHICS_FRAMEWORK_WEIGHT', 0.30)) # Alignment with defined ETHICAL_FRAMEWORK
+DEFAULT_ETHICS_COHERENCE_WEIGHT = 0.25
+try:
+    ETHICS_COHERENCE_WEIGHT = float(os.getenv('ETHICS_COHERENCE_WEIGHT', DEFAULT_ETHICS_COHERENCE_WEIGHT))
+except ValueError as e:
+    print(f"Warning: Invalid value for ETHICS_COHERENCE_WEIGHT env var ('{os.getenv('ETHICS_COHERENCE_WEIGHT')}'). Using default: {DEFAULT_ETHICS_COHERENCE_WEIGHT}. Error: {e}", file=sys.stderr)
+    ETHICS_COHERENCE_WEIGHT = DEFAULT_ETHICS_COHERENCE_WEIGHT
+
+DEFAULT_ETHICS_VALENCE_WEIGHT = 0.25
+try:
+    ETHICS_VALENCE_WEIGHT = float(os.getenv('ETHICS_VALENCE_WEIGHT', DEFAULT_ETHICS_VALENCE_WEIGHT))
+except ValueError as e:
+    print(f"Warning: Invalid value for ETHICS_VALENCE_WEIGHT env var ('{os.getenv('ETHICS_VALENCE_WEIGHT')}'). Using default: {DEFAULT_ETHICS_VALENCE_WEIGHT}. Error: {e}", file=sys.stderr)
+    ETHICS_VALENCE_WEIGHT = DEFAULT_ETHICS_VALENCE_WEIGHT
+
+DEFAULT_ETHICS_INTENSITY_WEIGHT = 0.20
+try:
+    ETHICS_INTENSITY_WEIGHT = float(os.getenv('ETHICS_INTENSITY_WEIGHT', DEFAULT_ETHICS_INTENSITY_WEIGHT))
+except ValueError as e:
+    print(f"Warning: Invalid value for ETHICS_INTENSITY_WEIGHT env var ('{os.getenv('ETHICS_INTENSITY_WEIGHT')}'). Using default: {DEFAULT_ETHICS_INTENSITY_WEIGHT}. Error: {e}", file=sys.stderr)
+    ETHICS_INTENSITY_WEIGHT = DEFAULT_ETHICS_INTENSITY_WEIGHT
+
+DEFAULT_ETHICS_FRAMEWORK_WEIGHT = 0.30
+try:
+    ETHICS_FRAMEWORK_WEIGHT = float(os.getenv('ETHICS_FRAMEWORK_WEIGHT', DEFAULT_ETHICS_FRAMEWORK_WEIGHT))
+except ValueError as e:
+    print(f"Warning: Invalid value for ETHICS_FRAMEWORK_WEIGHT env var ('{os.getenv('ETHICS_FRAMEWORK_WEIGHT')}'). Using default: {DEFAULT_ETHICS_FRAMEWORK_WEIGHT}. Error: {e}", file=sys.stderr)
+    ETHICS_FRAMEWORK_WEIGHT = DEFAULT_ETHICS_FRAMEWORK_WEIGHT
 
 # Parameters for ethical clustering or contextual analysis
-ETHICS_CLUSTER_CONTEXT_WEIGHT = float(os.getenv('ETHICS_CLUSTER_CONTEXT_WEIGHT', 0.5))
-ETHICS_CLUSTER_RADIUS_FACTOR = float(os.getenv('ETHICS_CLUSTER_RADIUS_FACTOR', 1.5)) # Multiplier for determining cluster size
+DEFAULT_ETHICS_CLUSTER_CONTEXT_WEIGHT = 0.5
+try:
+    ETHICS_CLUSTER_CONTEXT_WEIGHT = float(os.getenv('ETHICS_CLUSTER_CONTEXT_WEIGHT', DEFAULT_ETHICS_CLUSTER_CONTEXT_WEIGHT))
+except ValueError as e:
+    print(f"Warning: Invalid value for ETHICS_CLUSTER_CONTEXT_WEIGHT env var ('{os.getenv('ETHICS_CLUSTER_CONTEXT_WEIGHT')}'). Using default: {DEFAULT_ETHICS_CLUSTER_CONTEXT_WEIGHT}. Error: {e}", file=sys.stderr)
+    ETHICS_CLUSTER_CONTEXT_WEIGHT = DEFAULT_ETHICS_CLUSTER_CONTEXT_WEIGHT
+
+DEFAULT_ETHICS_CLUSTER_RADIUS_FACTOR = 1.5
+try:
+    ETHICS_CLUSTER_RADIUS_FACTOR = float(os.getenv('ETHICS_CLUSTER_RADIUS_FACTOR', DEFAULT_ETHICS_CLUSTER_RADIUS_FACTOR))
+except ValueError as e:
+    print(f"Warning: Invalid value for ETHICS_CLUSTER_RADIUS_FACTOR env var ('{os.getenv('ETHICS_CLUSTER_RADIUS_FACTOR')}'). Using default: {DEFAULT_ETHICS_CLUSTER_RADIUS_FACTOR}. Error: {e}", file=sys.stderr)
+    ETHICS_CLUSTER_RADIUS_FACTOR = DEFAULT_ETHICS_CLUSTER_RADIUS_FACTOR
 
 # Parameters for ethics log and trend analysis
-ETHICS_LOG_MAX_ENTRIES = int(os.getenv('ETHICS_LOG_MAX_ENTRIES', 10000)) # Max entries in ethics log
-ETHICS_TREND_MIN_DATAPOINTS = int(os.getenv('ETHICS_TREND_MIN_DATAPOINTS', 50)) # Min data points to detect a trend
-ETHICS_TREND_SIGNIFICANCE_THRESHOLD = float(os.getenv('ETHICS_TREND_SIGNIFICANCE_THRESHOLD', 0.05)) # p-value or similar
+DEFAULT_ETHICS_LOG_MAX_ENTRIES = 10000
+try:
+    ETHICS_LOG_MAX_ENTRIES = int(os.getenv('ETHICS_LOG_MAX_ENTRIES', DEFAULT_ETHICS_LOG_MAX_ENTRIES))
+except ValueError as e:
+    print(f"Warning: Invalid value for ETHICS_LOG_MAX_ENTRIES env var ('{os.getenv('ETHICS_LOG_MAX_ENTRIES')}'). Using default: {DEFAULT_ETHICS_LOG_MAX_ENTRIES}. Error: {e}", file=sys.stderr)
+    ETHICS_LOG_MAX_ENTRIES = DEFAULT_ETHICS_LOG_MAX_ENTRIES
+
+DEFAULT_ETHICS_TREND_MIN_DATAPOINTS = 50
+try:
+    ETHICS_TREND_MIN_DATAPOINTS = int(os.getenv('ETHICS_TREND_MIN_DATAPOINTS', DEFAULT_ETHICS_TREND_MIN_DATAPOINTS))
+except ValueError as e:
+    print(f"Warning: Invalid value for ETHICS_TREND_MIN_DATAPOINTS env var ('{os.getenv('ETHICS_TREND_MIN_DATAPOINTS')}'). Using default: {DEFAULT_ETHICS_TREND_MIN_DATAPOINTS}. Error: {e}", file=sys.stderr)
+    ETHICS_TREND_MIN_DATAPOINTS = DEFAULT_ETHICS_TREND_MIN_DATAPOINTS
+
+DEFAULT_ETHICS_TREND_SIGNIFICANCE_THRESHOLD = 0.05
+try:
+    ETHICS_TREND_SIGNIFICANCE_THRESHOLD = float(os.getenv('ETHICS_TREND_SIGNIFICANCE_THRESHOLD', DEFAULT_ETHICS_TREND_SIGNIFICANCE_THRESHOLD))
+except ValueError as e:
+    print(f"Warning: Invalid value for ETHICS_TREND_SIGNIFICANCE_THRESHOLD env var ('{os.getenv('ETHICS_TREND_SIGNIFICANCE_THRESHOLD')}'). Using default: {DEFAULT_ETHICS_TREND_SIGNIFICANCE_THRESHOLD}. Error: {e}", file=sys.stderr)
+    ETHICS_TREND_SIGNIFICANCE_THRESHOLD = DEFAULT_ETHICS_TREND_SIGNIFICANCE_THRESHOLD
 
 # Threshold for the Mitigator module to intervene based on ethical assessment
-MITIGATION_ETHICAL_THRESHOLD = float(os.getenv('MITIGATION_ETHICAL_THRESHOLD', 0.85)) # Higher than alignment threshold
+DEFAULT_MITIGATION_ETHICAL_THRESHOLD = 0.85
+try:
+    MITIGATION_ETHICAL_THRESHOLD = float(os.getenv('MITIGATION_ETHICAL_THRESHOLD', DEFAULT_MITIGATION_ETHICAL_THRESHOLD))
+except ValueError as e:
+    print(f"Warning: Invalid value for MITIGATION_ETHICAL_THRESHOLD env var ('{os.getenv('MITIGATION_ETHICAL_THRESHOLD')}'). Using default: {DEFAULT_MITIGATION_ETHICAL_THRESHOLD}. Error: {e}", file=sys.stderr)
+    MITIGATION_ETHICAL_THRESHOLD = DEFAULT_MITIGATION_ETHICAL_THRESHOLD
 
 # --- End of Ethics Module Configuration ---
 
@@ -296,33 +462,140 @@ MITIGATION_ETHICAL_THRESHOLD = float(os.getenv('MITIGATION_ETHICAL_THRESHOLD', 0
 # Parameters governing memory operations, novelty detection, and knowledge library interactions.
 
 # Threshold for determining if a new piece of information is novel enough to be stored.
-MEMORY_NOVELTY_THRESHOLD = float(os.getenv('MEMORY_NOVELTY_THRESHOLD', 0.6))
+DEFAULT_MEMORY_NOVELTY_THRESHOLD = 0.6
+try:
+    MEMORY_NOVELTY_THRESHOLD = float(os.getenv('MEMORY_NOVELTY_THRESHOLD', DEFAULT_MEMORY_NOVELTY_THRESHOLD))
+except ValueError as e:
+    print(f"Warning: Invalid value for MEMORY_NOVELTY_THRESHOLD env var ('{os.getenv('MEMORY_NOVELTY_THRESHOLD')}'). Using default: {DEFAULT_MEMORY_NOVELTY_THRESHOLD}. Error: {e}", file=sys.stderr)
+    MEMORY_NOVELTY_THRESHOLD = DEFAULT_MEMORY_NOVELTY_THRESHOLD
+
 
 # Ethical threshold for storing memories. Can default to the general ethical alignment threshold.
-MEMORY_ETHICAL_THRESHOLD = float(os.getenv('MEMORY_ETHICAL_THRESHOLD', ETHICAL_ALIGNMENT_THRESHOLD))
+DEFAULT_MEMORY_ETHICAL_THRESHOLD = ETHICAL_ALIGNMENT_THRESHOLD 
+try:
+    MEMORY_ETHICAL_THRESHOLD = float(os.getenv('MEMORY_ETHICAL_THRESHOLD', DEFAULT_MEMORY_ETHICAL_THRESHOLD))
+except ValueError as e:
+    print(f"Warning: Invalid value for MEMORY_ETHICAL_THRESHOLD env var ('{os.getenv('MEMORY_ETHICAL_THRESHOLD')}'). Using default: {DEFAULT_MEMORY_ETHICAL_THRESHOLD}. Error: {e}", file=sys.stderr)
+    MEMORY_ETHICAL_THRESHOLD = DEFAULT_MEMORY_ETHICAL_THRESHOLD
+
 
 # Weights for combining different aspects of novelty (e.g., spatial vs. textual content)
-SPATIAL_NOVELTY_WEIGHT = float(os.getenv('SPATIAL_NOVELTY_WEIGHT', 0.5))
-TEXTUAL_NOVELTY_WEIGHT = float(os.getenv('TEXTUAL_NOVELTY_WEIGHT', 0.5))
+DEFAULT_SPATIAL_NOVELTY_WEIGHT = 0.5
+try:
+    SPATIAL_NOVELTY_WEIGHT = float(os.getenv('SPATIAL_NOVELTY_WEIGHT', DEFAULT_SPATIAL_NOVELTY_WEIGHT))
+except ValueError as e:
+    print(f"Warning: Invalid value for SPATIAL_NOVELTY_WEIGHT env var ('{os.getenv('SPATIAL_NOVELTY_WEIGHT')}'). Using default: {DEFAULT_SPATIAL_NOVELTY_WEIGHT}. Error: {e}", file=sys.stderr)
+    SPATIAL_NOVELTY_WEIGHT = DEFAULT_SPATIAL_NOVELTY_WEIGHT
+
+DEFAULT_TEXTUAL_NOVELTY_WEIGHT = 0.5
+try:
+    TEXTUAL_NOVELTY_WEIGHT = float(os.getenv('TEXTUAL_NOVELTY_WEIGHT', DEFAULT_TEXTUAL_NOVELTY_WEIGHT))
+except ValueError as e:
+    print(f"Warning: Invalid value for TEXTUAL_NOVELTY_WEIGHT env var ('{os.getenv('TEXTUAL_NOVELTY_WEIGHT')}'). Using default: {DEFAULT_TEXTUAL_NOVELTY_WEIGHT}. Error: {e}", file=sys.stderr)
+    TEXTUAL_NOVELTY_WEIGHT = DEFAULT_TEXTUAL_NOVELTY_WEIGHT
+
 
 # Flag to determine if explicit consent is required before storing data in public knowledge areas.
 REQUIRE_PUBLIC_STORAGE_CONSENT = os.getenv('REQUIRE_PUBLIC_STORAGE_CONSENT', 'True').lower() == 'true'
 
 # Default coherence value assigned to new knowledge items in the library, can be updated by SNN.
-DEFAULT_KNOWLEDGE_COHERENCE = float(os.getenv('DEFAULT_KNOWLEDGE_COHERENCE', 0.75))
+DEFAULT_KNOWLEDGE_COHERENCE = 0.75
+try:
+    DEFAULT_KNOWLEDGE_COHERENCE = float(os.getenv('DEFAULT_KNOWLEDGE_COHERENCE', DEFAULT_KNOWLEDGE_COHERENCE))
+except ValueError as e:
+    print(f"Warning: Invalid value for DEFAULT_KNOWLEDGE_COHERENCE env var ('{os.getenv('DEFAULT_KNOWLEDGE_COHERENCE')}'). Using default: {DEFAULT_KNOWLEDGE_COHERENCE}. Error: {e}", file=sys.stderr)
+    DEFAULT_KNOWLEDGE_COHERENCE = DEFAULT_KNOWLEDGE_COHERENCE
 
 # --- End of Memory/Library Configuration ---
+
+# --- Default Values for core/__init__.py ---
+AWARENESS_ERROR_DEFAULTS = {
+    "curiosity": 0, "context_stability": 0, "self_evolution_rate": 0, 
+    "coherence": 0, "active_llm_fallback": True, 
+    "primary_concept_coord": (0,0,0,0), "snn_error": "Manifold not initialized"
+}
+CRITICAL_MANIFOLD_ERROR_MSG = "CRITICAL: SpacetimeManifold not available. Cannot process thought."
+USER_FACING_MANIFOLD_ERROR_MSG = "I am currently unable to process thoughts due to an internal initialization issue."
+
+# --- Default Values for core/brain.py ---
+DEFAULT_BRAIN_AWARENESS_METRICS = {
+    "curiosity": 0.1, "context_stability": 0.5, "self_evolution_rate": 0.0,
+    "coherence": 0.0, "active_llm_fallback": True,
+    "primary_concept_coord": (0.0, 0.0, 0.0, 0.0), "snn_error": None
+}
+# Factors/defaults for metric calculations in brain.think()
+CURIOSITY_COHERENCE_FACTOR = 0.5 # (1.0 / 2.0)
+CONTEXT_STABILITY_STD_DEV_FACTOR = 2.0
+DEFAULT_CONTEXT_STABILITY_SINGLE_READING = 0.75
+DEFAULT_CONTEXT_STABILITY_NO_READING = 0.25
+
+
+# --- Default Values for core/dialogue.py ---
+DEFAULT_AWARENESS_METRICS_DIALOGUE = {
+    "curiosity": 0.1, "context_stability": 0.3, "self_evolution_rate": 0.0,
+    "coherence": 0.0, "active_llm_fallback": True,
+    "primary_concept_coord": None, "raw_t_intensity": 0.0, "snn_error": None
+}
+DEFAULT_DIALOGUE_ERROR_BRAIN_RESPONSE = "System did not generate a specific response due to an internal processing issue."
+DEFAULT_DIALOGUE_ETHICAL_SCORE_FALLBACK = 0.5
+MAX_CONCEPT_NAME_FOR_MEMORY_LEN = 30
+DEFAULT_MEMORY_CONCEPT_NAME = "interaction_summary"
+DIALOGUE_SUMMARY_LENGTH_SHORT = 100  # For user input summary for ethics
+DIALOGUE_SUMMARY_LENGTH_ACTION = 200 # For brain response summary for ethics
+
+# --- Default Values for core/ethics.py ---
+ETHICS_INTENSITY_PREFERENCE_SIGMA = 0.25
+ETHICS_IDEAL_INTENSITY_CENTER = 0.5
+ETHICS_TREND_T_INTENSITY_FACTOR = 0.9
+ETHICS_TREND_BASE_WEIGHT = 0.1
+ETHICS_TREND_SHORT_WINDOW_FACTOR = 0.2
+ETHICS_TREND_LONG_WINDOW_FACTOR = 0.5
+ETHICS_TREND_MIN_SHORT_WINDOW = 3
+ETHICS_TREND_MIN_LONG_WINDOW = 5
+
+# --- Default Values for core/gui.py ---
+GUI_RESPONSE_STREAMING_DELAY = 0.05
+
+# --- Default Values for core/library.py ---
+DEFAULT_SUMMARY_MAX_LENGTH = 100
+MITIGATION_LOG_SUMMARY_MAX_LENGTH = 75
+MITIGATION_SEVERE_ETHICAL_SCORE_THRESHOLD = 0.3
+MITIGATION_STRICT_CAUTION_ETHICAL_SCORE_THRESHOLD = 0.5
+KNOWLEDGE_PREVIEW_MAX_LENGTH = 150
+KNOWLEDGE_COORD_CONCEPT_NAME_MAX_LENGTH = 20
+KNOWLEDGE_DEFAULT_COORD_CONCEPT_NAME = "generic library content"
+KNOWLEDGE_ENTRY_SCHEMA_VERSION = "1.0"
+
+# --- Default Values for core/memory.py ---
+TEXTUAL_NOVELTY_EMPTY_SUMMARY_SCORE = 0.5
+MEMORY_NODE_TYPE_CONCEPT = "concept_memory"
+MEMORY_DEFAULT_RELATION_TYPE = "related_to"
+DEFAULT_RECENT_MEMORIES_LIMIT = 10
+
+# --- Default Values for main.py ---
+DEFAULT_SINGLE_QUERY_STREAM_THOUGHTS = False
+
 
 # --- Other Configuration Sections ---
 # Miscellaneous parameters for system behavior, learning, and environment.
 
 # Threshold for self-correction mechanisms. If confidence or alignment drops below this,
 # the system might trigger internal review or learning processes.
-SELF_CORRECTION_THRESHOLD = float(os.getenv('SELF_CORRECTION_THRESHOLD', 0.75))
+DEFAULT_SELF_CORRECTION_THRESHOLD = 0.75
+try:
+    SELF_CORRECTION_THRESHOLD = float(os.getenv('SELF_CORRECTION_THRESHOLD', DEFAULT_SELF_CORRECTION_THRESHOLD))
+except ValueError as e:
+    print(f"Warning: Invalid value for SELF_CORRECTION_THRESHOLD env var ('{os.getenv('SELF_CORRECTION_THRESHOLD')}'). Using default: {DEFAULT_SELF_CORRECTION_THRESHOLD}. Error: {e}", file=sys.stderr)
+    SELF_CORRECTION_THRESHOLD = DEFAULT_SELF_CORRECTION_THRESHOLD
 
 # Modifier for the rate at which the system evolves or adapts its core structures.
 # Could influence learning rates, structural plasticity, etc.
-EVOLUTION_RATE_MODIFIER = float(os.getenv('EVOLUTION_RATE_MODIFIER', 1.0)) # 1.0 for normal rate
+DEFAULT_EVOLUTION_RATE_MODIFIER = 1.0
+try:
+    EVOLUTION_RATE_MODIFIER = float(os.getenv('EVOLUTION_RATE_MODIFIER', DEFAULT_EVOLUTION_RATE_MODIFIER)) # 1.0 for normal rate
+except ValueError as e:
+    print(f"Warning: Invalid value for EVOLUTION_RATE_MODIFIER env var ('{os.getenv('EVOLUTION_RATE_MODIFIER')}'). Using default: {DEFAULT_EVOLUTION_RATE_MODIFIER}. Error: {e}", file=sys.stderr)
+    EVOLUTION_RATE_MODIFIER = DEFAULT_EVOLUTION_RATE_MODIFIER
 
 # Execution environment: "development", "testing", "production"
 # This can be used to enable/disable certain features, logging levels, etc.

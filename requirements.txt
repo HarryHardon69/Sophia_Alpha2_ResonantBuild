@@ -2,7 +2,4 @@ streamlit
 torch
 snntorch
 numpy
-openai
-pandas
-psutil
 requests

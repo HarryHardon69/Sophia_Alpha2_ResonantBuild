@@ -16,6 +16,20 @@ def think(input_text: str, stream_thought_steps: bool = False) -> tuple[list, st
     """
     Primary entry point for making Sophia_Alpha2 process input and generate a response.
     Retrieves the shared SpacetimeManifold instance and calls its think() method.
+
+    Args:
+        input_text (str): The text input to be processed.
+        stream_thought_steps (bool, optional): If True, enables more verbose
+                                               thought step logging from the brain.
+                                               Defaults to False.
+
+    Returns:
+        tuple[list, str, dict]: A tuple containing:
+            - thought_steps (list): A list of strings describing internal processing.
+            - response_text (str): The generated textual response.
+            - awareness_metrics (dict): A dictionary of current awareness metrics.
+              In case of manifold initialization failure, this will contain default/error
+              values including an 'snn_error' key.
     """
     manifold = get_shared_manifold()
     if manifold:

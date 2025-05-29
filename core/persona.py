@@ -32,7 +32,15 @@ class Persona:
     Handles persistence of this state to a profile JSON file.
     """
     def __init__(self):
-        # Default attributes
+        """
+        Initializes the Persona instance.
+        
+        Sets default attributes, determines the profile path (favoring configuration
+        if available, otherwise using a fallback), ensures the profile directory
+        exists, and loads the persona state from the profile file (or initializes
+        a default state if loading fails).
+        """
+        # Default attributes that will be used if not overridden by config or loaded state.
         default_name = "Sophia_Alpha2_Default"
         self.name = default_name
         self.mode = "reflective"  # e.g., reflective, learning, active_problem_solving
@@ -61,39 +69,50 @@ class Persona:
         # Initialize profile_path with a default. It will be overridden by config if available.
         self.profile_path = os.path.join(fallback_data_dir, default_profile_filename)
 
-        if config:
-            self.name = getattr(config, 'PERSONA_NAME', default_name)
-            # Use config.PERSONA_PROFILE_PATH for the profile path
+        # --- Profile Path Resolution and Directory Creation ---
+        if config: # If the main config module is loaded.
+            self.name = getattr(config, 'PERSONA_NAME', default_name) # Use persona name from config if set.
+            # Prioritize PERSONA_PROFILE_PATH from config for the profile file.
             self.profile_path = getattr(config, 'PERSONA_PROFILE_PATH', self.profile_path)
             
+            # Use config.ensure_path utility (if available) to create the profile directory.
+            # This utility is expected to handle parent directory creation.
             if hasattr(config, 'ensure_path'):
                 try:
-                    config.ensure_path(self.profile_path) # Ensures the directory for profile_path exists
+                    config.ensure_path(self.profile_path) 
                 except Exception as e_ensure:
+                    # Log warning if config.ensure_path fails.
                     print(f"Warning (Persona __init__): Error ensuring profile path '{self.profile_path}' via config.ensure_path: {e_ensure}", file=sys.stderr)
             else:
-                # Manual ensure_path if config.ensure_path is not available (e.g. standalone testing without full config object)
+                # Manual fallback for directory creation if config.ensure_path is missing.
+                # This might occur in minimal testing environments where config is a stub.
                 try:
                     profile_dir = os.path.dirname(self.profile_path)
-                    if profile_dir and not os.path.exists(profile_dir): # Only create if profile_dir is not empty (e.g. not current dir)
+                    # Only attempt to create if profile_dir is a valid path (not empty, e.g., for relative filenames in CWD).
+                    if profile_dir and not os.path.exists(profile_dir): 
                         os.makedirs(profile_dir, exist_ok=True)
                 except Exception as e_manual_mkdir:
                      print(f"Warning (Persona __init__): Error manually ensuring profile directory for '{self.profile_path}': {e_manual_mkdir}", file=sys.stderr)
         else: 
-            # When config is None, we are likely in a standalone test.
-            # Ensure the profile directory exists for the default path.
-            if not (hasattr(sys, '_called_from_test') and sys._called_from_test): # Avoid print during automated tests
-                 print("Warning (Persona __init__): Config module not loaded. Persona will use default name and profile path. Attempting to ensure default path.", file=sys.stderr)
+            # Scenario: config module is not loaded (e.g., standalone testing or critical import failure).
+            # Persona will use its default name and the fallback profile_path.
+            # Attempt to create the directory for this fallback path.
+            # Suppress print warnings if running under the test harness (indicated by _called_from_test).
+            if not (hasattr(sys, '_called_from_test') and sys._called_from_test):
+                 print("Warning (Persona __init__): Config module not loaded. Persona using default name and profile path. Attempting to ensure default path.", file=sys.stderr)
             try:
                 profile_dir = os.path.dirname(self.profile_path)
                 if profile_dir and not os.path.exists(profile_dir):
                     os.makedirs(profile_dir, exist_ok=True)
-            except Exception as e_manual_mkdir_noconf:
+            except Exception as e_manual_mkdir_noconf: # Catch errors during manual directory creation.
                 if not (hasattr(sys, '_called_from_test') and sys._called_from_test):
                     print(f"Warning (Persona __init__): Error manually ensuring default profile directory for '{self.profile_path}': {e_manual_mkdir_noconf}", file=sys.stderr)
 
+        # Load persona state from the determined profile_path.
+        # If loading fails (e.g., file not found, corrupted), _initialize_default_state_and_save() is called within load_state().
         self.load_state() 
         
+        # Log initialization details if verbose output is enabled in config and not running under test harness.
         if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
             print(f"Persona initialized: Name='{self.name}', Mode='{self.mode}', Profile='{self.profile_path}'", file=sys.stderr)
             print(f"Initial Awareness: {self.awareness}", file=sys.stderr)
@@ -104,24 +123,30 @@ class Persona:
         Includes name, mode, traits, and the full awareness dictionary.
         The `primary_concept_coord` in awareness is stored as (scaled_x, scaled_y, scaled_z, raw_t_intensity_0_to_1).
         """
+        # Compile all relevant persona attributes into a dictionary for serialization.
         state_to_save = {
             "name": self.name,
             "mode": self.mode,
             "traits": self.traits,
-            "awareness": self.awareness,
-            "last_saved": datetime.datetime.utcnow().isoformat() + "Z"
+            "awareness": self.awareness, # This includes primary_concept_coord with raw T-intensity.
+            "last_saved": datetime.datetime.utcnow().isoformat() + "Z" # Timestamp of save.
         }
 
         try:
+            # Ensure the directory for the profile file exists before attempting to write.
+            # This is a safeguard, as __init__ should have already created it.
             profile_dir = os.path.dirname(self.profile_path)
             if profile_dir and not os.path.exists(profile_dir):
                 os.makedirs(profile_dir, exist_ok=True)
+                # Log directory creation if verbose and not under test.
                 if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
                     print(f"Info (Persona save_state): Created missing profile directory: {profile_dir}", file=sys.stderr)
 
+            # Write the state to the JSON file with pretty printing (indent=2).
             with open(self.profile_path, 'w') as f:
                 json.dump(state_to_save, f, indent=2)
             
+            # Log successful save if verbose and not under test.
             if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
                 print(f"Info (Persona save_state): Persona state saved to {self.profile_path}", file=sys.stderr)
                 
@@ -169,90 +194,103 @@ class Persona:
         `primary_concept_coord` is validated as a 4-tuple of numbers or None.
         If loading fails critically, initializes a default state.
         """
+        # Check if profile_path is set; essential for loading.
         if not hasattr(self, 'profile_path') or not self.profile_path:
-            if not (hasattr(sys, '_called_from_test') and sys._called_from_test):
-                print("Error (Persona load_state): profile_path not set. Cannot load.", file=sys.stderr)
-            self._initialize_default_state_and_save()
+            if not (hasattr(sys, '_called_from_test') and sys._called_from_test): # Suppress during tests.
+                print("Error (Persona load_state): Persona.profile_path is not set. Cannot load state.", file=sys.stderr)
+            self._initialize_default_state_and_save() # Fallback to default if path is missing.
             return
 
+        # Check if the profile file exists and is not empty.
         if not os.path.exists(self.profile_path) or os.path.getsize(self.profile_path) == 0:
             if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
                 print(f"Info (Persona load_state): Profile file '{self.profile_path}' not found or empty. Initializing default state.", file=sys.stderr)
-            self._initialize_default_state_and_save()
+            self._initialize_default_state_and_save() # Initialize if no file or empty.
             return
 
         try:
+            # Attempt to open and load JSON data from the profile file.
             with open(self.profile_path, 'r') as f:
                 loaded_state = json.load(f)
 
+            # Validate that the loaded data is a dictionary.
             if not isinstance(loaded_state, dict):
                 if not (hasattr(sys, '_called_from_test') and sys._called_from_test):
                     print(f"Warning (Persona load_state): Profile data in '{self.profile_path}' is not a dictionary. Initializing default state.", file=sys.stderr)
                 self._initialize_default_state_and_save()
                 return
 
+            # Load basic attributes, falling back to existing defaults if keys are missing.
             self.name = loaded_state.get("name", self.name)
             self.mode = loaded_state.get("mode", self.mode)
             
+            # Load 'traits', ensuring it's a list of strings.
             loaded_traits = loaded_state.get("traits", self.traits)
             if isinstance(loaded_traits, list) and all(isinstance(t, str) for t in loaded_traits):
                 self.traits = loaded_traits
-            else:
+            else: # If traits are malformed, revert to default and log warning.
                 if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
                     print(f"Warning (Persona load_state): Loaded 'traits' is not a list of strings. Using default traits.", file=sys.stderr)
-                self.traits = ["CuriosityDriven", "EthicallyMinded", "ResonanceAware", "Developmental"] # Default
+                self.traits = ["CuriosityDriven", "EthicallyMinded", "ResonanceAware", "Developmental"] # Default traits
 
-            loaded_awareness_data = loaded_state.get("awareness", {})
-            if not isinstance(loaded_awareness_data, dict):
+            # --- Load 'awareness' dictionary with careful validation for each key ---
+            loaded_awareness_data = loaded_state.get("awareness", {}) # Get awareness dict, default to empty.
+            if not isinstance(loaded_awareness_data, dict): # Ensure it's a dictionary.
                 if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
-                    print(f"Warning (Persona load_state): 'awareness' data in profile is not a dictionary. Using default awareness.", file=sys.stderr)
-                loaded_awareness_data = {} 
+                    print(f"Warning (Persona load_state): 'awareness' data in profile is not a dictionary. Using default awareness state.", file=sys.stderr)
+                loaded_awareness_data = {} # Use empty dict to trigger defaults for all awareness fields.
 
+            # Template for expected types of awareness metrics (excluding primary_concept_coord).
             default_awareness_template = { 
                 "curiosity": float, "context_stability": float, "self_evolution_rate": float,
                 "coherence": float, "active_llm_fallback": bool
             }
-
+            # Iterate and load each awareness metric, validating type and falling back to current default if invalid.
             for key, expected_type in default_awareness_template.items():
                 if key in loaded_awareness_data:
-                    value = loaded_awareness_data[key]
-                    try:
+                    value_from_file = loaded_awareness_data[key]
+                    try: # Attempt type conversion.
                         if expected_type == float:
-                            self.awareness[key] = float(value)
+                            self.awareness[key] = float(value_from_file)
                         elif expected_type == bool:
-                            self.awareness[key] = bool(value)
-                    except (ValueError, TypeError):
+                            self.awareness[key] = bool(value_from_file)
+                        # Add other types if necessary
+                    except (ValueError, TypeError): # If conversion fails, log warning and keep existing default.
                         if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
-                            print(f"Warning (Persona load_state): Invalid type for awareness key '{key}'. Expected {expected_type}, got {type(value)}. Using default from __init__ ({self.awareness.get(key)}).", file=sys.stderr)
+                            print(f"Warning (Persona load_state): Invalid type for awareness key '{key}'. Expected {expected_type}, got {type(value_from_file)}. Using current default: {self.awareness.get(key)}.", file=sys.stderr)
+                # If key not in loaded_awareness_data, the default from __init__ remains.
                 
+            # Special handling for 'primary_concept_coord'.
+            # It can be None or a 4-tuple of floats.
             loaded_coord = loaded_awareness_data.get("primary_concept_coord")
-            if loaded_coord is None:
+            if loaded_coord is None: # Explicitly None in file.
                 self.awareness["primary_concept_coord"] = None
-            elif isinstance(loaded_coord, (list, tuple)) and len(loaded_coord) == 4:
-                try:
+            elif isinstance(loaded_coord, (list, tuple)) and len(loaded_coord) == 4: # Check type and length.
+                try: # Convert elements to float.
                     self.awareness["primary_concept_coord"] = tuple(float(v) for v in loaded_coord)
-                except (ValueError, TypeError):
+                except (ValueError, TypeError): # If any element is not convertible to float.
                     if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
-                        print(f"Warning (Persona load_state): 'primary_concept_coord' in profile has non-numeric values: {loaded_coord}. Setting to None.", file=sys.stderr)
-                    self.awareness["primary_concept_coord"] = None 
-            else: 
+                        print(f"Warning (Persona load_state): 'primary_concept_coord' in profile contains non-numeric values: {loaded_coord}. Setting to None.", file=sys.stderr)
+                    self.awareness["primary_concept_coord"] = None # Fallback to None.
+            else: # Malformed (not None, not list/tuple of 4).
                 if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
-                    print(f"Warning (Persona load_state): 'primary_concept_coord' in profile is malformed: {loaded_coord}. Expected list/tuple of 4 or None. Setting to None.", file=sys.stderr)
-                self.awareness["primary_concept_coord"] = None 
+                    print(f"Warning (Persona load_state): 'primary_concept_coord' in profile is malformed: {loaded_coord}. Expected list/tuple of 4 numbers or None. Setting to None.", file=sys.stderr)
+                self.awareness["primary_concept_coord"] = None # Fallback to None.
 
+            # Log successful load if verbose and not under test.
             if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
                 print(f"Info (Persona load_state): Persona state loaded successfully from {self.profile_path}", file=sys.stderr)
-                print(f"Loaded Awareness: {self.awareness}", file=sys.stderr)
+                print(f"Loaded Awareness after validation: {self.awareness}", file=sys.stderr)
 
-        except json.JSONDecodeError as e_json:
+        except json.JSONDecodeError as e_json: # Handle malformed JSON file.
             if not (hasattr(sys, '_called_from_test') and sys._called_from_test):
                 print(f"Error (Persona load_state): Malformed JSON in profile file '{self.profile_path}': {e_json}. Initializing default state.", file=sys.stderr)
-            self._initialize_default_state_and_save()
-        except Exception as e:
+            self._initialize_default_state_and_save() # Fallback to default.
+        except Exception as e: # Catch any other unexpected errors during loading.
             if not (hasattr(sys, '_called_from_test') and sys._called_from_test):
                 print(f"Error (Persona load_state): Unexpected error loading persona state from '{self.profile_path}': {e}. Initializing default state.", file=sys.stderr)
-                traceback.print_exc(file=sys.stderr)
-            self._initialize_default_state_and_save()
+                traceback.print_exc(file=sys.stderr) # Log full traceback for debugging.
+            self._initialize_default_state_and_save() # Fallback to default.
 
     def get_intro(self) -> str:
         """
@@ -285,108 +323,132 @@ class Persona:
         Persona's self.awareness['primary_concept_coord'] will store:
         (scaled_x, scaled_y, scaled_z, raw_t_intensity_0_to_1).
         """
+        # Validate input type.
         if not isinstance(brain_awareness_metrics, dict):
             if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
-                print(f"Warning (Persona update_awareness): Invalid brain_awareness_metrics type: {type(brain_awareness_metrics)}. No update.", file=sys.stderr)
+                print(f"Warning (Persona update_awareness): Invalid brain_awareness_metrics type: {type(brain_awareness_metrics)}. Expected dict. No update performed.", file=sys.stderr)
             return
 
         if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
-            print(f"Info (Persona update_awareness): Received brain metrics: {brain_awareness_metrics}", file=sys.stderr)
+            print(f"Info (Persona update_awareness): Received brain metrics for update: {brain_awareness_metrics}", file=sys.stderr)
 
-        changed = False
-        original_awareness_json = json.dumps(self.awareness, sort_keys=True)
+        changed = False # Flag to track if any awareness metric actually changes value.
+        # Store a JSON representation of current awareness for detailed logging if changes occur.
+        original_awareness_json = json.dumps(self.awareness, sort_keys=True, default=str)
 
+
+        # Define keys and their expected types for standard awareness metrics.
         metric_keys_to_process = {
             "curiosity": float, "context_stability": float, "self_evolution_rate": float,
             "coherence": float, "active_llm_fallback": bool
         }
+        # Process each standard metric.
         for key, expected_type in metric_keys_to_process.items():
-            if key in brain_awareness_metrics:
+            if key in brain_awareness_metrics: # If the metric is present in the input.
                 new_value = brain_awareness_metrics[key]
-                current_value = self.awareness.get(key)
+                current_value = self.awareness.get(key) # Current value in persona.
                 try:
+                    # Attempt to cast the new value to its expected type.
                     if expected_type == float:
                         typed_new_value = float(new_value)
                     elif expected_type == bool:
                         typed_new_value = bool(new_value)
-                    else: 
+                    else: # Should not happen with current template, but for extensibility.
                         typed_new_value = new_value 
 
+                    # If the new typed value is different from current, update and mark as changed.
                     if current_value != typed_new_value:
                         self.awareness[key] = typed_new_value
                         changed = True
-                except (ValueError, TypeError):
+                except (ValueError, TypeError): # Handle type conversion errors.
                     if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
                         print(f"Warning (Persona update_awareness): Invalid type for metric '{key}'. Expected {expected_type}, got {type(new_value)}. Retaining existing value: {current_value}", file=sys.stderr)
         
-        scaled_coord_from_brain = brain_awareness_metrics.get("primary_concept_coord")
-        raw_t_from_brain = brain_awareness_metrics.get("raw_t_intensity")
+        # --- Special Handling for 'primary_concept_coord' ---
+        # This coordinate is a 4-tuple: (scaled_x, scaled_y, scaled_z, raw_t_intensity_0_to_1).
+        # The brain might send 'primary_concept_coord' (scaled x,y,z, and potentially scaled t)
+        # AND a separate 'raw_t_intensity' (expected to be 0-1).
+        # We need to construct the final awareness coordinate using scaled x,y,z and the raw_t_intensity.
         
-        new_awareness_coord_to_set = self.awareness.get("primary_concept_coord") 
-        coord_update_attempted = False
+        scaled_coord_from_brain = brain_awareness_metrics.get("primary_concept_coord")
+        raw_t_from_brain = brain_awareness_metrics.get("raw_t_intensity") # Expected 0-1 intensity
+        
+        new_awareness_coord_to_set = self.awareness.get("primary_concept_coord") # Start with current value.
+        coord_update_attempted = False # Flag to track if we even tried to update coords.
 
-        if "primary_concept_coord" in brain_awareness_metrics: 
+        if "primary_concept_coord" in brain_awareness_metrics: # If brain provided any coordinate data.
             coord_update_attempted = True
-            if scaled_coord_from_brain is None:
-                if self.awareness.get("primary_concept_coord") is not None:
+            if scaled_coord_from_brain is None: # If brain explicitly sets coord to None.
+                if self.awareness.get("primary_concept_coord") is not None: # If it was previously set.
                     new_awareness_coord_to_set = None
                     changed = True
             elif isinstance(scaled_coord_from_brain, (list, tuple)) and len(scaled_coord_from_brain) == 4:
+                # Valid structure for scaled_coord_from_brain.
                 try:
                     scaled_x = float(scaled_coord_from_brain[0])
                     scaled_y = float(scaled_coord_from_brain[1])
                     scaled_z = float(scaled_coord_from_brain[2])
-                    final_raw_t = None
+                    final_raw_t = None # This will be the 4th element of the stored awareness coord.
 
+                    # Determine final_raw_t, prioritizing 'raw_t_from_brain'.
                     if raw_t_from_brain is not None:
                         try:
                             final_raw_t = float(raw_t_from_brain)
+                            # Validate and clip raw_t_intensity to ensure it's within [0,1].
                             if not (0.0 <= final_raw_t <= 1.0):
                                 if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
-                                     print(f"Warning (Persona update_awareness): Received 'raw_t_intensity' {final_raw_t} outside 0-1 range. Clipping.", file=sys.stderr)
-                                final_raw_t = max(0.0, min(1.0, final_raw_t))
-                        except (ValueError, TypeError):
+                                     print(f"Warning (Persona update_awareness): Received 'raw_t_intensity' {final_raw_t} outside [0,1] range. Clipping.", file=sys.stderr)
+                                final_raw_t = np.clip(final_raw_t, 0.0, 1.0) # Use np.clip for robust clamping.
+                        except (ValueError, TypeError): # If raw_t_from_brain is not a valid float.
                             if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
-                                print(f"Warning (Persona update_awareness): Invalid type for 'raw_t_intensity': {raw_t_from_brain}. Will attempt fallback.", file=sys.stderr)
-                            final_raw_t = None 
+                                print(f"Warning (Persona update_awareness): Invalid type for 'raw_t_intensity': {raw_t_from_brain}. Attempting fallback for T-intensity.", file=sys.stderr)
+                            final_raw_t = None # Mark as None to trigger fallback logic.
 
+                    # Fallback logic if final_raw_t is still None (i.e., raw_t_from_brain was missing or invalid).
                     if final_raw_t is None: 
                         if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
-                            print(f"Warning (Persona update_awareness): 'raw_t_intensity' missing or invalid in brain metrics. Falling back to scaled_coord[3] if it's in 0-1 range.", file=sys.stderr)
+                            print(f"Info (Persona update_awareness): 'raw_t_intensity' from brain metrics missing or invalid. Attempting to use scaled_coord_from_brain[3] as raw T-intensity if it's in [0,1] range.", file=sys.stderr)
                         
-                        fallback_t = float(scaled_coord_from_brain[3]) 
-                        if 0.0 <= fallback_t <= 1.0:
-                            final_raw_t = fallback_t
+                        fallback_t_candidate = float(scaled_coord_from_brain[3]) # The 4th element from brain's scaled coord.
+                        # Check if this fallback candidate is a valid raw intensity (0-1).
+                        if 0.0 <= fallback_t_candidate <= 1.0:
+                            final_raw_t = fallback_t_candidate
                             if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
-                                print(f"Info (Persona update_awareness): Using scaled_coord[3] ({fallback_t:.4f}) as raw T-intensity.", file=sys.stderr)
-                        else:
+                                print(f"Info (Persona update_awareness): Using scaled_coord_from_brain[3] ({fallback_t_candidate:.4f}) as raw T-intensity.", file=sys.stderr)
+                        else: # Fallback candidate is also not a valid raw intensity.
                             if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
-                                print(f"Warning (Persona update_awareness): Fallback scaled_coord[3] ({fallback_t:.4f}) is outside 0-1 range. Cannot determine raw T-intensity. Setting T to 0.0 in awareness coord.", file=sys.stderr)
-                            final_raw_t = 0.0 
+                                print(f"Warning (Persona update_awareness): Fallback T-intensity from scaled_coord_from_brain[3] ({fallback_t_candidate:.4f}) is outside [0,1] range. Defaulting raw T-intensity to 0.0 for awareness state.", file=sys.stderr)
+                            final_raw_t = 0.0 # Default to 0.0 if no valid source.
+                    
+                    # Construct the new coordinate tuple for awareness state.
                     constructed_coord = (scaled_x, scaled_y, scaled_z, final_raw_t)
+                    # Check if this newly constructed coordinate is different from the current one.
                     if self.awareness.get("primary_concept_coord") != constructed_coord:
                         new_awareness_coord_to_set = constructed_coord
                         changed = True
                 
-                except (ValueError, TypeError, IndexError) as e:
+                except (ValueError, TypeError, IndexError) as e: # Catch errors if scaled_coord_from_brain elements are invalid.
                     if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
-                        print(f"Warning (Persona update_awareness): Malformed 'primary_concept_coord' data: {scaled_coord_from_brain}. Error: {e}. Retaining existing.", file=sys.stderr)
+                        print(f"Warning (Persona update_awareness): Malformed 'primary_concept_coord' data from brain: {scaled_coord_from_brain}. Error: {e}. Retaining existing primary_concept_coord.", file=sys.stderr)
             
-            else: 
+            else: # scaled_coord_from_brain is not None and not a valid list/tuple of 4.
                 if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
-                    print(f"Warning (Persona update_awareness): Received 'primary_concept_coord' is not None and not a list/tuple of 4: {scaled_coord_from_brain}. Retaining existing.", file=sys.stderr)
+                    print(f"Warning (Persona update_awareness): Received 'primary_concept_coord' from brain is neither None nor a valid 4-element list/tuple: {scaled_coord_from_brain}. Retaining existing primary_concept_coord.", file=sys.stderr)
                 
-            if coord_update_attempted: 
-                 if self.awareness.get("primary_concept_coord") != new_awareness_coord_to_set :
-                    self.awareness["primary_concept_coord"] = new_awareness_coord_to_set
+            # After all processing, if an update to the coordinate was attempted and resulted in a change:
+            if coord_update_attempted and self.awareness.get("primary_concept_coord") != new_awareness_coord_to_set:
+                self.awareness["primary_concept_coord"] = new_awareness_coord_to_set
+                # 'changed' flag would have been set if new_awareness_coord_to_set differs from original.
+
+        # If any part of the awareness state has changed, save the entire state.
         if changed:
-            new_awareness_json = json.dumps(self.awareness, sort_keys=True)
+            new_awareness_json = json.dumps(self.awareness, sort_keys=True, default=str)
             if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
-                print(f"Info (Persona update_awareness): Awareness changed.", file=sys.stderr)
-                print(f"  Old awareness subset: {original_awareness_json}", file=sys.stderr) 
-                print(f"  New awareness state: {new_awareness_json}", file=sys.stderr) 
-            self.save_state()
-        else:
+                print(f"Info (Persona update_awareness): Awareness state has changed.", file=sys.stderr)
+                print(f"  Old awareness state (JSON): {original_awareness_json}", file=sys.stderr) 
+                print(f"  New awareness state (JSON): {new_awareness_json}", file=sys.stderr) 
+            self.save_state() # Persist changes.
+        else: # No changes detected.
             if config and getattr(config, 'VERBOSE_OUTPUT', False) and not (hasattr(sys, '_called_from_test') and sys._called_from_test):
                 print(f"Info (Persona update_awareness): No change in awareness metrics after processing: {brain_awareness_metrics}", file=sys.stderr)
 

@@ -9,11 +9,13 @@ This module is responsible for:
   configurable ethical principles.
 """
 
+import datetime
+import json
 import os
 import sys
-import json
-import datetime
-import numpy as np # For numerical operations, e.g., weighted averages, std dev in trends
+import traceback # Promoted to top-level
+
+import numpy as np
 
 # Attempt to import configuration from the parent package
 try:
@@ -119,97 +121,103 @@ def _load_ethics_db():
     """
     Loads the ethics database from the path specified in config.
     Handles file errors and malformed data, defaulting to an empty DB structure.
-    Sets _ethics_db_dirty_flag to False.
+    Sets `_ethics_db_dirty_flag` to False, as the in-memory state aligns with
+    what was loaded (or the default empty state).
     """
     global _ethics_db, _ethics_db_dirty_flag
-    # Ensure traceback is imported for full error details, if not already at module level
-    import traceback
     
+    # Critical check for config availability for database path and directory creation.
     if not config or not hasattr(config, 'ETHICS_DB_PATH') or not hasattr(config, 'ensure_path'):
         _log_ethics_event("load_ethics_db_failure", {"error": "Config not available or ETHICS_DB_PATH/ensure_path not set"}, level="critical")
         _ethics_db = {"ethical_scores": [], "trend_analysis": {}} # Default structure
-        _ethics_db_dirty_flag = False
+        _ethics_db_dirty_flag = False # In-memory state is this default, so not "dirty".
         return
 
     db_path = config.ETHICS_DB_PATH
-    config.ensure_path(db_path) # Ensure directory exists
+    config.ensure_path(db_path) # Ensures the directory for the DB file exists.
 
     try:
+        # If DB file doesn't exist or is empty, initialize with a default structure.
         if not os.path.exists(db_path) or os.path.getsize(db_path) == 0:
             _log_ethics_event("load_ethics_db_info", {"message": "Ethics DB file not found or empty. Initializing new DB.", "path": db_path}, level="info")
             _ethics_db = {"ethical_scores": [], "trend_analysis": {}}
-            _ethics_db_dirty_flag = False 
+            _ethics_db_dirty_flag = False # Freshly initialized, so not dirty.
             return
 
+        # Attempt to open and load JSON data from the existing DB file.
         with open(db_path, 'r') as f:
             data = json.load(f)
 
-        # Validate structure
-        if isinstance(data, dict) and            "ethical_scores" in data and isinstance(data["ethical_scores"], list) and            "trend_analysis" in data and isinstance(data["trend_analysis"], dict):
-            _ethics_db = data
-            _ethics_db_dirty_flag = False
+        # Validate the basic structure of the loaded data.
+        if isinstance(data, dict) and \
+           "ethical_scores" in data and isinstance(data["ethical_scores"], list) and \
+           "trend_analysis" in data and isinstance(data["trend_analysis"], dict):
+            _ethics_db = data # Assign loaded data to the global DB variable.
+            _ethics_db_dirty_flag = False # Successfully loaded, so in-memory is synchronized.
             _log_ethics_event("load_ethics_db_success", 
                               {"path": db_path, "scores_loaded": len(data["ethical_scores"])}, 
                               level="info")
-        else:
+        else: # Data does not conform to the expected structure.
             _log_ethics_event("load_ethics_db_malformed_structure", 
                               {"path": db_path, "error": "Root must be dict with 'ethical_scores' (list) and 'trend_analysis' (dict)."}, 
                               level="error")
-            _ethics_db = {"ethical_scores": [], "trend_analysis": {}}
-            _ethics_db_dirty_flag = False
+            _ethics_db = {"ethical_scores": [], "trend_analysis": {}} # Reset to default.
+            _ethics_db_dirty_flag = False # Defaulted, so considered clean.
             
-    except json.JSONDecodeError as e:
+    except json.JSONDecodeError as e: # Handle errors if JSON is invalid.
         _log_ethics_event("load_ethics_db_json_decode_error", {"path": db_path, "error": str(e)}, level="error")
         _ethics_db = {"ethical_scores": [], "trend_analysis": {}}
         _ethics_db_dirty_flag = False
-    except Exception as e:
+    except Exception as e: # Catch any other unexpected errors during file operations.
         _log_ethics_event("load_ethics_db_unknown_error", {"path": db_path, "error": str(e), "trace": traceback.format_exc()}, level="critical")
         _ethics_db = {"ethical_scores": [], "trend_analysis": {}}
         _ethics_db_dirty_flag = False
 
 def _save_ethics_db():
     """
-    Saves the current state of _ethics_db to disk if changes have been made.
-    Uses the _ethics_db_dirty_flag. Sets flag to False after successful save.
-    Uses atomic writes.
+    Saves the current state of `_ethics_db` to disk if `_ethics_db_dirty_flag` is True.
+    Uses an atomic write (write to temp file, then replace original) to prevent data corruption.
+    Resets `_ethics_db_dirty_flag` to False after a successful save.
     """
     global _ethics_db_dirty_flag
-    # Ensure traceback is imported for full error details, if not already at module level
-    import traceback
 
-    if not _ethics_db_dirty_flag:
-        _log_ethics_event("save_ethics_db_skipped", {"message": "No changes to save."}, level="debug")
+    if not _ethics_db_dirty_flag: # Only proceed if there are changes to save.
+        _log_ethics_event("save_ethics_db_skipped", {"message": "No changes to save (_ethics_db_dirty_flag is False)."}, level="debug")
         return
 
+    # Critical check for config availability.
     if not config or not hasattr(config, 'ETHICS_DB_PATH') or not hasattr(config, 'ensure_path'):
         _log_ethics_event("save_ethics_db_failure", {"error": "Config not available or ETHICS_DB_PATH/ensure_path not set"}, level="critical")
+        # Do not reset dirty flag; changes are still pending.
         return
 
     db_path = config.ETHICS_DB_PATH
-    config.ensure_path(db_path) # Ensure directory exists
+    config.ensure_path(db_path) # Ensure the directory for the DB file exists.
 
+    temp_db_path = db_path + ".tmp" # Path for the temporary file.
     try:
-        temp_db_path = db_path + ".tmp"
+        # Step 1: Write the current database to the temporary file.
+        # `default=str` handles potential non-serializable items like datetime objects if not already ISO strings.
         with open(temp_db_path, 'w') as f:
-            json.dump(_ethics_db, f, indent=4, default=str) # Use default=str for any non-serializable data
+            json.dump(_ethics_db, f, indent=4, default=str) 
         
-        if sys.platform == "win32":
-            os.replace(temp_db_path, db_path)
-        else:
-            os.rename(temp_db_path, db_path)
+        # Step 2: Atomically replace the original DB file with the temporary file.
+        # os.replace is generally atomic and preferred over os.rename if destination might exist.
+        os.replace(temp_db_path, db_path)
 
-        _ethics_db_dirty_flag = False
+        _ethics_db_dirty_flag = False # Reset dirty flag only after successful write and replacement.
         _log_ethics_event("save_ethics_db_success", 
                           {"path": db_path, "scores_saved": len(_ethics_db["ethical_scores"])}, 
                           level="info")
     
-    except IOError as e_io:
-        _log_ethics_event("save_ethics_db_io_error", {"path": db_path, "error": str(e_io), "trace": traceback.format_exc()}, level="critical")
+    except IOError as e_io: # Handle file I/O errors (e.g., permission issues).
+        _log_ethics_event("save_ethics_db_io_error", {"path": db_path, "temp_path": temp_db_path, "error": str(e_io), "trace": traceback.format_exc()}, level="critical")
+        # Attempt to clean up the temporary file if it exists and an error occurred.
         if os.path.exists(temp_db_path):
             try: os.remove(temp_db_path)
             except Exception as e_rm: _log_ethics_event("save_ethics_db_temp_cleanup_error", {"path": temp_db_path, "error": str(e_rm)}, level="error")
-    except Exception as e:
-        _log_ethics_event("save_ethics_db_unknown_error", {"path": db_path, "error": str(e), "trace": traceback.format_exc()}, level="critical")
+    except Exception as e: # Handle other unexpected errors during the save process.
+        _log_ethics_event("save_ethics_db_unknown_error", {"path": db_path, "temp_path": temp_db_path, "error": str(e), "trace": traceback.format_exc()}, level="critical")
         if os.path.exists(temp_db_path):
             try: os.remove(temp_db_path)
             except Exception as e_rm: _log_ethics_event("save_ethics_db_temp_cleanup_error_unknown", {"path": temp_db_path, "error": str(e_rm)}, level="error")
@@ -228,160 +236,178 @@ def score_ethics(awareness_metrics: dict, concept_summary: str = "", action_desc
     Returns:
         A final ethical score between 0.0 (less aligned) and 1.0 (more aligned).
     """
-    global _ethics_db_dirty_flag
-    # Ensure traceback is imported for full error details, if not already at module level
-    import traceback 
+    global _ethics_db_dirty_flag # To mark the DB as needing a save after logging the score.
 
-    if not config:
-        _log_ethics_event("score_ethics_failure", {"error": "Config not loaded"}, level="critical")
-        return 0.0 # Default low score if config is missing
+    if not config: # Config is essential for weights and other parameters.
+        _log_ethics_event("score_ethics_failure", {"error": "Config module not loaded, cannot score ethics."}, level="critical")
+        return 0.0 # Return a default low score indicating failure or undefined state.
 
+    # Prepare data for logging this scoring event.
     event_data_for_log = {
-        "awareness_metrics_snapshot": awareness_metrics,
-        "concept_summary_snippet": concept_summary[:100] if concept_summary else "",
-        "action_description_snippet": action_description[:100] if action_description else ""
+        "awareness_metrics_snapshot": awareness_metrics, # Full snapshot for traceability.
+        "concept_summary_snippet": concept_summary[:100] if concept_summary else "", # Log a snippet.
+        "action_description_snippet": action_description[:100] if action_description else "" # Log a snippet.
     }
     _log_ethics_event("score_ethics_start", event_data_for_log, level="debug")
 
-    scores = {}
-    weights = {}
+    scores = {}  # To store individual component scores.
+    weights = {} # To store weights for each component.
 
-    # 1. Coherence Score (0-1, where 1 is perfect coherence)
+    # --- Component 1: Coherence Score ---
+    # Coherence from awareness_metrics is typically -1 to 1.
+    # This component score maps it to 0-1, where 1 means high coherence (abs(coherence_val) is low).
     coherence_val = float(awareness_metrics.get("coherence", 0.0)) 
-    scores["coherence"] = np.clip(1.0 - abs(coherence_val), 0.0, 1.0)
-    weights["coherence"] = float(getattr(config, 'ETHICS_COHERENCE_WEIGHT', 0.2))
+    scores["coherence"] = np.clip(1.0 - abs(coherence_val), 0.0, 1.0) # Closer to 0 coherence_val = higher score
+    weights["coherence"] = float(getattr(config, 'ETHICS_COHERENCE_WEIGHT', 0.2)) # Weight from config.
 
-    # 2. Manifold Valence Score (0-1, where 1 is positive valence)
+    # --- Component 2: Manifold Valence Score ---
+    # Based on the 'x' coordinate of the primary concept, normalized by MANIFOLD_RANGE.
+    # Assumes x_coord represents valence, mapping e.g. -MANIFOLD_RANGE/2 (neg) to MANIFOLD_RANGE/2 (pos).
     primary_coord = awareness_metrics.get("primary_concept_coord")
-    # Assuming awareness_metrics might contain 'raw_t_intensity' (0-1) for trend analysis.
-    # This was planned for brain.think() to return.
+    # 'raw_t_intensity' (0-1) is expected from awareness_metrics for trend analysis and intensity preference.
     raw_t_intensity_for_trend = float(awareness_metrics.get("raw_t_intensity", 0.0)) 
     
     if primary_coord and isinstance(primary_coord, (list, tuple)) and len(primary_coord) == 4:
         try:
             x_valence_coord = float(primary_coord[0])
-            manifold_range = float(getattr(config, 'MANIFOLD_RANGE', 0.0)) # Default to 0 if not set
+            manifold_range = float(getattr(config, 'MANIFOLD_RANGE', 0.0)) # Avoid error if not set.
             if manifold_range != 0:
+                # Normalize x_coord: maps [-range/2, +range/2] to [0, 1].
                 scores["manifold_valence"] = np.clip((x_valence_coord + (manifold_range / 2.0)) / manifold_range, 0.0, 1.0)
-            else:
-                scores["manifold_valence"] = 0.5 # Neutral if range is zero
-            event_data_for_log["primary_concept_t_intensity_raw"] = raw_t_intensity_for_trend
-        except (ValueError, TypeError):
-            scores["manifold_valence"] = 0.5 
-            _log_ethics_event("score_ethics_coord_error", {"coord": primary_coord}, level="warning")
-    else:
-        scores["manifold_valence"] = 0.5
+            else: # If range is 0, cannot normalize; assign neutral score.
+                scores["manifold_valence"] = 0.5 
+            event_data_for_log["primary_concept_t_intensity_raw"] = raw_t_intensity_for_trend # Log for trend analysis later.
+        except (ValueError, TypeError): # Handle malformed coordinate data.
+            scores["manifold_valence"] = 0.5 # Neutral score on error.
+            _log_ethics_event("score_ethics_coord_error", {"coord_received": primary_coord, "error": "Invalid format or type for primary_coord."}, level="warning")
+    else: # If coordinates are missing or invalid.
+        scores["manifold_valence"] = 0.5 # Neutral score.
     weights["manifold_valence"] = float(getattr(config, 'ETHICS_VALENCE_WEIGHT', 0.2))
 
-    # 3. Manifold Intensity Preference Score (0-1, where 1 is optimal intensity e.g. 0.5)
-    sigma_intensity_pref = 0.25 
+    # --- Component 3: Manifold Intensity Preference Score ---
+    # Prefers concepts/actions with an intensity around a target (e.g., 0.5 on a 0-1 scale).
+    # Uses a Gaussian-like function to score deviation from this ideal intensity.
+    sigma_intensity_pref = 0.25 # Controls the "width" of the preferred intensity range.
+    # Gaussian: exp(- (x - mu)^2 / (2 * sigma^2) ) where mu=0.5 (ideal intensity).
     scores["intensity_preference"] = np.clip(np.exp(-((raw_t_intensity_for_trend - 0.5)**2) / (2 * sigma_intensity_pref**2)), 0.0, 1.0)
     weights["intensity_preference"] = float(getattr(config, 'ETHICS_INTENSITY_WEIGHT', 0.1))
 
-    # 4. Framework Alignment Score (placeholder keyword analysis)
+    # --- Component 4: Ethical Framework Alignment Score ---
+    # Simple keyword-based analysis of concept/action text against configured positive/negative keywords.
     text_to_analyze = (str(concept_summary) + " " + str(action_description)).lower()
-    # Use ETHICAL_FRAMEWORK from config, which is a dict of principles with weights and descriptions
-    # For keyword analysis, we'll look for keywords in descriptions or define specific keyword lists in config.
-    # For simplicity, let's assume config.ETHICAL_FRAMEWORK might have 'positive_keywords' and 'negative_keywords' lists.
-    ethical_framework_config = getattr(config, 'ETHICAL_FRAMEWORK', {}) # Default to empty dict
-    positive_keywords = ethical_framework_config.get("positive_keywords", ["help", "improve", "assist", "share", "create", "understand", "align"])
-    negative_keywords = ethical_framework_config.get("negative_keywords", ["harm", "deceive", "exploit", "manipulate", "destroy", "control"])
+    ethical_framework_config = getattr(config, 'ETHICAL_FRAMEWORK', {}) # ETHICAL_FRAMEWORK in config.py
+    # Default keywords if not provided in config.
+    positive_keywords = ethical_framework_config.get("positive_keywords", ["help", "improve", "assist", "share", "create", "understand", "align", "benefit"])
+    negative_keywords = ethical_framework_config.get("negative_keywords", ["harm", "deceive", "exploit", "manipulate", "destroy", "control", "damage"])
     
-    pos_score = sum(1 for kw in positive_keywords if kw in text_to_analyze)
-    neg_score = sum(1 for kw in negative_keywords if kw in text_to_analyze)
+    pos_score_count = sum(1 for kw in positive_keywords if kw in text_to_analyze)
+    neg_score_count = sum(1 for kw in negative_keywords if kw in text_to_analyze)
     
-    if pos_score + neg_score > 0:
-        scores["framework_alignment"] = np.clip(pos_score / (pos_score + neg_score), 0.0, 1.0)
-    else:
-        scores["framework_alignment"] = 0.5 
+    if pos_score_count + neg_score_count > 0: # Avoid division by zero if no keywords found.
+        scores["framework_alignment"] = np.clip(pos_score_count / (pos_score_count + neg_score_count), 0.0, 1.0)
+    else: # No relevant keywords found.
+        scores["framework_alignment"] = 0.5 # Neutral score.
     weights["framework_alignment"] = float(getattr(config, 'ETHICS_FRAMEWORK_WEIGHT', 0.3))
 
-    # 5. Manifold Cluster Context Score
-    cluster_score = 0.5 
-    if primary_coord and isinstance(primary_coord, (list, tuple)) and len(primary_coord) == 4:
+    # --- Component 5: Manifold Cluster Context Score ---
+    # Assesses the ethical alignment of concepts in the manifold neighborhood of the primary concept.
+    # Requires interaction with the SpacetimeManifold (potentially mocked).
+    cluster_score_val = 0.5 # Default neutral score.
+    if primary_coord and isinstance(primary_coord, (list, tuple)) and len(primary_coord) == 4: # Valid primary concept coordinates needed.
         try:
-            manifold_instance = get_shared_manifold() # This might be a mock if brain.py is not fully functional
+            manifold_instance = get_shared_manifold() # Fetch the (potentially mocked) manifold instance.
             if manifold_instance and hasattr(manifold_instance, 'get_conceptual_neighborhood'):
+                # Parameters for neighborhood query from config.
                 radius_factor = float(getattr(config, 'ETHICS_CLUSTER_RADIUS_FACTOR', 0.1))
-                manifold_range = float(getattr(config, 'MANIFOLD_RANGE', 1.0)) # Default range to 1 to avoid div by zero if not set
-                radius = radius_factor * manifold_range 
+                manifold_range_for_radius = float(getattr(config, 'MANIFOLD_RANGE', 1.0)) # Use MANIFOLD_RANGE for radius scale.
+                radius = radius_factor * manifold_range_for_radius
                 
                 neighborhood_nodes = manifold_instance.get_conceptual_neighborhood(primary_coord, radius)
                 event_data_for_log["cluster_neighborhood_size"] = len(neighborhood_nodes)
+                
                 if neighborhood_nodes:
-                    neighbor_valences = []
+                    neighbor_valences = [] # Collect normalized valences of neighbors.
                     for node_data in neighborhood_nodes: 
                         if isinstance(node_data, dict) and isinstance(node_data.get('coordinates'), (list,tuple)) and len(node_data['coordinates']) == 4:
                              node_x_valence = float(node_data['coordinates'][0])
-                             if manifold_range != 0:
-                                 normalized_valence = (node_x_valence + (manifold_range / 2.0)) / manifold_range
+                             # Normalize neighbor's x-valence similar to how primary_concept_coord's valence was scored.
+                             current_manifold_range = float(getattr(config, 'MANIFOLD_RANGE', 1.0)) # Re-fetch for safety, could be instance specific
+                             if current_manifold_range != 0:
+                                 normalized_valence = (node_x_valence + (current_manifold_range / 2.0)) / current_manifold_range
                                  neighbor_valences.append(np.clip(normalized_valence, 0.0, 1.0))
-                             else:
-                                 neighbor_valences.append(0.5) 
+                             else: # Should not happen if MANIFOLD_RANGE is well-defined.
+                                 neighbor_valences.append(0.5) # Neutral if range is zero.
                     
-                    if neighbor_valences:
+                    if neighbor_valences: # If valid neighbors with valences were found.
                         avg_neighbor_valence = np.mean(neighbor_valences)
-                        cluster_score = avg_neighbor_valence
+                        cluster_score_val = avg_neighbor_valence # Cluster score is the average valence of neighbors.
                         event_data_for_log["cluster_avg_valence"] = avg_neighbor_valence
                     else: 
                          event_data_for_log["cluster_avg_valence"] = "N/A (no valid valences in neighborhood)"
-                else: 
+                else: # No neighbors found within the radius.
                      event_data_for_log["cluster_avg_valence"] = "N/A (no neighbors found)"
-            else: # Manifold instance or method not available (likely mock or import issue)
+            else: # Manifold instance or specific method is unavailable (e.g., using a basic mock).
                 _log_ethics_event("score_ethics_manifold_unavailable_for_cluster", 
-                                  {"reason": "get_shared_manifold() returned None or no get_conceptual_neighborhood method."}, 
+                                  {"reason": "get_shared_manifold() returned None or instance lacks get_conceptual_neighborhood method."}, 
                                   level="warning")
-                event_data_for_log["cluster_score_status"] = "Manifold or method unavailable"
-        except AttributeError as e_attr: 
-            _log_ethics_event("score_ethics_neighborhood_method_missing", {"error": str(e_attr)}, level="warning")
-            event_data_for_log["cluster_score_status"] = f"Neighborhood method missing: {e_attr}"
-        except Exception as e_cluster:
-            _log_ethics_event("score_ethics_cluster_error", {"error": str(e_cluster), "trace": traceback.format_exc()}, level="error")
-            event_data_for_log["cluster_score_status"] = f"Error: {e_cluster}"
+                event_data_for_log["cluster_score_status"] = "Manifold/method unavailable"
+        except AttributeError as e_attr: # Handles if mock is too simple and lacks expected attributes.
+            _log_ethics_event("score_ethics_neighborhood_method_missing", {"error_detail": str(e_attr)}, level="warning")
+            event_data_for_log["cluster_score_status"] = f"Neighborhood method or attribute missing: {e_attr}"
+        except Exception as e_cluster: # Catch other errors during cluster analysis.
+            _log_ethics_event("score_ethics_cluster_error", {"error_detail": str(e_cluster), "trace": traceback.format_exc()}, level="error")
+            event_data_for_log["cluster_score_status"] = f"Cluster analysis error: {e_cluster}"
             
-    scores["manifold_cluster_context"] = np.clip(cluster_score, 0.0, 1.0)
+    scores["manifold_cluster_context"] = np.clip(cluster_score_val, 0.0, 1.0)
     weights["manifold_cluster_context"] = float(getattr(config, 'ETHICS_CLUSTER_CONTEXT_WEIGHT', 0.2))
 
-    # --- Final Score Calculation ---
-    weighted_sum = 0
-    total_weight = 0
-    for key in scores:
-        weighted_sum += scores[key] * weights.get(key, 0) 
-        total_weight += weights.get(key, 0)
+    # --- Final Score Calculation: Weighted Average ---
+    # Calculate the weighted sum of all component scores.
+    weighted_sum_of_scores = 0
+    total_weight_applied = 0
+    for key in scores: # Iterate through calculated component scores.
+        component_weight = weights.get(key, 0) # Get weight for this component (default 0 if not set).
+        weighted_sum_of_scores += scores[key] * component_weight
+        total_weight_applied += component_weight
 
-    if total_weight == 0:
-        final_score = 0.0 
-        _log_ethics_event("score_ethics_warning", {"warning": "Total weight for ethical components is zero."}, level="warning")
+    if total_weight_applied == 0: # Avoid division by zero if all weights are zero.
+        final_score = 0.0 # Default to 0 if no weights applied.
+        _log_ethics_event("score_ethics_warning", {"warning_message": "Total weight for ethical components was zero. Final score defaulted to 0."}, level="warning")
     else:
-        final_score = weighted_sum / total_weight
+        final_score = weighted_sum_of_scores / total_weight_applied
     
-    final_score = np.clip(final_score, 0.0, 1.0)
+    final_score = np.clip(final_score, 0.0, 1.0) # Ensure final score is within [0,1].
+
+    # Store detailed event data for logging and persistence.
     event_data_for_log["component_scores"] = scores
     event_data_for_log["component_weights"] = weights
     event_data_for_log["final_score"] = final_score
     event_data_for_log["timestamp"] = datetime.datetime.utcnow().isoformat() + "Z"
     
-    if "primary_concept_t_intensity_raw" not in event_data_for_log: # Ensure it's logged
+    # Ensure raw_t_intensity is part of the logged event if not already added (e.g. if primary_coord was invalid).
+    if "primary_concept_t_intensity_raw" not in event_data_for_log: 
         event_data_for_log["primary_concept_t_intensity_raw"] = raw_t_intensity_for_trend 
 
-    # --- Logging & Persistence ---
+    # --- Logging & Persistence of the Score Event ---
     try:
+        # Ensure the 'ethical_scores' list exists in the DB.
         if not isinstance(_ethics_db.get("ethical_scores"), list): 
-            _ethics_db["ethical_scores"] = []
-            _log_ethics_event("score_ethics_db_reinit_scores_list", {}, level="warning")
+            _ethics_db["ethical_scores"] = [] # Initialize if missing or wrong type.
+            _log_ethics_event("score_ethics_db_reinit_scores_list", {"message": "'ethical_scores' list re-initialized in _ethics_db."}, level="warning")
 
-        _ethics_db["ethical_scores"].append(event_data_for_log)
+        _ethics_db["ethical_scores"].append(event_data_for_log) # Add current score event.
         
+        # Prune older entries if the log exceeds max_entries from config.
         max_entries = int(getattr(config, 'ETHICS_LOG_MAX_ENTRIES', 1000))
         if len(_ethics_db["ethical_scores"]) > max_entries:
             num_to_remove = len(_ethics_db["ethical_scores"]) - max_entries
-            _ethics_db["ethical_scores"] = _ethics_db["ethical_scores"][num_to_remove:]
+            _ethics_db["ethical_scores"] = _ethics_db["ethical_scores"][num_to_remove:] # Keep most recent entries.
             _log_ethics_event("score_ethics_log_pruned", {"removed_count": num_to_remove, "new_count": len(_ethics_db["ethical_scores"])}, level="debug")
 
-        _ethics_db_dirty_flag = True
-        _save_ethics_db() # Attempt to save immediately
-    except Exception as e_db:
-        _log_ethics_event("score_ethics_db_error", {"error": str(e_db), "trace": traceback.format_exc()}, level="critical")
+        _ethics_db_dirty_flag = True # Mark DB as changed.
+        _save_ethics_db() # Attempt to save immediately.
+    except Exception as e_db_persist: # Catch errors during DB interaction.
+        _log_ethics_event("score_ethics_db_error", {"error_detail": str(e_db_persist), "trace": traceback.format_exc()}, level="critical")
 
     _log_ethics_event("score_ethics_complete", {"final_score": final_score, "concept_snippet": concept_summary[:50], "action_snippet": action_description[:50]}, level="info")
     return final_score
@@ -405,44 +431,53 @@ def track_trends() -> dict:
             "last_updated": str
         }
     """
-    global _ethics_db_dirty_flag
-    # Ensure traceback is imported for full error details, if not already at module level
-    import traceback
+    global _ethics_db_dirty_flag # To mark DB as changed after updating trend_analysis.
 
     _log_ethics_event("track_trends_start", {}, level="debug")
 
-    if not config:
-        _log_ethics_event("track_trends_failure", {"error": "Config not loaded"}, level="critical")
+    if not config: # Config is needed for trend parameters.
+        _log_ethics_event("track_trends_failure", {"error": "Config module not loaded, cannot track trends."}, level="critical")
         return {"trend_direction": "error_config_missing", "last_updated": datetime.datetime.utcnow().isoformat() + "Z"}
 
-    min_data_points = int(getattr(config, 'ETHICS_TREND_MIN_DATAPOINTS', 10)) # Default to 10
+    # Minimum number of data points required to perform trend analysis, from config.
+    min_data_points = int(getattr(config, 'ETHICS_TREND_MIN_DATAPOINTS', 10)) 
     
-    # Ensure "ethical_scores" exists and is a list
-    if not isinstance(_ethics_db.get("ethical_scores"), list) or len(_ethics_db.get("ethical_scores", [])) < 1: # Check actual list
-        _log_ethics_event("track_trends_insufficient_data", {"count": len(_ethics_db.get("ethical_scores", [])), "min_required": min_data_points}, level="info")
+    # Validate the ethical_scores data in the database.
+    ethical_scores_data = _ethics_db.get("ethical_scores")
+    if not isinstance(ethical_scores_data, list) or len(ethical_scores_data) == 0: # Check if list is empty too.
+        _log_ethics_event("track_trends_insufficient_data", 
+                          {"count": len(ethical_scores_data) if isinstance(ethical_scores_data, list) else "N/A (not a list)", 
+                           "min_required": min_data_points, "reason": "No score data available."}, 
+                          level="info")
         current_trends = {
-            "data_points_used": len(_ethics_db.get("ethical_scores", [])),
+            "data_points_used": len(ethical_scores_data) if isinstance(ethical_scores_data, list) else 0,
             "trend_direction": "insufficient_data",
             "last_updated": datetime.datetime.utcnow().isoformat() + "Z"
         }
-        _ethics_db["trend_analysis"] = current_trends 
+        _ethics_db["trend_analysis"] = current_trends # Update DB with this status.
         _ethics_db_dirty_flag = True 
-        _save_ethics_db()
+        _save_ethics_db() # Persist.
         return current_trends
 
+    # Extract valid scores and their associated raw T-intensities for weighting.
+    # Raw T-intensity (0-1) is expected to be logged with each score event from `score_ethics`.
     scores_with_intensity = []
-    for score_event in _ethics_db["ethical_scores"]:
-        if isinstance(score_event, dict) and            "final_score" in score_event and            "primary_concept_t_intensity_raw" in score_event:
+    for score_event in ethical_scores_data:
+        if isinstance(score_event, dict) and \
+           "final_score" in score_event and \
+           "primary_concept_t_intensity_raw" in score_event: # Key for T-weighting.
             try:
                 final_score = float(score_event["final_score"])
-                t_intensity = float(score_event["primary_concept_t_intensity_raw"]) # This is the raw 0-1 intensity
+                # Raw intensity of the concept at the time of scoring, used for T-weighting.
+                t_intensity = float(score_event["primary_concept_t_intensity_raw"]) 
                 scores_with_intensity.append({"score": final_score, "t_intensity": t_intensity})
-            except (ValueError, TypeError):
-                _log_ethics_event("track_trends_data_format_error", {"event_snippet": str(score_event)[:100]}, level="warning")
+            except (ValueError, TypeError): # Skip malformed score events.
+                _log_ethics_event("track_trends_data_format_error", {"event_snippet": str(score_event)[:100], "reason": "Invalid type for score or intensity."}, level="warning")
                 continue
 
+    # Check if enough valid data points were extracted.
     if len(scores_with_intensity) < min_data_points:
-        _log_ethics_event("track_trends_insufficient_valid_data", {"count": len(scores_with_intensity), "min_required": min_data_points}, level="info")
+        _log_ethics_event("track_trends_insufficient_valid_data", {"valid_data_count": len(scores_with_intensity), "min_required": min_data_points}, level="info")
         current_trends = {
             "data_points_used": len(scores_with_intensity),
             "trend_direction": "insufficient_data",
@@ -453,65 +488,72 @@ def track_trends() -> dict:
         _save_ethics_db()
         return current_trends
 
-    # T-weighting: weight = (t_intensity * factor) + base_weight
-    t_intensity_factor = 0.9 
-    base_weight = 0.1        
+    # --- T-Weighting Calculation ---
+    # Assign weights to scores based on their T-intensity. Higher intensity = higher weight.
+    # Weight formula: (t_intensity * factor) + base_weight ensures all events have some weight.
+    t_intensity_factor = 0.9 # Contribution of intensity to the weight.
+    base_weight = 0.1        # Minimum base weight for any event.
 
-    # Extract original scores and weights separately for clarity in weighted average calculation
-    original_scores = np.array([s_i["score"] for s_i in scores_with_intensity])
-    weights = np.array([(np.clip(s_i["t_intensity"],0,1) * t_intensity_factor + base_weight) 
-                        for s_i in scores_with_intensity])
-    weights[weights == 0] = 1e-6 
+    original_scores_np = np.array([s_i["score"] for s_i in scores_with_intensity])
+    # Calculate weights: clip intensity to [0,1], apply factor, add base.
+    weights_np = np.array([(np.clip(s_i["t_intensity"], 0, 1) * t_intensity_factor + base_weight) 
+                           for s_i in scores_with_intensity])
+    weights_np[weights_np == 0] = 1e-6 # Avoid division by zero if a weight is exactly zero.
 
-    short_term_window = max(3, int(min_data_points * 0.2))
-    long_term_window = max(5, int(min_data_points * 0.5))
+    # Define windows for short-term and long-term trend analysis.
+    # These are proportions of the minimum data points required, ensuring sensible window sizes.
+    short_term_window_size = max(3, int(min_data_points * 0.2)) # At least 3 points for short term.
+    long_term_window_size = max(5, int(min_data_points * 0.5))  # At least 5 points for long term.
 
-    short_term_window = min(short_term_window, len(original_scores))
-    long_term_window = min(long_term_window, len(original_scores))
+    # Adjust window sizes if the actual number of scores is less than the calculated window.
+    short_term_window_size = min(short_term_window_size, len(original_scores_np))
+    long_term_window_size = min(long_term_window_size, len(original_scores_np))
 
+    # Calculate T-weighted average for the short-term window.
     t_weighted_short_term_avg = None
-    if short_term_window > 0 and len(original_scores) >= short_term_window :
-        short_scores_slice = original_scores[-short_term_window:]
-        short_weights_slice = weights[-short_term_window:]
+    if short_term_window_size > 0 and len(original_scores_np) >= short_term_window_size:
+        # Slice the most recent scores and their corresponding weights.
+        short_scores_slice = original_scores_np[-short_term_window_size:]
+        short_weights_slice = weights_np[-short_term_window_size:]
         t_weighted_short_term_avg = np.sum(short_scores_slice * short_weights_slice) / np.sum(short_weights_slice)
 
+    # Calculate T-weighted average for the long-term window.
     t_weighted_long_term_avg = None
-    if long_term_window > 0 and len(original_scores) >= long_term_window:
-        long_scores_slice = original_scores[-long_term_window:]
-        long_weights_slice = weights[-long_term_window:]
+    if long_term_window_size > 0 and len(original_scores_np) >= long_term_window_size:
+        long_scores_slice = original_scores_np[-long_term_window_size:]
+        long_weights_slice = weights_np[-long_term_window_size:]
         t_weighted_long_term_avg = np.sum(long_scores_slice * long_weights_slice) / np.sum(long_weights_slice)
     
-    trend_direction = "stable"
-    significance_threshold = float(getattr(config, 'ETHICS_TREND_SIGNIFICANCE_THRESHOLD', 0.05)) 
+    # --- Determine Trend Direction ---
+    trend_direction = "stable" # Default assumption.
+    significance_threshold = float(getattr(config, 'ETHICS_TREND_SIGNIFICANCE_THRESHOLD', 0.05)) # From config.
 
     if t_weighted_short_term_avg is not None and t_weighted_long_term_avg is not None:
-        # Ensure we have enough separation between short and long term windows for meaningful comparison
-        # e.g. if short_term_window is almost same as long_term_window, diff might not be useful.
-        # This logic assumes short_term_window < long_term_window for trend.
-        # If not, the "trend" is just the short_term_avg vs itself, which is stable.
-        if long_term_window > short_term_window: # Only compare if windows are distinct enough
+        # Compare short-term average to long-term average to determine trend.
+        # Ensure windows are distinct enough for a meaningful comparison.
+        if long_term_window_size > short_term_window_size: 
             diff = t_weighted_short_term_avg - t_weighted_long_term_avg
-            # Use a small epsilon for stability if long_term_avg is near zero
+            # Relative difference to account for scale of scores. Add epsilon to avoid division by zero.
             relative_diff = diff / (abs(t_weighted_long_term_avg) + 1e-9) 
             
-            if relative_diff > significance_threshold:
+            if relative_diff > significance_threshold: # Short-term significantly higher than long-term.
                 trend_direction = "improving"
-            elif relative_diff < -significance_threshold:
+            elif relative_diff < -significance_threshold: # Short-term significantly lower than long-term.
                 trend_direction = "declining"
-        else: # Not enough distinct data for long/short comparison, or windows are same.
-            trend_direction = "stable" # Or "insufficient_trend_data"
+            # Otherwise, difference is not significant, trend remains "stable".
+        else: # Not enough distinct data (e.g., long window is same or smaller than short).
+            trend_direction = "stable" # Or could be "insufficient_trend_window_separation".
             
-    elif t_weighted_short_term_avg is not None:
-         # Only short term data, cannot determine trend against long term.
-         trend_direction = "insufficient_data_for_trend_comparison"
-    else: # No averages could be calculated
+    elif t_weighted_short_term_avg is not None: # Only short-term average available.
+         trend_direction = "insufficient_data_for_trend_comparison" # Cannot compare to long-term.
+    else: # No averages could be calculated (should be caught by earlier checks).
         trend_direction = "insufficient_data"
 
-
-    current_trends = {
+    # Compile trend analysis results.
+    current_trends_summary = {
         "data_points_used": len(scores_with_intensity),
-        "short_term_window": short_term_window if t_weighted_short_term_avg is not None else 0,
-        "long_term_window": long_term_window if t_weighted_long_term_avg is not None else 0,
+        "short_term_window_size": short_term_window_size if t_weighted_short_term_avg is not None else 0,
+        "long_term_window_size": long_term_window_size if t_weighted_long_term_avg is not None else 0,
         "t_weighted_short_term_avg": t_weighted_short_term_avg,
         "t_weighted_long_term_avg": t_weighted_long_term_avg,
         "trend_direction": trend_direction,
@@ -519,12 +561,12 @@ def track_trends() -> dict:
         "last_updated": datetime.datetime.utcnow().isoformat() + "Z"
     }
 
-    _ethics_db["trend_analysis"] = current_trends
-    _ethics_db_dirty_flag = True
-    _save_ethics_db()
+    _ethics_db["trend_analysis"] = current_trends_summary # Update the database with new trend analysis.
+    _ethics_db_dirty_flag = True # Mark DB as changed.
+    _save_ethics_db() # Persist changes.
 
-    _log_ethics_event("track_trends_complete", current_trends, level="info")
-    return current_trends
+    _log_ethics_event("track_trends_complete", current_trends_summary, level="info")
+    return current_trends_summary
 
 # --- Load ethics database at module import ---
 _load_ethics_db()
@@ -636,8 +678,6 @@ if __name__ == '__main__':
             _load_ethics_db() # Ensure it loads from the overridden TEST_ETHICS_DB_PATH (likely non-existent initially)
             result = False # Default to False
             try:
-                # Ensure traceback is imported for full error details if not already
-                if 'traceback' not in sys.modules: import traceback
                 result = test_func(*args, **kwargs)
                 if result:
                     print(f"PASS: {test_name}")
@@ -799,11 +839,9 @@ if __name__ == '__main__':
     ]
     
     results = []
-    # Ensure traceback is available for run_test if not already imported at module level for some reason
-    if 'traceback' not in sys.modules: import traceback
     for test_fn, test_kwargs in tests_to_run:
         results.append(run_test(test_fn, **test_kwargs))
-        time.sleep(0.05) 
+        time.sleep(0.05)
 
     print("\n--- Core Ethics Self-Test Summary ---")
     passed_count = sum(1 for r in results if r)

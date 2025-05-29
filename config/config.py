@@ -6,14 +6,15 @@ paths, resource profiles, API keys, persona details, ethical framework
 parameters, and other operational flags.
 """
 
+import json
 import os
 import sys
-import json
 
 # Sophia_Alpha2_ResonantBuild config starts here.
 
 # --- Path Configuration ---
-# Determine if running in a bundled environment (e.g., PyInstaller)
+# Determine if running in a bundled environment (e.g., PyInstaller).
+# PyInstaller sets sys._MEIPASS to the path of the bundled temporary folder.
 IS_BUNDLED = hasattr(sys, '_MEIPASS')
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(sys.executable if IS_BUNDLED else __file__))
 if not IS_BUNDLED: # If not bundled, __file__ is in config/, so go up one level
@@ -33,15 +34,31 @@ def ensure_path(file_or_dir_path: str) -> None:
     """
     Ensures that the directory for the given file path or the directory itself exists.
     If it's a file path, it ensures the parent directory exists.
-    If it's a directory path (ends with / or \), it ensures the directory exists.
+    If it's a directory path (conventionally passed ending with os.sep or os.altsep),
+    it ensures the directory itself exists.
     """
     path_to_ensure = file_or_dir_path
-    if not (file_or_dir_path.endswith(os.sep) or os.path.altsep and file_or_dir_path.endswith(os.path.altsep)):
-        # It's a file path, get the directory
+    # Check if the path is intended as a file path (does not end with a known separator)
+    # or a directory path (ends with a separator).
+    # os.altsep is checked for cross-platform compatibility (e.g. Windows '\').
+    if not (file_or_dir_path.endswith(os.sep) or \
+            (os.altsep and file_or_dir_path.endswith(os.path.altsep))):
+        # Path does not end with a separator, assume it's a file path.
+        # Ensure its parent directory exists.
         path_to_ensure = os.path.dirname(file_or_dir_path)
     
-    if path_to_ensure: # Ensure path_to_ensure is not empty (e.g. if file_or_dir_path was just a filename)
-        os.makedirs(path_to_ensure, exist_ok=True)
+    if path_to_ensure: # Ensure path_to_ensure is not empty (e.g. if file_or_dir_path was just a filename in the CWD)
+        try:
+            os.makedirs(path_to_ensure, exist_ok=True)
+        except OSError as e:
+            # This is a critical failure if essential directories cannot be created.
+            # Print to stderr and allow the program to decide if it can continue.
+            # In many cases, this might lead to a crash shortly after if paths are unusable.
+            print(f"CRITICAL CONFIG ERROR: Could not create directory '{path_to_ensure}'. Error: {e}", file=sys.stderr)
+            # Depending on severity and application design, one might:
+            # raise ConfigError(f"Failed to create directory: {path_to_ensure}") from e
+            # or sys.exit(1)
+            # For now, just printing allows other modules to fail if the path is truly needed.
 
 # Core Directories
 CONFIG_DIR = get_path('config')
@@ -52,7 +69,14 @@ MEMORY_STORE_DIR = get_path(os.path.join('data', 'memory_store')) # For KGraph, 
 LIBRARY_STORE_DIR = get_path(os.path.join('data', 'library_store')) # For LibLog
 ETHICS_STORE_DIR = get_path(os.path.join('data', 'ethics_store')) # For EthicsDB
 
-# Specific File Paths (using placeholders for names that might be configured later)
+# --- Persona Configuration ---
+# Defines the active persona for Sophia_Alpha2.
+# The persona profile file (JSON) contains detailed personality traits, communication style, etc.
+PERSONA_NAME = os.getenv('PERSONA_NAME', 'Sophia_Alpha2_Prime')
+# --- End of Persona Configuration ---
+
+# Specific File Paths
+# Now PERSONA_NAME is defined and can be used here
 PERSONA_PROFILE_PATH = get_path(os.path.join(PERSONA_DIR, PERSONA_NAME + '.json'))
 
 SYSTEM_LOG_FILENAME = "sophia_alpha2_system.log"
@@ -231,13 +255,6 @@ LLM_CONCEPT_PROMPT_TEMPLATE = CURRENT_LLM_SETTINGS["CONCEPT_PROMPT_TEMPLATE"]
 
 # --- End of API Keys and Endpoints ---
 
-# --- Persona Configuration ---
-# Defines the active persona for Sophia_Alpha2.
-# The persona profile file (JSON) contains detailed personality traits, communication style, etc.
-PERSONA_NAME = os.getenv('PERSONA_NAME', 'Sophia_Alpha2_Prime')
-
-# --- End of Persona Configuration ---
-
 # --- Ethics Module Configuration ---
 # Parameters governing the ethical decision-making and alignment framework.
 
@@ -317,7 +334,18 @@ IS_PRODUCTION_ENV = (EXECUTION_ENVIRONMENT == 'production')
 # --- End of Other Configuration Sections ---
 
 def validate_config():
-    """Performs basic validation of critical configuration settings."""
+    """
+    Performs basic validation of critical configuration settings.
+
+    Checks include:
+    - LLM provider selection and necessary API key/URL/model settings if LLM is enabled.
+    - Resource profile validity.
+    - Existence of essential data and log directories.
+
+    Prints warnings or errors to the console.
+    Returns:
+        bool: True if basic validation passes, False otherwise.
+    """
     print("\n--- Validating Configuration ---")
     valid = True
 
@@ -365,8 +393,20 @@ def validate_config():
         print("Configuration validation failed with errors/warnings above.")
     return valid
 
-def self_test_config_paths_and_creation():
-    """Tests path helper functions and directory creation."""
+def self_test_config_paths_and_creation() -> bool:
+    """
+    Tests the `get_path` and `ensure_path` helper functions.
+
+    Specifically, it verifies:
+    - `get_path` correctly constructs absolute paths.
+    - `ensure_path` correctly creates directories if they don't exist,
+      both for direct directory paths and parent directories of file paths.
+    - Attempts to clean up any created temporary directories.
+
+    Prints detailed messages about test progress and outcomes.
+    Returns:
+        bool: True if all tests pass (including cleanup), False otherwise.
+    """
     print("\n--- Testing Path Configuration & Creation ---")
     test_passed = True
     

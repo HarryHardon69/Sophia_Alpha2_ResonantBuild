@@ -90,7 +90,7 @@ from .library import (
 )
 
 # --- Dialogue Exports ---
-from .dialogue import generate_response, dialogue_loop
+from .dialogue import generate_response, dialogue_loop, get_dialogue_persona
 
 # --- GUI Exports ---
 from .gui import start_gui
@@ -132,6 +132,7 @@ __all__ = [
     # Dialogue components
     'generate_response',
     'dialogue_loop',
+    'get_dialogue_persona',
     # GUI components
     'start_gui',
     # Other core components will be added here as they are developed

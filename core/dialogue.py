@@ -9,8 +9,9 @@ import sys
 import os
 import datetime
 import json
-import time
 import traceback
+# 'time' module is used only in the __main__ test block, not in the module's core logic.
+# It can be imported there if specific test timing is needed.
 
 # --- Configuration Import ---
 try:
@@ -92,7 +93,13 @@ except ImportError as e:
     def track_trends(*args, **kwargs): # Mock function
         if not getattr(sys, '_IS_TEST_RUNNING', False):
             print("Warning (dialogue.py): Using fallback/mock track_trends(). Trend tracking is not available.")
-        return "Trends unavailable"
+        # Return a dictionary structure similar to what the real function might return in an error/default state
+        return {
+            "trend_direction": "unavailable_mock_fallback",
+            "data_points_used": 0,
+            "last_updated": datetime.datetime.utcnow().isoformat() + "Z"
+            # Add other keys expected by consumers if necessary, with default values
+        }
 
 _LIBRARY_AVAILABLE = False
 _SUMMARIZE_TEXT_AVAILABLE = False
@@ -143,9 +150,24 @@ except ImportError as e:
 
 # --- Logging Function ---
 def _log_dialogue_event(event_type: str, data: dict, level: str = "info"):
+    """
+    Logs a structured event from the dialogue module.
+
+    Similar to logging functions in other core modules, this function formats
+    log data as JSON and writes to the system log file specified in config,
+    respecting the configured LOG_LEVEL. Includes fallback to stderr if
+    config or file writing fails. Suppresses print output during test runs
+    identified by `sys._IS_TEST_RUNNING`.
+
+    Args:
+        event_type (str): The type of event being logged (e.g., "generate_response_start").
+        data (dict): A dictionary containing data relevant to the event.
+        level (str, optional): The severity level of the log ("debug", "info", 
+                               "warning", "error", "critical"). Defaults to "info".
+    """
     log_message_data = {
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        "module": "dialogue",
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z", # ISO 8601 UTC timestamp
+        "module": "dialogue", # Identifies the source module of the log
         "level": level.upper(),
         "event_type": event_type,
         "data": data
@@ -189,210 +211,324 @@ def _log_dialogue_event(event_type: str, data: dict, level: str = "info"):
             sys.stderr.write(log_message_str)
 
 # --- Shared Persona Instance Management ---
-_dialogue_persona_instance: Persona | None = None
+_dialogue_persona_instance: Persona | None = None # Cached global instance of Persona.
 
 def get_dialogue_persona() -> Persona | None:
+    """
+    Retrieves or initializes the shared Persona instance for the dialogue module.
+
+    This function implements a singleton pattern for the Persona object within
+    the dialogue module's scope. If the Persona class was not successfully
+    imported, or if instantiation fails, it logs an error and returns None.
+
+    Returns:
+        Persona | None: The shared Persona instance, or None if unavailable/failed.
+    """
     global _dialogue_persona_instance
     if _dialogue_persona_instance is None:
+        # Check if Persona class itself is available (might have failed import).
         if not _PERSONA_AVAILABLE or Persona is None:
-            _log_dialogue_event("get_persona_failed", {"reason": "Persona class not imported successfully."}, level="error")
+            _log_dialogue_event("get_persona_failed", {"reason": "Persona class was not imported successfully."}, level="error")
             return None
         try:
+            # Instantiate Persona (loads its state from file or defaults).
             _dialogue_persona_instance = Persona()
-            _log_dialogue_event("dialogue_persona_initialized", {"persona_name": _dialogue_persona_instance.name if _dialogue_persona_instance else "Unknown"}, level="info")
-        except Exception as e:
-            _log_dialogue_event("dialogue_persona_init_error", {"error": str(e), "trace": traceback.format_exc()}, level="critical")
-            _dialogue_persona_instance = None 
+            _log_dialogue_event("dialogue_persona_initialized", 
+                                {"persona_name": _dialogue_persona_instance.name if _dialogue_persona_instance else "UnknownName"}, 
+                                level="info")
+        except Exception as e: # Catch any error during Persona instantiation.
+            _log_dialogue_event("dialogue_persona_init_error", {"error_message": str(e), "traceback": traceback.format_exc()}, level="critical")
+            _dialogue_persona_instance = None # Ensure it remains None on failure.
             return None
     return _dialogue_persona_instance
 
 # --- Main Dialogue Functions ---
 def generate_response(user_input: str, stream_thought_steps: bool = False) -> tuple[str, list, dict]:
-    _log_dialogue_event("generate_response_start", {"user_input_snippet": user_input[:100]})
-    persona_instance = get_dialogue_persona()
-    if persona_instance is None:
-        _log_dialogue_event("generate_response_error", {"reason": "Persona module not available."}, level="critical")
-        return ("Error: Persona module not available. Cannot generate response.", [], {"error": "Persona unavailable"})
+    """
+    Orchestrates the generation of a response to user input.
 
+    This involves:
+    1. Fetching the Persona instance.
+    2. Calling the brain's `think` method to process the input and get initial response and awareness metrics.
+    3. Updating the Persona's awareness based on these metrics.
+    4. Calculating an ethical score for the context.
+    5. Storing a memory of the interaction.
+    6. Applying content mitigation/moderation if necessary based on ethics.
+    7. Tracking ethical trends.
+    8. Formatting and returning the final response, thought steps, and awareness metrics.
+
+    Args:
+        user_input (str): The text input from the user.
+        stream_thought_steps (bool, optional): If True, the brain's `think` method
+                                               might provide more verbose thought steps.
+                                               Defaults to False.
+
+    Returns:
+        tuple: A tuple containing:
+            - final_response (str): The generated response to the user.
+            - thought_steps (list): A list of strings detailing the internal processing.
+            - awareness_metrics (dict): The latest awareness metrics after processing.
+    """
+    _log_dialogue_event("generate_response_start", {"user_input_snippet": user_input[:100]}) # Log start and input snippet.
+    
+    # Step 1: Get the shared Persona instance.
+    persona_instance = get_dialogue_persona()
+    if persona_instance is None: # Critical failure if persona is not available.
+        _log_dialogue_event("generate_response_error", {"reason": "Persona instance is unavailable."}, level="critical")
+        # Return an error message and default/empty state.
+        return ("Error: System persona is currently unavailable. Cannot generate response.", 
+                ["Dialogue Manager: Persona unavailable."], 
+                {"error": "Persona unavailable"})
+
+    # Initialize default awareness metrics and thought log.
+    # These will be updated by results from brain, ethics, etc.
     awareness_metrics = {
         "curiosity": 0.1, "context_stability": 0.3, "self_evolution_rate": 0.0,
-        "coherence": 0.0, "active_llm_fallback": True, 
+        "coherence": 0.0, "active_llm_fallback": True, # Assume LLM fallback initially.
         "primary_concept_coord": None, "raw_t_intensity": 0.0, "snn_error": None
     }
     thought_steps: list[str] = ["Dialogue Manager: Initializing response sequence."]
-    brain_response_text = "No response generated due to an internal issue." 
+    brain_response_text = "System did not generate a specific response due to an internal processing issue." # Default brain response.
 
+    # Step 2: Process input with the brain's `think` method.
     try:
-        if _BRAIN_THINK_AVAILABLE:
-            thought_steps_brain, brain_response_text_from_module, brain_awareness = think(user_input, stream_thought_steps=stream_thought_steps)
-            brain_response_text = brain_response_text_from_module 
-            if isinstance(brain_awareness, dict): awareness_metrics.update(brain_awareness)
-            else: _log_dialogue_event("brain_awareness_invalid_type", {"type": type(brain_awareness).__name__}, level="warning")
+        if _BRAIN_THINK_AVAILABLE: # Check if `think` function was imported successfully.
+            # Call brain.think() to get initial response and awareness metrics.
+            thought_steps_brain, brain_response_text_from_module, brain_awareness_metrics = think(user_input, stream_thought_steps=stream_thought_steps)
+            brain_response_text = brain_response_text_from_module # Update response text.
+            
+            # Update overall awareness_metrics with those from the brain.
+            if isinstance(brain_awareness_metrics, dict): awareness_metrics.update(brain_awareness_metrics)
+            else: _log_dialogue_event("brain_awareness_invalid_type", {"type_received": type(brain_awareness_metrics).__name__}, level="warning")
+            
+            # Append brain's thought steps to the main log.
             if isinstance(thought_steps_brain, list): thought_steps.extend(thought_steps_brain)
-            else: _log_dialogue_event("brain_thought_steps_invalid_type", {"type": type(thought_steps_brain).__name__}, level="warning")
-            awareness_metrics["active_llm_fallback"] = brain_awareness.get("active_llm_fallback", True) if isinstance(brain_awareness, dict) else True
-        else:
-            thought_steps.append("Dialogue Manager: Brain 'think' function not available. Using default response.")
-            awareness_metrics["snn_error"] = "Brain module not available"
-    except Exception as e_brain:
-        _log_dialogue_event("brain_think_error", {"error": str(e_brain), "trace": traceback.format_exc()}, level="error")
-        brain_response_text = f"My apologies, I encountered an issue while processing that: {str(e_brain)}"
-        awareness_metrics["snn_error"] = str(e_brain)
-        awareness_metrics["active_llm_fallback"] = True 
-        thought_steps.append(f"Error during brain.think: {str(e_brain)}")
+            else: _log_dialogue_event("brain_thought_steps_invalid_type", {"type_received": type(thought_steps_brain).__name__}, level="warning")
+            
+            # Specifically update active_llm_fallback status from brain's report.
+            awareness_metrics["active_llm_fallback"] = brain_awareness_metrics.get("active_llm_fallback", True) if isinstance(brain_awareness_metrics, dict) else True
+        else: # Brain's `think` function is not available (e.g., import failed).
+            thought_steps.append("Dialogue Manager: Brain 'think' function unavailable. Proceeding with default response logic.")
+            awareness_metrics["snn_error"] = "Brain module or 'think' function not loaded." # Record error.
+    except Exception as e_brain_think: # Handle any unexpected errors from brain.think().
+        _log_dialogue_event("brain_think_error", {"error_message": str(e_brain_think), "traceback": traceback.format_exc()}, level="error")
+        brain_response_text = f"My apologies, I encountered an issue while processing your input: {str(e_brain_think)}"
+        awareness_metrics["snn_error"] = str(e_brain_think) # Record the error.
+        awareness_metrics["active_llm_fallback"] = True # Assume fallback if brain processing failed.
+        thought_steps.append(f"Dialogue Manager: Error during brain.think() execution: {str(e_brain_think)}")
 
+    # Step 3: Update Persona's awareness state.
     try:
-        if _PERSONA_AVAILABLE and persona_instance:
-            persona_instance.update_awareness(awareness_metrics)
-            thought_steps.append("Dialogue Manager: Persona awareness updated.")
-        else: thought_steps.append("Dialogue Manager: Persona instance or module not available for awareness update.")
-    except Exception as e_persona_update:
-        _log_dialogue_event("persona_update_awareness_error", {"error": str(e_persona_update), "trace": traceback.format_exc()}, level="error")
-        thought_steps.append(f"Error updating persona awareness: {str(e_persona_update)}")
+        if _PERSONA_AVAILABLE and persona_instance: # Check if Persona class and instance are valid.
+            persona_instance.update_awareness(awareness_metrics) # Update with latest metrics.
+            thought_steps.append("Dialogue Manager: Persona awareness state updated.")
+        else: thought_steps.append("Dialogue Manager: Persona instance or module unavailable for awareness update.")
+    except Exception as e_persona_update_awareness:
+        _log_dialogue_event("persona_update_awareness_error", {"error_message": str(e_persona_update_awareness), "traceback": traceback.format_exc()}, level="error")
+        thought_steps.append(f"Dialogue Manager: Error updating persona awareness: {str(e_persona_update_awareness)}")
 
-    ethical_score = 0.5 
-    concept_summary_for_ethics = summarize_text(user_input if awareness_metrics.get("active_llm_fallback") else brain_response_text, 100)
-    action_description_for_ethics = summarize_text(brain_response_text, 200)
+    # Step 4: Calculate ethical score for the current context.
+    ethical_score_value = 0.5 # Default neutral ethical score.
+    # Determine summary for ethics: use user input if LLM fallback, else brain's response.
+    summary_text_for_ethics = summarize_text(user_input if awareness_metrics.get("active_llm_fallback") else brain_response_text, 100)
+    action_text_for_ethics = summarize_text(brain_response_text, 200) # Brain's response as the "action".
     try:
-        if _ETHICS_SCORE_ETHICS_AVAILABLE:
-            calculated_score = score_ethics(awareness_metrics, concept_summary_for_ethics, action_description_for_ethics)
-            if isinstance(calculated_score, (int, float)) and 0.0 <= calculated_score <= 1.0: ethical_score = float(calculated_score)
-            else: _log_dialogue_event("ethics_score_invalid_type", {"score": calculated_score, "type": type(calculated_score).__name__}, level="warning")
-            thought_steps.append(f"Dialogue Manager: Ethical score calculated: {ethical_score:.2f}")
-        else: thought_steps.append("Dialogue Manager: Ethical scoring not available. Using default score.")
-    except Exception as e_ethics_score:
-        _log_dialogue_event("ethics_score_error", {"error": str(e_ethics_score), "trace": traceback.format_exc()}, level="error")
-        thought_steps.append(f"Error during ethical scoring: {str(e_ethics_score)}")
+        if _ETHICS_SCORE_ETHICS_AVAILABLE: # Check if `score_ethics` function is available.
+            calculated_score = score_ethics(awareness_metrics, concept_summary=summary_text_for_ethics, action_description=action_text_for_ethics)
+            # Validate and use the returned score.
+            if isinstance(calculated_score, (int, float)) and 0.0 <= calculated_score <= 1.0: ethical_score_value = float(calculated_score)
+            else: _log_dialogue_event("ethics_score_invalid_type", {"score_received": calculated_score, "type_received": type(calculated_score).__name__}, level="warning")
+            thought_steps.append(f"Dialogue Manager: Ethical score calculated: {ethical_score_value:.2f}")
+        else: thought_steps.append("Dialogue Manager: Ethical scoring function unavailable. Using default ethical score.")
+    except Exception as e_ethics_scoring_call:
+        _log_dialogue_event("ethics_score_error", {"error_message": str(e_ethics_scoring_call), "traceback": traceback.format_exc()}, level="error")
+        thought_steps.append(f"Dialogue Manager: Error during ethical scoring: {str(e_ethics_scoring_call)}")
 
+    # Step 5: Store a memory of the interaction.
     try:
-        if _MEMORY_STORE_MEMORY_AVAILABLE:
-            primary_coord = awareness_metrics.get("primary_concept_coord")
-            if is_valid_coordinate(primary_coord):
-                concept_name_for_memory = summarize_text(user_input, 30).replace("...", "").strip() or "interaction_summary"
-                intensity_for_memory = awareness_metrics.get("raw_t_intensity", 0.0)
-                memory_data = {
-                    "concept_name": concept_name_for_memory, "concept_coord": primary_coord,
-                    "summary": summarize_text(f"User: {user_input} | Sophia: {brain_response_text}", 200),
-                    "intensity": float(intensity_for_memory) if isinstance(intensity_for_memory, (int,float)) else 0.0,
-                    "ethical_alignment": ethical_score,
+        if _MEMORY_STORE_MEMORY_AVAILABLE: # Check if `store_memory` function is available.
+            primary_coord_for_memory = awareness_metrics.get("primary_concept_coord")
+            # Store memory only if valid coordinates are available (from SNN processing).
+            if _IS_VALID_COORDINATE_AVAILABLE and is_valid_coordinate(primary_coord_for_memory):
+                concept_name_for_memory_storage = summarize_text(user_input, 30).replace("...", "").strip() or "interaction_summary"
+                intensity_for_memory_storage = awareness_metrics.get("raw_t_intensity", 0.0) # Raw T-intensity (0-1).
+                # Prepare data packet for memory storage.
+                memory_data_packet = {
+                    "concept_name": concept_name_for_memory_storage, "concept_coord": primary_coord_for_memory,
+                    "summary": summarize_text(f"User: {user_input} | Sophia: {brain_response_text}", 200), # Interaction summary.
+                    "intensity": float(intensity_for_memory_storage) if isinstance(intensity_for_memory_storage, (int,float)) else 0.0,
+                    "ethical_alignment": ethical_score_value, # Store with calculated ethical score.
                 }
-                memory_entry_id = store_memory(**memory_data) # type: ignore
-                _log_dialogue_event("memory_store_attempt", {"entry_id": memory_entry_id if memory_entry_id else "failed", "concept": concept_name_for_memory})
-                thought_steps.append(f"Dialogue Manager: Memory storage attempted for '{concept_name_for_memory}'. ID: {memory_entry_id}")
-            else: thought_steps.append("Dialogue Manager: Primary concept coordinate not valid for memory storage.")
-        else: thought_steps.append("Dialogue Manager: Memory storage not available.")
-    except Exception as e_memory_store:
-        _log_dialogue_event("memory_store_error", {"error": str(e_memory_store), "trace": traceback.format_exc()}, level="error")
-        thought_steps.append(f"Error storing memory: {str(e_memory_store)}")
+                memory_entry_id = store_memory(**memory_data_packet) # type: ignore # Store the memory.
+                _log_dialogue_event("memory_store_attempt", {"entry_id": memory_entry_id if memory_entry_id else "Store_Failed", "concept_name": concept_name_for_memory_storage})
+                thought_steps.append(f"Dialogue Manager: Memory storage attempted for '{concept_name_for_memory_storage}'. Entry ID: {memory_entry_id}")
+            else: thought_steps.append("Dialogue Manager: Primary concept coordinates not valid for memory storage.")
+        else: thought_steps.append("Dialogue Manager: Memory storage function unavailable.")
+    except Exception as e_memory_storage_call:
+        _log_dialogue_event("memory_store_error", {"error_message": str(e_memory_storage_call), "traceback": traceback.format_exc()}, level="error")
+        thought_steps.append(f"Dialogue Manager: Error during memory storage: {str(e_memory_storage_call)}")
 
-    current_mode = getattr(persona_instance, 'mode', 'N/A').upper()
-    final_response = f"[{current_mode}|E:{ethical_score:.2f}] {brain_response_text}"
-    mitigation_applied_flag = False
+    # Step 6: Apply content mitigation/moderation if needed.
+    # The final response includes persona mode and ethical score.
+    current_persona_mode = getattr(persona_instance, 'mode', 'N/A').upper()
+    final_response_text = f"[{current_persona_mode}|E:{ethical_score_value:.2f}] {brain_response_text}"
+    mitigation_was_applied = False
     try:
-        if _MITIGATOR_AVAILABLE and Mitigator:
-            mitigation_eth_threshold = getattr(config, 'MITIGATION_ETHICAL_THRESHOLD', 0.3) if config else 0.3
-            alignment_eth_threshold = getattr(config, 'ETHICAL_ALIGNMENT_THRESHOLD', 0.5) if config else 0.5
-            if ethical_score < mitigation_eth_threshold:
-                mitigator_instance = Mitigator()
-                mitigated_text = mitigator_instance.moderate_ethically_flagged_content(brain_response_text, ethical_score, strict_mode=True)
-                final_response = f"[{current_mode}|E:{ethical_score:.2f}] [MITIGATED] {mitigated_text}"
-                mitigation_applied_flag = True
-                thought_steps.append("Dialogue Manager: Mitigation applied (strict).")
-            elif ethical_score < alignment_eth_threshold:
-                final_response = f"[{current_mode}|E:{ethical_score:.2f}] [CAUTION] {brain_response_text}" 
-                mitigation_applied_flag = True 
-                thought_steps.append("Dialogue Manager: Caution applied to response.")
-        else: thought_steps.append("Dialogue Manager: Mitigation utilities not available.")
-    except Exception as e_mitigation:
-        _log_dialogue_event("mitigation_error", {"error": str(e_mitigation), "trace": traceback.format_exc()}, level="error")
-        thought_steps.append(f"Error during content mitigation: {str(e_mitigation)}")
+        if _MITIGATOR_AVAILABLE and Mitigator: # Check if Mitigator class is available.
+            # Get mitigation thresholds from config (or use defaults).
+            mitigation_trigger_threshold = getattr(config, 'MITIGATION_ETHICAL_THRESHOLD', 0.3) if config else 0.3
+            caution_threshold = getattr(config, 'ETHICAL_ALIGNMENT_THRESHOLD', 0.5) if config else 0.5
+            
+            if ethical_score_value < mitigation_trigger_threshold: # If score is below stricter mitigation threshold.
+                mitigator_instance = Mitigator() # Create Mitigator instance.
+                mitigated_text_content = mitigator_instance.moderate_ethically_flagged_content(brain_response_text, ethical_score_value, strict_mode=True)
+                final_response_text = f"[{current_persona_mode}|E:{ethical_score_value:.2f}] [MITIGATED] {mitigated_text_content}"
+                mitigation_was_applied = True
+                thought_steps.append("Dialogue Manager: Content mitigation applied (strict threshold).")
+            elif ethical_score_value < caution_threshold: # If score is below general alignment (caution) threshold.
+                final_response_text = f"[{current_persona_mode}|E:{ethical_score_value:.2f}] [CAUTION] {brain_response_text}" 
+                mitigation_was_applied = True # Technically a form of content presentation adjustment.
+                thought_steps.append("Dialogue Manager: Caution applied to response presentation.")
+        else: thought_steps.append("Dialogue Manager: Mitigation utilities (Mitigator class) not available.")
+    except Exception as e_mitigation_application:
+        _log_dialogue_event("mitigation_error", {"error_message": str(e_mitigation_application), "traceback": traceback.format_exc()}, level="error")
+        thought_steps.append(f"Dialogue Manager: Error during content mitigation: {str(e_mitigation_application)}")
 
+    # Step 7: Track ethical trends.
     try:
-        if _ETHICS_TRACK_TRENDS_AVAILABLE:
-            trends_summary = track_trends(ethical_score=ethical_score, context=concept_summary_for_ethics) 
-            _log_dialogue_event("ethics_trends_updated", {"summary": trends_summary if trends_summary else "No summary"}, level="debug")
-            thought_steps.append(f"Dialogue Manager: Ethical trends updated. Summary: {trends_summary}")
-        else: thought_steps.append("Dialogue Manager: Ethical trend tracking not available.")
-    except Exception as e_ethics_trends:
-        _log_dialogue_event("ethics_track_trends_error", {"error": str(e_ethics_trends), "trace": traceback.format_exc()}, level="error")
-        thought_steps.append(f"Error tracking ethical trends: {str(e_ethics_trends)}")
+        if _ETHICS_TRACK_TRENDS_AVAILABLE: # Check if `track_trends` function is available.
+            # Call track_trends with the current ethical score and context summary.
+            # Note: The original `track_trends` signature might need adjustment if it doesn't take these args.
+            # For this review, assuming it's compatible or adapted. If not, this call might error or be ineffective.
+            # Based on ethics.py, track_trends() does not take arguments directly, it reads from its DB.
+            # So, the score_ethics call which saves to DB is the input to track_trends.
+            trends_summary_report = track_trends() # This will use the score just logged by score_ethics.
+            _log_dialogue_event("ethics_trends_updated", {"summary_report": trends_summary_report if trends_summary_report else "No summary report"}, level="debug")
+            thought_steps.append(f"Dialogue Manager: Ethical trends updated. Current trend: {trends_summary_report.get('trend_direction', 'N/A') if isinstance(trends_summary_report,dict) else 'N/A'}")
+        else: thought_steps.append("Dialogue Manager: Ethical trend tracking function unavailable.")
+    except Exception as e_ethics_trends_call:
+        _log_dialogue_event("ethics_track_trends_error", {"error_message": str(e_ethics_trends_call), "traceback": traceback.format_exc()}, level="error")
+        thought_steps.append(f"Dialogue Manager: Error tracking ethical trends: {str(e_ethics_trends_call)}")
 
-    _log_dialogue_event("generate_response_end", {"final_response_snippet": final_response[:100], "mitigation_applied": mitigation_applied_flag})
-    return (final_response, thought_steps, awareness_metrics)
+    _log_dialogue_event("generate_response_end", {"final_response_snippet": final_response_text[:100], "mitigation_applied_flag": mitigation_was_applied})
+    return (final_response_text, thought_steps, awareness_metrics) # Return final composed response.
 
 def dialogue_loop(enable_streaming_thoughts: bool = None):
     _log_dialogue_event("dialogue_loop_start", {})
     persona_instance = get_dialogue_persona()
     if persona_instance is None:
+    """
+    Manages the main interactive command-line loop for Sophia_Alpha2.
+
+    Handles user input, command parsing (e.g., !help, !stream),
+    calls `generate_response` for actual dialogue, and prints outputs.
+    The loop continues until the user types 'quit' or 'exit'.
+
+    Args:
+        enable_streaming_thoughts (bool, optional): Overrides the initial setting for
+                                                    streaming thought steps. If None,
+                                                    it defaults to `config.VERBOSE_OUTPUT`.
+    """
+    _log_dialogue_event("dialogue_loop_start", {})
+    
+    # Attempt to get the persona instance at the start of the loop.
+    persona_instance = get_dialogue_persona()
+    if persona_instance is None: # Critical: If persona can't be loaded, loop cannot run.
         print("CRITICAL: Persona module could not be initialized. Dialogue loop cannot start.", file=sys.stderr)
-        _log_dialogue_event("dialogue_loop_critical_fail", {"reason": "Persona unavailable at start"}, level="critical")
+        _log_dialogue_event("dialogue_loop_critical_fail", {"reason": "Persona instance unavailable at loop start."}, level="critical")
         return
 
     print("Sophia_Alpha2 Dialogue Interface. Type '!help' for commands, 'quit' or 'exit' to end.")
-    if enable_streaming_thoughts is not None: stream_thoughts_cli = enable_streaming_thoughts
-    elif config: stream_thoughts_cli = getattr(config, 'VERBOSE_OUTPUT', False)
-    else: stream_thoughts_cli = False
-    print(f"Thought Streaming: {'ON' if stream_thoughts_cli else 'OFF'}. Type '!stream' to toggle.")
+    
+    # Determine initial state for streaming thought steps.
+    if enable_streaming_thoughts is not None:
+        stream_thoughts_cli_active = enable_streaming_thoughts
+    elif config: # If config is available, use VERBOSE_OUTPUT.
+        stream_thoughts_cli_active = getattr(config, 'VERBOSE_OUTPUT', False)
+    else: # Default to False if no config.
+        stream_thoughts_cli_active = False
+    print(f"Thought Streaming: {'ON' if stream_thoughts_cli_active else 'OFF'}. Type '!stream' to toggle.")
 
+    # Main input loop.
     while True:
         try:
+            # Refresh persona instance in case it was reset or changed externally (though unlikely in current design).
             current_persona = get_dialogue_persona()
-            if current_persona is None:
+            if current_persona is None: # If persona becomes unavailable mid-loop.
                 print("CRITICAL: Persona became unavailable during loop. Exiting.", file=sys.stderr)
-                _log_dialogue_event("dialogue_loop_persona_lost", {}, level="critical")
+                _log_dialogue_event("dialogue_loop_persona_lost", {"reason": "Persona instance became None mid-loop."}, level="critical")
                 break
-            awareness = getattr(current_persona, 'awareness', {})
-            prompt_mode = getattr(current_persona, 'mode', 'N/A').upper()
-            prompt_name = getattr(current_persona, 'name', 'Sophia')
-            prompt_curiosity = awareness.get('curiosity', 0.0)
-            prompt_coherence = awareness.get('coherence', 0.0)
-            prompt = f"{prompt_name}({prompt_mode}|A:{prompt_curiosity:.1f},C:{prompt_coherence:.1f})> "
-            user_input = input(prompt)
-        except KeyboardInterrupt: print("\nExiting dialogue loop (KeyboardInterrupt)..."); break
-        except EOFError: print("\nExiting dialogue loop (EOFError)..."); break
+            
+            # Construct the command prompt string using current persona details.
+            current_awareness_state = getattr(current_persona, 'awareness', {})
+            prompt_persona_mode = getattr(current_persona, 'mode', 'N/A').upper()
+            prompt_persona_name = getattr(current_persona, 'name', 'Sophia')
+            prompt_persona_curiosity = current_awareness_state.get('curiosity', 0.0)
+            prompt_persona_coherence = current_awareness_state.get('coherence', 0.0)
+            command_prompt = f"{prompt_persona_name}({prompt_persona_mode}|A:{prompt_persona_curiosity:.1f},C:{prompt_persona_coherence:.1f})> "
+            
+            user_input_str = input(command_prompt) # Get user input.
+        except KeyboardInterrupt: # Handle Ctrl+C gracefully.
+            print("\nExiting dialogue loop (KeyboardInterrupt)...")
+            _log_dialogue_event("dialogue_loop_ended_interrupt", {})
+            break
+        except EOFError: # Handle end-of-file (e.g., piped input).
+            print("\nExiting dialogue loop (EOFError)...")
+            _log_dialogue_event("dialogue_loop_ended_eof", {})
+            break
 
-        user_input_lower = user_input.strip().lower()
-        if user_input_lower in ["quit", "exit"]: break
-        elif user_input_lower == "!stream":
-            stream_thoughts_cli = not stream_thoughts_cli
-            print(f"Thought Streaming: {'ON' if stream_thoughts_cli else 'OFF'}")
-        elif user_input_lower == "!persona":
+        user_input_cleaned_lower = user_input_str.strip().lower() # Process for command checking.
+
+        # Command Handling
+        if user_input_cleaned_lower in ["quit", "exit"]: # Exit command.
+            break
+        elif user_input_cleaned_lower == "!stream": # Toggle thought streaming.
+            stream_thoughts_cli_active = not stream_thoughts_cli_active
+            print(f"Thought Streaming: {'ON' if stream_thoughts_cli_active else 'OFF'}")
+        elif user_input_cleaned_lower == "!persona": # Display persona info.
             if current_persona and hasattr(current_persona, 'get_intro'):
-                print(current_persona.get_intro())
-                print(json.dumps(getattr(current_persona, 'awareness', {}), indent=2))
+                print(current_persona.get_intro()) # Display formatted intro.
+                # Display raw awareness dict for debugging.
+                print(json.dumps(getattr(current_persona, 'awareness', {}), indent=2, default=str))
             else: print("Persona details unavailable.")
-        elif user_input_lower == "!ethicsdb":
+        elif user_input_cleaned_lower == "!ethicsdb": # Debug: Display ethics DB summary.
             if _ETHICS_MODULE_AVAILABLE and ethics_module and hasattr(ethics_module, '_ethics_db'):
-                print(f"Ethics DB (first 5 entries): {list(ethics_module._ethics_db.items())[:5]}") 
-                print(f"Total ethics entries: {len(ethics_module._ethics_db)}")
-            else: print("Ethics DB details unavailable or module not loaded.")
-        elif user_input_lower == "!memgraph":
+                # Display a summary or sample of the ethics DB.
+                print(f"Ethics DB (first 5 score entries): {ethics_module._ethics_db.get('ethical_scores', [])[:5]}") 
+                print(f"Total ethics score entries: {len(ethics_module._ethics_db.get('ethical_scores', []))}")
+                print(f"Trend Analysis: {ethics_module._ethics_db.get('trend_analysis', {})}")
+            else: print("Ethics DB details unavailable (module or _ethics_db not loaded).")
+        elif user_input_cleaned_lower == "!memgraph": # Debug: Display memory graph summary.
             if _MEMORY_MODULE_AVAILABLE and memory_module and hasattr(memory_module, '_knowledge_graph'):
-                kg = memory_module._knowledge_graph
-                print(f"Memory Graph: Nodes={len(kg.get('nodes',[]))}, Edges={len(kg.get('edges',[]))}")
-            else: print("Memory Graph details unavailable or module not loaded.")
-        elif user_input_lower == "!library":
-            if _LIBRARY_AVAILABLE and library_module:
+                kg_state = memory_module._knowledge_graph
+                print(f"Memory Graph: Nodes={len(kg_state.get('nodes',[]))}, Edges={len(kg_state.get('edges',[]))}")
+            else: print("Memory Graph details unavailable (module or _knowledge_graph not loaded).")
+        elif user_input_cleaned_lower == "!library": # Debug: Display library summary.
+            if _LIBRARY_AVAILABLE and library_module: # Check if library_module itself was imported.
+                # KNOWLEDGE_LIBRARY is a global in library_module.
                 print(f"Knowledge Library Entries: {len(library_module.KNOWLEDGE_LIBRARY)}")
-            else: print("Knowledge Library details unavailable or module not loaded.")
-        elif user_input_lower == "!help":
+            else: print("Knowledge Library details unavailable (module not loaded).")
+        elif user_input_cleaned_lower == "!help": # Display help message.
             print("\nAvailable Commands:\n  !help          - Show this help message.\n  !stream        - Toggle streaming of thought steps.\n  !persona       - Display current persona information.\n  !ethicsdb      - Display summary of ethics database (debug).\n  !memgraph      - Display summary of memory graph (debug).\n  !library       - Display summary of knowledge library (debug).\n  quit / exit    - End the dialogue session.\n")
-        else:
-            if not user_input.strip(): continue
-            print("Thinking...")
+        else: # Not a command, process as dialogue input.
+            if not user_input_str.strip(): continue # Skip empty input lines.
+            print("Thinking...") # Indicate processing.
             try:
-                final_response, thought_steps, _ = generate_response(user_input, stream_thought_steps=stream_thoughts_cli)
-                print(f"\n{final_response}")
-                if stream_thoughts_cli and thought_steps:
+                # Generate response using the main orchestration function.
+                final_response_text, thought_steps_log, _ = generate_response(user_input_str, stream_thought_steps=stream_thoughts_cli_active)
+                print(f"\n{final_response_text}") # Print final response.
+                # If streaming is active, print thought steps.
+                if stream_thoughts_cli_active and thought_steps_log:
                     print("\n--- Thought Process ---")
-                    for i, step in enumerate(thought_steps): print(f"{i+1}. {step}")
+                    for i, step_detail in enumerate(thought_steps_log): print(f"{i+1}. {step_detail}")
                     print("--- End of Thoughts ---\n")
-            except CoreException as e_core: 
-                _log_dialogue_event("dialogue_loop_core_exception", {"error": str(e_core), "type": type(e_core).__name__}, level="error")
-                print(f"A known error occurred: ({type(e_core).__name__}) {str(e_core)}")
-            except Exception as e_unexpected:
-                _log_dialogue_event("dialogue_loop_unexpected_exception", {"error": str(e_unexpected), "trace": traceback.format_exc()}, level="critical")
-                print(f"An unexpected error occurred: {str(e_unexpected)}. Please check logs.")
+            except CoreException as e_core_dialogue: # Handle known custom exceptions from core modules.
+                _log_dialogue_event("dialogue_loop_core_exception", {"error_message": str(e_core_dialogue), "exception_type": type(e_core_dialogue).__name__}, level="error")
+                print(f"A known system error occurred: ({type(e_core_dialogue).__name__}) {str(e_core_dialogue)}")
+            except Exception as e_unexpected_dialogue: # Handle any other unexpected errors.
+                _log_dialogue_event("dialogue_loop_unexpected_exception", {"error_message": str(e_unexpected_dialogue), "traceback": traceback.format_exc()}, level="critical")
+                print(f"An unexpected critical error occurred: {str(e_unexpected_dialogue)}. Please check system logs for details.")
+    
     print("Dialogue session ended.")
     _log_dialogue_event("dialogue_loop_end", {})
 

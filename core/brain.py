@@ -8,19 +8,20 @@ This module is responsible for:
 - Generating awareness metrics based on SNN activity and coherence.
 """
 
-import os
-import sys
+import datetime
 import json
+import os
 import re
 import socket # For _try_connect_llm
+import sys
 import time
-import datetime
 import traceback # For error logging
 
 import numpy as np
-import torch
-import torch.nn as nn # Corrected from torch.nn
+import requests # Added: For LLM API calls
 import snntorch as snn
+import torch
+import torch.nn as nn # Part of torch
 from snntorch import surrogate
 
 # Attempt to import configuration from the parent package
@@ -96,6 +97,14 @@ def get_shared_manifold(force_recreate: bool = False):
     """
     Provides access to the singleton SpacetimeManifold instance.
     Initializes it if it doesn't exist or if force_recreate is True.
+
+    Args:
+        force_recreate (bool, optional): If True, any existing instance is discarded
+                                         and a new one is created. Defaults to False.
+    
+    Returns:
+        SpacetimeManifold | None: The singleton instance, or None if creation fails
+                                  (e.g., SpacetimeManifold class not yet defined).
     """
     global _shared_manifold_instance
     if _shared_manifold_instance is None or force_recreate:
@@ -145,15 +154,23 @@ class SpacetimeManifold:
             raise ImportError("Config module not loaded. SpacetimeManifold requires config.")
 
         # --- Device Configuration ---
-        if config.USE_GPU and torch.cuda.is_available():
+        # Determine compute device (GPU if enabled and available, else CPU)
+        # Use getattr for USE_GPU for robustness against it missing in config.
+        use_gpu_flag = getattr(config, 'USE_GPU', False) # Default to False if not set
+        if use_gpu_flag and torch.cuda.is_available():
             self.device = torch.device("cuda")
-            _log_system_event("device_config", {"device": "cuda", "reason": "USE_GPU is True and CUDA available"})
+            _log_system_event("device_config", {"device": "cuda", "reason": "USE_GPU is True in config and CUDA available"})
         else:
             self.device = torch.device("cpu")
-            reason = "USE_GPU is False" if not config.USE_GPU else "CUDA not available"
+            reason = "USE_GPU is False in config" if not use_gpu_flag else "CUDA not available (though USE_GPU was True)"
+            if not torch.cuda.is_available() and use_gpu_flag: # More specific reason
+                 reason = "CUDA not available (though USE_GPU was True in config)"
+            elif not use_gpu_flag:
+                 reason = "USE_GPU is False or not set in config"
+
             _log_system_event("device_config", {"device": "cpu", "reason": reason})
         
-        print(f"SpacetimeManifold using device: {self.device}")
+        print(f"SpacetimeManifold using device: {self.device}") # User feedback
 
 
         # --- Load Parameters from Config ---
@@ -199,20 +216,25 @@ class SpacetimeManifold:
         ).to(self.device)
 
         # Initialize membrane potential and spikes
-        # Batch size is assumed to be 1 for now (one concept/input at a time)
+        # Batch size is assumed to be 1 (processing one concept/input at a time)
         self.batch_size = 1 
-        self.mem = self.lif1.init_leaky() # Initializes based on lif1 internal state if not passed batch_size, or use below
-        # self.mem = torch.zeros(self.batch_size, self.snn_output_size, device=self.device) # Alternative explicit init
+        # Initialize LIF membrane potential using snnTorch's utility for the defined LIF layer
+        self.mem = self.lif1.init_leaky() 
+        # Initialize spike tensor (output spikes) for the first step
         self.spk = torch.zeros(self.batch_size, self.snn_output_size, device=self.device)
 
         # --- Initialize Optimizer ---
-        # We want to optimize the weights of the fully connected layer and LIF beta
+        # Adam optimizer is chosen for its adaptive learning rate capabilities.
+        # It will optimize parameters of the fully connected layer (self.fc) and
+        # the learnable parameters of the LIF neuron layer (self.lif1), such as 'beta'.
         self.optimizer = torch.optim.Adam(
-            list(self.fc.parameters()) + list(self.lif1.parameters()), 
-            lr=self.optimizer_lr
+            list(self.fc.parameters()) + list(self.lif1.parameters()), # Parameters to optimize
+            lr=self.optimizer_lr # Learning rate from config
         )
 
         # --- Manifold State Variables ---
+        # self.coordinates: Stores spatial and temporal intensity information for each concept.
+        # Format: {concept_name: (x_coord, y_coord, z_coord, t_intensity_coord)}
         self.coordinates = {}  # Stores {concept_name: (x, y, z, t_intensity)}
         self.coherence = 0.0   # Global coherence metric of the manifold
         self.last_avg_stdp_weight_change = 0.0 # For self_evolution_rate metric
@@ -303,27 +325,22 @@ class SpacetimeManifold:
         Intensity is the 't' coordinate before normalization.
         """
         _log_system_event("concept_bootstrap_start", {"concept_name": concept_name})
-        llm_data = None
+        llm_data = None # Initialize to ensure it's defined in all paths
 
+        # Attempt to connect to LLM API if enabled
         if config.ENABLE_LLM_API and self._try_connect_llm():
             headers = {"Content-Type": "application/json"}
+            # Add Authorization header for OpenAI if API key is present
             if config.LLM_PROVIDER == "openai" and config.LLM_API_KEY != "YOUR_OPENAI_API_KEY_HERE_IF_NOT_SET_AS_ENV":
                 headers["Authorization"] = f"Bearer {config.LLM_API_KEY}"
             
-            # Construct payload based on provider's expected format
-            # Using a generic chat completions structure for this example
-            # The actual prompt template usage will vary by provider and API endpoint
-            # For now, we'll assume a simple "define this concept" approach for the LLM call.
-            # The richer CONCEPT_PROMPT_TEMPLATE from config will be used more in dialogue or deeper queries.
-            
-            # Simplified prompt for direct concept definition query to LLM
-            # This part might need refinement based on how LLM_CONCEPT_PROMPT_TEMPLATE is structured
-            # and whether we expect a single user message or a system+user message pair.
+            # Construct the prompt for the LLM.
+            # Uses templates from config, ensuring a core instruction is present.
             user_prompt_content = config.LLM_CONCEPT_PROMPT_TEMPLATE.get("user", "Explain the concept: {concept_name}").format(concept_name=concept_name)
-            if "Explain the concept:" not in user_prompt_content: # Ensure the core instruction is there if template is minimal
+            if "Explain the concept:" not in user_prompt_content: # Fallback for minimal templates
                  user_prompt_content = f"Explain the concept: {concept_name}. {user_prompt_content}"
 
-
+            # Prepare payload for the LLM API call
             payload = {
                 "model": config.LLM_MODEL,
                 "messages": [
@@ -331,72 +348,75 @@ class SpacetimeManifold:
                     {"role": "user", "content": user_prompt_content }
                 ],
                 "temperature": config.LLM_TEMPERATURE,
-                # Add max_tokens if appropriate for the provider
+                # "max_tokens": ... # Consider adding max_tokens if necessary for the provider
             }
-            # OpenAI and compatible APIs (like LM Studio) support response_format for JSON
-            if config.LLM_PROVIDER in ["openai", "lm_studio"]: # Assuming lm_studio endpoint supports it
+            # Request JSON response format if supported by the provider (e.g., OpenAI, LM Studio)
+            if config.LLM_PROVIDER in ["openai", "lm_studio"]:
                  payload["response_format"] = {"type": "json_object"}
 
-
+            # Determine the correct API endpoint URL based on the provider
             api_url = config.LLM_BASE_URL
-            # Adjust API URL for specific providers if needed (e.g., OpenAI chat completions)
             if config.LLM_PROVIDER == "openai":
-                api_url = os.path.join(config.LLM_BASE_URL, "chat/completions") # Common endpoint
+                api_url = os.path.join(config.LLM_BASE_URL, "chat/completions")
             elif config.LLM_PROVIDER == "ollama":
-                 # Ollama might use /api/chat or /api/generate. Assuming /api/chat for this structure.
-                 # For generate, the payload structure is different.
+                 # Ollama's /api/chat is suitable for message-based interactions.
+                 # /api/generate has a different payload structure.
                  api_url = os.path.join(config.LLM_BASE_URL, "chat")
-
 
             try:
                 _log_system_event("llm_api_call_start", {"url": api_url, "provider": config.LLM_PROVIDER, "model": config.LLM_MODEL}, level="debug")
-                # NOTE: The 'requests' import is missing. This will be handled in a separate step.
-                import requests # Temporary import for this block
+                # Make the POST request to the LLM API
                 response = requests.post(
-                    api_url, 
-                    headers=headers, 
+                    api_url,
+                    headers=headers,
                     data=json.dumps(payload), 
                     timeout=config.LLM_REQUEST_TIMEOUT
                 )
-                response.raise_for_status() # Raise HTTPError for bad responses (4XX or 5XX)
+                response.raise_for_status() # Raise an HTTPError for bad status codes (4xx or 5xx)
                 
-                raw_response_text = response.text
+                raw_response_text = response.text # Store raw text for potential regex fallback
                 _log_system_event("llm_api_call_success_raw", {"concept_name": concept_name, "status_code": response.status_code, "response_head": raw_response_text[:200]}, level="debug")
 
+                # Attempt to parse the JSON response from the LLM
                 try:
-                    # Attempt to parse JSON directly from response text
-                    # For OpenAI chat completions, content is nested: response.json()['choices'][0]['message']['content']
+                    # Provider-specific parsing logic
                     if config.LLM_PROVIDER == "openai":
+                        # OpenAI chat completions nest content: response.json()['choices'][0]['message']['content']
                         json_content_str = response.json()['choices'][0]['message']['content']
                         llm_data = json.loads(json_content_str)
-                    elif config.LLM_PROVIDER == "lm_studio": # Assuming direct JSON object in response for LM Studio with response_format
+                    elif config.LLM_PROVIDER == "lm_studio":
+                        # Assume LM Studio with response_format="json_object" returns direct JSON
                         llm_data = response.json()
-                    elif config.LLM_PROVIDER == "ollama": # Ollama chat response is streamed JSON objects, or a single JSON object if not streamed.
-                                                          # For non-streaming chat, it's response.json()['message']['content'] which is a string, potentially JSON.
+                    elif config.LLM_PROVIDER == "ollama":
+                        # Ollama chat (non-streaming) returns JSON with content at: response.json()['message']['content']
+                        # This content itself might be a JSON string.
                         message_content_str = response.json()['message']['content']
                         try:
                             llm_data = json.loads(message_content_str)
-                        except json.JSONDecodeError:
+                        except json.JSONDecodeError: # If content is not a JSON string, log and prepare for regex
                             _log_system_event("llm_parsing_warning", {"concept_name": concept_name, "detail": "Ollama message content not direct JSON, attempting regex.", "content": message_content_str[:200]}, level="warning")
-                            # Fall through to regex if direct parse fails
-                    else: # Generic attempt
+                            llm_data = None # Explicitly set to None to trigger regex fallback
+                            # Fall through to regex if direct parse fails (llm_data is None)
+                    else: # Generic attempt for other providers
                         llm_data = response.json()
 
-                    if not isinstance(llm_data, dict) or not all(k in llm_data for k in ["summary", "valence", "abstraction", "relevance", "intensity"]):
+                    # Validate if the parsed data has the expected structure (all required keys)
+                    if llm_data is not None and (not isinstance(llm_data, dict) or not all(k in llm_data for k in ["summary", "valence", "abstraction", "relevance", "intensity"])):
                         _log_system_event("llm_parsing_warning", {"concept_name": concept_name, "detail": "Parsed JSON lacks required keys. Attempting regex on raw text.", "parsed_data_type": str(type(llm_data))}, level="warning")
-                        llm_data = None # Force regex fallback
+                        llm_data = None # Force regex fallback if structure is incorrect
 
-                except (json.JSONDecodeError, KeyError) as e_parse:
+                except (json.JSONDecodeError, KeyError) as e_parse: # Handle errors during JSON parsing
                     _log_system_event("llm_parsing_error_json", {"concept_name": concept_name, "error": str(e_parse), "response_text_head": raw_response_text[:200]}, level="warning")
-                    llm_data = None # Signal to try regex
+                    llm_data = None # Signal to try regex parsing
 
-                if llm_data is None: # Attempt regex extraction if direct JSON parsing failed or produced invalid structure
+                # Regex fallback if JSON parsing failed or yielded invalid structure
+                if llm_data is None:
                     _log_system_event("llm_parsing_attempt_regex", {"concept_name": concept_name}, level="debug")
-                    # This regex is a basic example and needs to be robust and match the expected LLM output format
-                    # It assumes JSON-like structures within the text.
+                    # Define regex patterns to extract data fields from raw text.
+                    # These patterns assume a JSON-like string within the response.
                     patterns = {
-                        "summary": r'"summary":\s*"(.*?)"',
-                        "valence": r'"valence":\s*(-?\d+\.?\d*)',
+                        "summary": r'"summary":\s*"(.*?)"', # Captures text within quotes
+                        "valence": r'"valence":\s*(-?\d+\.?\d*)', # Captures float/int
                         "abstraction": r'"abstraction":\s*(-?\d+\.?\d*)',
                         "relevance": r'"relevance":\s*(-?\d+\.?\d*)',
                         "intensity": r'"intensity":\s*(-?\d+\.?\d*)'
@@ -407,71 +427,70 @@ class SpacetimeManifold:
                         if match:
                             if key == "summary":
                                 extracted_data[key] = match.group(1).strip()
-                            else:
+                            else: # For numeric fields, convert to float
                                 try:
                                     extracted_data[key] = float(match.group(1))
-                                except ValueError:
+                                except ValueError: # Handle conversion error
                                     _log_system_event("llm_regex_type_error", {"key": key, "value": match.group(1)}, level="warning")
-                                    extracted_data[key] = 0.0 # Default on parse error
-                        else: # Key not found by regex
+                                    extracted_data[key] = 0.0 # Default on error
+                        else: # If a key is not found by regex
                              _log_system_event("llm_regex_key_not_found", {"key": key}, level="warning")
-                             if key != "summary": extracted_data[key] = 0.0 # Default numeric
-                             else: extracted_data[key] = "Summary not extracted."
+                             if key != "summary": extracted_data[key] = 0.0 # Default for numeric
+                             else: extracted_data[key] = "Summary not extracted." # Default for summary
 
-
+                    # If all required keys were successfully extracted via regex
                     if all(k in extracted_data for k in ["summary", "valence", "abstraction", "relevance", "intensity"]):
                         llm_data = extracted_data
                         _log_system_event("llm_parsing_success_regex", {"concept_name": concept_name, "data_keys": list(llm_data.keys())}, level="info")
-                    else:
+                    else: # Regex extraction also failed to get all keys
                         _log_system_event("llm_parsing_failure_regex", {"concept_name": concept_name, "extracted_keys": list(extracted_data.keys())}, level="error")
+                        # llm_data remains None or partially filled
                         
-            except requests.exceptions.RequestException as e_req:
+            except requests.exceptions.RequestException as e_req: # Handle network/request errors
                 _log_system_event("llm_api_call_failure", {"concept_name": concept_name, "error": str(e_req)}, level="error")
-            except Exception as e_gen:
+            except Exception as e_gen: # Catch any other unexpected errors during LLM processing
                 _log_system_event("llm_processing_error_unknown", {"concept_name": concept_name, "error": str(e_gen), "trace": traceback.format_exc()}, level="critical")
 
-
-        if not llm_data:
+        # Fallback to mock data if LLM data acquisition failed or LLM is disabled
+        if not llm_data: # This check handles cases where llm_data is None or became None after failed parsing/validation
             _log_system_event("llm_data_unavailable_using_mock", {"concept_name": concept_name}, level="warning")
             llm_data = self._mock_phi3_concept_data(concept_name)
         
+        # Ensure default values for all expected keys in llm_data to prevent KeyErrors later
+        # This is especially important if mock data or a failed LLM response (even after regex)
+        # does not guarantee all keys.
         llm_data.setdefault("summary", "No summary available.")
         llm_data.setdefault("valence", 0.0)
         llm_data.setdefault("abstraction", 0.0)
         llm_data.setdefault("relevance", 0.0)
         llm_data.setdefault("intensity", 0.0)
 
-        # Calculate 4D coordinates, normalizing by self.range
-        # x from valence, y from abstraction, z from relevance, t from intensity
-        # Assuming self.range is the max absolute value for coordinates (e.g., if range is 1000, coords are -500 to 500)
-        # For simplicity, let's map LLM outputs (0-1 or -1 to 1) to a portion of this range.
-        # E.g., map valence (-1 to 1) to x (-self.range/2 to self.range/2)
-        # E.g., map abstraction (0 to 1) to y (0 to self.range/2)
-        # E.g., map relevance (0 to 1) to z (0 to self.range/2)
-        # E.g., map intensity (0 to 1) to t_intensity (0 to self.range/2 or some other scale)
-        
-        # For now, a simple direct mapping, clipping/scaling can be added
-        # x: valence (-1 to 1) * (self.range / 2)
-        # y: abstraction (0 to 1) * (self.range / 2)
-        # z: relevance (0 to 1) * (self.range / 2)
-        # t_raw_intensity: intensity (0 to 1) - this is the one returned as 'intensity_float'
-        # t_coord_intensity: intensity (0 to 1) * (self.range / 2) - used as a coordinate
+        # --- Calculate 4D Manifold Coordinates ---
+        # Coordinates are derived from LLM/mock data (valence, abstraction, relevance, intensity).
+        # These values are normalized and scaled by `self.range`.
+        # x: derived from valence (-1 to 1), mapped to (-self.range/2 to +self.range/2)
+        # y: derived from abstraction (0 to 1), mapped to (0 to +self.range/2)
+        # z: derived from relevance (0 to 1), mapped to (0 to +self.range/2)
+        # t_coord_intensity: derived from raw_intensity (0 to 1), mapped to (0 to +self.range/2)
+        # raw_intensity is returned separately as 'intensity_float'.
 
-        half_range = self.range / 2.0
+        half_range = self.range / 2.0 # Pre-calculate for efficiency
         
+        # Clip values to expected ranges before scaling
         x = np.clip(float(llm_data["valence"]), -1.0, 1.0) * half_range
         y = np.clip(float(llm_data["abstraction"]), 0.0, 1.0) * half_range 
         z = np.clip(float(llm_data["relevance"]), 0.0, 1.0) * half_range
         
-        raw_intensity = np.clip(float(llm_data["intensity"]), 0.0, 1.0)
-        t_coord_intensity = raw_intensity * half_range # Or map to a different scale if needed
+        raw_intensity = np.clip(float(llm_data["intensity"]), 0.0, 1.0) # This is the (0-1) intensity
+        t_coord_intensity = raw_intensity * half_range # This is the scaled 't' coordinate
 
-        coordinates = (x, y, z, t_coord_intensity)
-        self.coordinates[concept_name] = coordinates
+        coordinates = (x, y, z, t_coord_intensity) # Store as a tuple
+        self.coordinates[concept_name] = coordinates # Update manifold's dictionary
         
         _log_system_event("concept_bootstrap_complete", 
                           {"concept_name": concept_name, "coordinates": coordinates, 
-                           "raw_intensity": raw_intensity, "source": "LLM" if config.ENABLE_LLM_API and llm_data.get("summary","").startswith("Mock summary:") is False else "Mock"}, 
+                           "raw_intensity": raw_intensity, 
+                           "source": "LLM" if config.ENABLE_LLM_API and not llm_data.get("summary","").startswith("Mock summary:") else "Mock"}, 
                           level="info")
         
         return coordinates, raw_intensity, str(llm_data["summary"])
@@ -501,77 +520,54 @@ class SpacetimeManifold:
 
         _log_system_event("stdp_update_start", {"concept": concept_name}, level="debug")
 
-        # Ensure tensors are on the correct device
+        # Ensure tensors are on the correct device for computation
         pre_spk_flat = pre_spk_flat.to(self.device)
         post_spk_flat = post_spk_flat.to(self.device)
-        current_weights_clone = current_weights.clone().to(self.device) # Work on a clone
+        current_weights_clone = current_weights.clone().to(self.device) # Work on a clone to avoid modifying original tensor in-place prematurely
 
-        # Get current t_intensity for the concept
+        # Get current t_intensity for the concept from stored coordinates
         current_concept_coords = self.coordinates.get(concept_name)
-        if not current_concept_coords:
+        if not current_concept_coords: # Should ideally not happen if concept was bootstrapped
             _log_system_event("stdp_error_no_coords", {"concept": concept_name}, level="warning")
-            return current_weights_clone, 0.0
+            return current_weights_clone, 0.0 # Return original weights if no coordinates found
         
-        # current_t_intensity is the 4th element (index 3) of the coordinate tuple (x,y,z,t)
-        # This t_coord_intensity was scaled by self.range/2. We might need raw_intensity (0-1) for delta_t.
-        # However, bootstrap_concept_from_llm returns raw_intensity separately.
-        # Let's assume prev_t_intensity and the one derived from current_concept_coords are comparable,
-        # or better, that they are both the 'raw_intensity' (0-1 scale).
-        # For now, let's use the stored t_coord_intensity and assume prev_t_intensity is on a similar scale.
+        # The 't' coordinate (index 3) is used as a proxy for the timing of the current event.
+        # This was previously scaled by self.range/2. For STDP, the raw_intensity (0-1) might be
+        # more suitable for calculating delta_t if prev_t_intensity is also raw.
+        # Current implementation uses scaled t_coord_intensity. This needs to be consistent.
         current_t_intensity = current_concept_coords[3] 
 
-        # --- Basic STDP/Hebbian Logic ---
-        # delta_t: Time difference. Positive if presynaptic spike happens BEFORE postsynaptic.
-        # For this model, 'time' is proxied by t_intensity.
-        # A larger prev_t_intensity means the 'previous event' was 'later' or 'stronger in time'.
-        # So, if prev_t_intensity > current_t_intensity, it's like the previous event is "closer" in time or "after" current.
-        # This interpretation of delta_t needs to be consistent with the STDP rule.
-        # Let's define delta_t = t_current - t_previous.
-        # If delta_t > 0 (current is "after" previous), it could be LTP for pre-before-post.
-        # If delta_t < 0 (current is "before" previous), it could be LTD for post-before-pre.
-        
+        # --- STDP/Hebbian Logic using t_intensity as a proxy for time ---
+        # delta_t = t_current_event - t_previous_event
+        # Positive delta_t: Current event is "after" previous. If pre-synaptic spike (input) led to post-synaptic spike (output)
+        #                   under this condition, it implies potentiation (LTP).
+        # Negative delta_t: Current event is "before" previous. If post-synaptic spike occurred before pre-synaptic under this
+        #                   timing, it implies depression (LTD).
+        # This is a conceptual application of STDP principles where t_intensity differences model event timing.
         delta_t = current_t_intensity - prev_t_intensity 
         
-        # Weight update matrix, initialized to zeros
+        # Initialize weight change matrix
         delta_w = torch.zeros_like(current_weights_clone)
 
-        # Expand pre_spk_flat and post_spk_flat for broadcasting with weights
-        # pre_spk_flat: [1, snn_input_size] -> [snn_output_size, snn_input_size] (repeated rows)
-        # post_spk_flat: [1, snn_output_size] -> [snn_output_size, 1] -> [snn_output_size, snn_input_size] (repeated columns)
-        
-        # We need to iterate over each neuron pair or find a vectorized way.
-        # For a simple Hebbian rule: delta_w = lr * post_spikes * pre_spikes_transpose
-        # pre_spk_flat is (1, num_inputs), post_spk_flat is (1, num_outputs)
-        # delta_w should be (num_outputs, num_inputs)
-        # So, delta_w_hebbian = self.lr_stdp * post_spk_flat.T @ pre_spk_flat
-        
-        # For STDP, the timing component (delta_t and self.tau_stdp_s) is crucial.
-        # A common STDP exponential window function:
-        # if delta_t > 0 (pre-before-post): LTP = A_plus * exp(-delta_t / tau_plus)
-        # if delta_t < 0 (post-before-pre): LTD = -A_minus * exp(delta_t / tau_minus) (delta_t is negative here)
-        # Let tau_plus = tau_minus = self.tau_stdp_s
-        # Let A_plus = self.lr_stdp
-        # Let A_minus = self.lr_stdp * self.stdp_depression_factor (or just self.stdp_depression_factor if lr_stdp is the base magnitude)
+        # Hebbian term: Correlation of pre-synaptic and post-synaptic activity.
+        # post_spk_flat.T (shape [snn_output_size, 1]) @ pre_spk_flat (shape [1, snn_input_size])
+        # results in an outer product (shape [snn_output_size, snn_input_size]),
+        # representing correlated activity between each input and output neuron.
+        hebbian_term = torch.mm(post_spk_flat.T, pre_spk_flat)
 
-        # Simplified STDP based on delta_t sign, applied to correlated activity
-        # This is a conceptual STDP. Real biophysical STDP is spike-pair specific.
-        # Here, delta_t is a global timing difference between 'events'.
-        
-        # Calculate the Hebbian term (correlation of activity)
-        # post_spk_flat.T has shape [snn_output_size, 1]
-        # pre_spk_flat has shape [1, snn_input_size]
-        hebbian_term = torch.mm(post_spk_flat.T, pre_spk_flat) # Outer product: results in [snn_output_size, snn_input_size]
-
-        if delta_t > 0: # Potentiation (pre-before-post like)
-            # Exponential decay factor, stronger for smaller delta_t
-            timing_factor = torch.exp(-torch.abs(delta_t) / (self.tau_stdp_s + 1e-9)) # add epsilon to avoid div by zero
+        # STDP rule application based on the sign of delta_t (timing proxy)
+        if delta_t > 0: # Potentiation case (LTP, pre-before-post like)
+            # Timing factor: exponential decay based on delta_t and STDP window (tau_stdp_s).
+            # Smaller delta_t (events closer in time in the "correct" order) leads to stronger potentiation.
+            timing_factor = torch.exp(-torch.abs(delta_t) / (self.tau_stdp_s + 1e-9)) # Epsilon for stability
             delta_w = self.lr_stdp * timing_factor * hebbian_term
-        elif delta_t < 0: # Depression (post-before-pre like)
+        elif delta_t < 0: # Depression case (LTD, post-before-pre like)
             timing_factor = torch.exp(-torch.abs(delta_t) / (self.tau_stdp_s + 1e-9))
-            # Depression factor makes LTD effect smaller or different magnitude
+            # LTD is scaled by stdp_depression_factor.
             delta_w = -self.lr_stdp * self.stdp_depression_factor * timing_factor * hebbian_term
-        # If delta_t is zero, no change based on this simplified timing rule, only Hebbian if implemented differently.
+        # If delta_t is zero, no weight change occurs under this specific timing rule.
 
+        # Apply the calculated weight change
         updated_weights = current_weights_clone + delta_w
         
         # Clip weights to a reasonable range if necessary, e.g., [-1, 1] or [0, 1] if only excitatory
@@ -599,116 +595,130 @@ class SpacetimeManifold:
         """
         Main SNN processing loop. Bootstraps a concept, runs SNN simulation with STDP learning,
         and updates manifold state.
+
+        Args:
+            input_text (str): The primary concept text to process.
+
+        Returns:
+            tuple: A tuple containing:
+                - thought_steps_log (list): Chronological log of processing steps and observations.
+                - final_monologue (str): A summary string of the SNN processing outcome.
+                - spk_rec_list (list): List of numpy arrays, where each array holds the spike
+                                       data for one time step of the SNN simulation.
+                - activity_levels_list (list): List of floats representing mean SNN activity
+                                               per neuron at each time step.
+                - primary_concept_coord_tuple (tuple): The (x,y,z,t) coordinates of the
+                                                       bootstrapped primary concept.
         """
         _log_system_event("warp_manifold_start", {"input_text": input_text})
-        thought_steps_log = [] # To store logs of each step
+        thought_steps_log = [] # Stores a chronological log of processing steps
 
-        # 1. Bootstrap primary concept
+        # 1. Bootstrap Primary Concept: Convert input text to manifold coordinates and properties.
         try:
             concept_coords, concept_raw_intensity, concept_summary = self.bootstrap_concept_from_llm(input_text)
-            if concept_coords is None: # Should not happen if mock fallback works
-                _log_system_event("warp_manifold_error", {"error": "Concept bootstrapping failed critically"}, level="critical")
-                return [], "Error: Concept bootstrapping failed.", [], [], (0,0,0,0)
+            if concept_coords is None: # Should be handled by mock fallback in bootstrap if LLM fails
+                _log_system_event("warp_manifold_error", {"error": "Concept bootstrapping failed critically (returned None)"}, level="critical")
+                # Return empty/error state
+                return [], "Error: Concept bootstrapping failed critically.", [], [], (0.0, 0.0, 0.0, 0.0)
+            
             primary_concept_coord_tuple = concept_coords
-            # prev_t_intensity for STDP can be the raw intensity of the bootstrapped concept
-            # This represents the 'initial time' or 'intensity' of the stimulus.
+            # prev_t_intensity_for_stdp: Use the raw (0-1) intensity of the newly bootstrapped concept
+            # as the 'previous' time marker for the first STDP update cycle within this warp.
+            # This establishes the initial temporal context for subsequent SNN activity.
             prev_t_intensity_for_stdp = concept_raw_intensity 
-            thought_steps_log.append(f"Bootstrapped concept '{input_text}': Coords={concept_coords}, Intensity={concept_raw_intensity:.2f}, Summary: {concept_summary[:50]}...")
-        except Exception as e_bootstrap:
-            _log_system_event("warp_manifold_bootstrap_exception", {"error": str(e_bootstrap), "trace": traceback.format_exc()}, level="critical")
-            return [], f"Error during concept bootstrapping: {str(e_bootstrap)}", [], [], (0,0,0,0)
+            thought_steps_log.append(f"Bootstrapped concept '{input_text}': Coords={concept_coords}, RawIntensity={concept_raw_intensity:.2f}, Summary: {concept_summary[:50]}...")
+        except Exception as e_bootstrap: # Catch any unexpected error during bootstrapping
+            _log_system_event("warp_manifold_bootstrap_exception", {"input_text": input_text, "error": str(e_bootstrap), "trace": traceback.format_exc()}, level="critical")
+            return [], f"Error during concept bootstrapping for '{input_text}': {str(e_bootstrap)}", [], [], (0.0, 0.0, 0.0, 0.0)
 
-        # 2. Initialize SNN State
-        # Membrane potential and spikes, reset for each warp sequence
-        self.mem = self.lif1.init_leaky() # Re-initialize for the current batch_size (1)
-        # self.spk is updated in the loop. Initialize a fresh recording list.
+        # 2. Initialize SNN State for the current warp cycle:
+        # Reset membrane potential for LIF neurons. Spikes are recorded per step.
+        self.mem = self.lif1.init_leaky() # Re-initialize membrane potential for the batch (size 1)
         
-        spk_rec_list = []  # To store spike recordings at each time step
-        # mem_rec_list = [] # Optional: to store membrane potential recordings
+        spk_rec_list = []  # Stores spike recordings from each SNN time step
+        activity_levels_list = [] # Stores mean SNN activity level at each time step
         
-        # Get a clone of current weights to modify during this warp cycle
+        # Work on a clone of the current weights for this warp cycle's STDP updates.
+        # This allows accumulating changes within the cycle before applying to the model.
         current_weights = self.fc.weight.data.clone().to(self.device)
         
-        # t_intensity_diffs_list: to store how SNN activity relates to original intensity
-        # This is a placeholder for a more concrete metric.
-        # For now, let's store the mean spike count at each step as a proxy for activity level.
-        activity_levels_list = [] 
-        
-        total_stdp_change_accumulator = 0.0
-        num_stdp_updates = 0
+        total_stdp_change_accumulator = 0.0 # Accumulates magnitude of STDP changes
+        num_stdp_updates = 0 # Counts how many STDP updates occurred
 
-        # 3. SNN Simulation Loop
+        # 3. SNN Simulation Loop: Iterate over configured number of time steps.
         _log_system_event("snn_simulation_loop_start", 
                           {"time_steps": self.snn_time_steps, "concept": input_text, 
-                           "initial_intensity_for_stdp": prev_t_intensity_for_stdp}, 
+                           "initial_intensity_for_stdp_context": prev_t_intensity_for_stdp}, 
                           level="debug")
                           
         for step in range(self.snn_time_steps):
-            # --- a. Create input_features tensor ---
-            # This needs to be a tensor of size [batch_size, self.snn_input_size]
-            # Simple approach: Use concept_raw_intensity to modulate a fixed pattern or one specific input neuron.
-            # More advanced: Convert concept_coords or summary embedding to an SNN_INPUT_SIZE tensor.
-            # For now, activate the first input neuron proportionally to intensity.
+            # --- a. Create Input Features Tensor ---
+            # The input to the SNN is derived from the bootstrapped concept's properties.
+            # Current approach: Activate a subset of input neurons proportionally to concept_raw_intensity.
+            # This is a simplified representation; more complex mappings from concept features to SNN inputs are possible.
             input_features = torch.zeros(self.batch_size, self.snn_input_size, device=self.device)
             if self.snn_input_size > 0:
-                 # Spread activation across first few inputs, modulated by intensity
-                num_active_inputs = min(self.snn_input_size, max(1, self.snn_input_size // 10)) # Activate up to 10% or at least 1
-                activation_value = concept_raw_intensity 
+                # Activate a portion of input neurons (e.g., first 10% or at least one)
+                num_active_inputs = min(self.snn_input_size, max(1, self.snn_input_size // 10)) 
+                activation_value = concept_raw_intensity # Modulate activation by concept's raw intensity
                 input_features[0, :num_active_inputs] = activation_value
             
             # --- b. SNN Forward Pass ---
-            # self.fc expects input of shape [batch_size, snn_input_size]
-            # self.lif1 expects input of shape [batch_size, snn_output_size]
+            # Propagate input features through the fully connected layer and then the LIF neuron layer.
+            # self.fc: [batch_size, snn_input_size] -> [batch_size, snn_output_size]
+            # self.lif1: Processes weighted inputs to produce output spikes and updated membrane potentials.
             try:
-                current_fc_out = self.fc(input_features)
-                spk_out, self.mem = self.lif1(current_fc_out, self.mem)
-            except Exception as e_forward:
-                _log_system_event("snn_forward_pass_error", {"step": step, "error": str(e_forward), "trace": traceback.format_exc()}, level="error")
-                thought_steps_log.append(f"Error in SNN forward pass at step {step}: {e_forward}")
-                # Potentially break or handle error gracefully
-                break 
+                current_fc_out = self.fc(input_features) # Output of the dense layer
+                spk_out, self.mem = self.lif1(current_fc_out, self.mem) # Output spikes and updated membrane
+            except Exception as e_forward: # Catch errors during SNN computation
+                _log_system_event("snn_forward_pass_error", {"step": step, "concept": input_text, "error": str(e_forward), "trace": traceback.format_exc()}, level="error")
+                thought_steps_log.append(f"Error in SNN forward pass at step {step} for '{input_text}': {e_forward}")
+                break # Exit simulation loop on error
 
-            spk_rec_list.append(spk_out.clone().cpu().numpy()) # Store spikes (as numpy on CPU)
-            # mem_rec_list.append(self.mem.clone().cpu().numpy()) # Optional
+            # Record output spikes (convert to NumPy array on CPU for storage/analysis)
+            spk_rec_list.append(spk_out.clone().cpu().numpy())
 
             # --- c. STDP Learning ---
-            # pre_spk_flat for STDP is the input_features that caused spk_out
-            # post_spk_flat is spk_out
-            if torch.any(spk_out > 0) and torch.any(input_features > 0): # Only if there's activity
+            # Apply STDP if there's both pre-synaptic (input_features) and post-synaptic (spk_out) activity.
+            # This ensures learning occurs only when relevant signals are present.
+            if torch.any(spk_out > 0) and torch.any(input_features > 0):
                 updated_weights, delta_w_mean_abs = self.update_stdp(
-                    pre_spk_flat=input_features, # Shape: [1, snn_input_size]
-                    post_spk_flat=spk_out,       # Shape: [1, snn_output_size]
-                    current_weights=current_weights,
-                    concept_name=input_text,     # Use the primary concept name for context
-                    prev_t_intensity=prev_t_intensity_for_stdp # Compare to initial intensity
+                    pre_spk_flat=input_features,    # Current input to SNN
+                    post_spk_flat=spk_out,          # Resulting output spikes
+                    current_weights=current_weights,# Current weights (clone) being updated in this cycle
+                    concept_name=input_text,        # Primary concept for contextual t_intensity
+                    prev_t_intensity=prev_t_intensity_for_stdp # Temporal context from initial bootstrap
                 )
-                current_weights = updated_weights # Persist changes for the current warp cycle
+                current_weights = updated_weights # Persist STDP changes for this warp cycle
                 total_stdp_change_accumulator += delta_w_mean_abs
                 num_stdp_updates +=1
-            else:
-                delta_w_mean_abs = 0.0 # No STDP if no relevant spikes
+            else: # No STDP update if no relevant pre/post activity
+                delta_w_mean_abs = 0.0
 
-            # --- d. Log step details ---
-            current_spike_count = spk_out.sum().item()
-            activity_levels_list.append(current_spike_count / self.snn_output_size) # Store mean spike activity
+            # --- d. Log Step Details & Collect Activity Metrics ---
+            current_spike_count = spk_out.sum().item() # Total spikes in this step
+            # Mean activity: proportion of neurons firing in this step
+            activity_levels_list.append(current_spike_count / self.snn_output_size if self.snn_output_size > 0 else 0.0) 
 
             log_msg = (f"Step {step+1}/{self.snn_time_steps}: Spikes={current_spike_count}, "
-                       f"STDP_dW={delta_w_mean_abs:.4e}, Coherence={self.coherence:.3f}")
+                       f"STDP_dW_Mean={delta_w_mean_abs:.4e}, Coherence={self.coherence:.3f}")
             thought_steps_log.append(log_msg)
-            if (step + 1) % max(1, self.snn_time_steps // 10) == 0: # Log roughly 10 times
+            # Log detailed SNN step info periodically (e.g., 10 times during simulation)
+            if (step + 1) % max(1, self.snn_time_steps // 10) == 0:
                  _log_system_event("snn_simulation_step", {"step": step + 1, "total_steps": self.snn_time_steps, 
-                                                          "spikes": current_spike_count, 
+                                                          "concept": input_text, "spikes": current_spike_count, 
                                                           "stdp_dw_mean": delta_w_mean_abs, 
                                                           "coherence": self.coherence}, level="debug")
 
-        # 4. After Loop - Finalize
-        # Apply the accumulated weight changes from this warp cycle to the actual model
+        # 4. After Simulation Loop - Finalize Changes:
+        # Apply the accumulated weight changes from this warp cycle to the actual model's parameters.
         self.fc.weight.data = current_weights.to(self.device) 
         
+        # Calculate the average STDP weight change for this cycle (if any updates occurred).
         if num_stdp_updates > 0:
             self.last_avg_stdp_weight_change = total_stdp_change_accumulator / num_stdp_updates
         else:
-            self.last_avg_stdp_weight_change = 0.0
+            self.last_avg_stdp_weight_change = 0.0 # No STDP updates means no average change
         
         _log_system_event("snn_simulation_loop_end", 
                           {"concept": input_text, 
@@ -716,98 +726,115 @@ class SpacetimeManifold:
                            "final_coherence": self.coherence}, 
                           level="info")
 
-        # 5. Generate placeholder monologue and return
-        final_monologue = f"Warp manifold processing complete for '{input_text}'. Summary: {concept_summary} Coherence: {self.coherence:.3f}."
-        thought_steps_log.append(f"Final coherence: {self.coherence:.3f}, Avg STDP dW: {self.last_avg_stdp_weight_change:.4e}")
+        # 5. Generate Monologue and Return Results:
+        final_monologue = f"Warp manifold processing complete for '{input_text}'. Summary: {concept_summary} Final Coherence: {self.coherence:.3f}."
+        thought_steps_log.append(f"Final SNN coherence for '{input_text}': {self.coherence:.3f}, Avg STDP dW: {self.last_avg_stdp_weight_change:.4e}")
 
-        _log_system_event("warp_manifold_end", {"input_text": input_text, "final_coherence": self.coherence})
-        
-        # Ensure all returned lists are serializable if needed (numpy arrays converted to lists of lists)
-        # spk_rec_list already stores numpy arrays.
+        _log_system_event("warp_manifold_end", {"input_text": input_text, "final_coherence": self.coherence, "monologue_summary": final_monologue[:100]})
         
         return thought_steps_log, final_monologue, spk_rec_list, activity_levels_list, primary_concept_coord_tuple
 
     def think(self, input_text: str, stream_thought_steps: bool = False) -> tuple[list, str, dict]:
         """
         Primary interface for initiating thought processes in the SpacetimeManifold.
-        Orchestrates SNN processing (if enabled) or LLM fallback, and calculates awareness metrics.
+
+        Orchestrates SNN processing (if enabled via config.ENABLE_SNN) or falls back
+        to LLM-based concept bootstrapping. Calculates and returns awareness metrics
+        based on the processing path taken and SNN activity.
+
+        Args:
+            input_text (str): The input text, typically a concept or query to be processed.
+            stream_thought_steps (bool, optional): If True and VERBOSE_OUTPUT is enabled
+                                                   in config, prints thought steps to console.
+                                                   Defaults to False.
+
+        Returns:
+            tuple: A tuple containing:
+                - thought_steps (list): A list of strings detailing the internal processing steps.
+                - response_text (str): The primary textual output or summary from the thought process.
+                - awareness_metrics (dict): A dictionary of metrics including:
+                    - "curiosity" (float): Calculated curiosity level.
+                    - "context_stability" (float): Calculated context stability.
+                    - "self_evolution_rate" (float): Rate of SNN self-evolution (STDP change).
+                    - "coherence" (float): Current SNN coherence level.
+                    - "active_llm_fallback" (bool): True if LLM fallback was used.
+                    - "primary_concept_coord" (tuple): (x,y,z,t) coordinates of the input concept.
+                    - "snn_error" (str | None): Description of SNN error if one occurred, else None.
         """
         _log_system_event("think_start", {"input_text": input_text, "stream_steps": stream_thought_steps})
         
-        thought_steps = []
+        thought_steps = [] # Initialize list to store logs of thought process
         response_text = ""
         awareness_metrics = {
-            "curiosity": 0.1, # Default low curiosity
-            "context_stability": 0.5, # Default moderate stability
-            "self_evolution_rate": 0.0, # Default no evolution
-            "coherence": 0.0, # Default neutral coherence
-            "active_llm_fallback": True, # Assume fallback initially
-            "primary_concept_coord": (0.0, 0.0, 0.0, 0.0),
-            "snn_error": None # To store any SNN processing error
+            "curiosity": 0.1, # Default: Low curiosity
+            "context_stability": 0.5, # Default: Moderate stability
+            "self_evolution_rate": 0.0, # Default: No evolution detected
+            "coherence": 0.0, # Default: Neutral coherence
+            "active_llm_fallback": True, # Assume LLM fallback is active by default
+            "primary_concept_coord": (0.0, 0.0, 0.0, 0.0), # Default coordinates
+            "snn_error": None # Placeholder for any SNN processing errors
         }
 
-        snn_processed_successfully = False
+        snn_processed_successfully = False # Flag to track if SNN processing completed
 
+        # Path 1: SNN Processing (if enabled in config)
         if config.ENABLE_SNN:
             try:
                 _log_system_event("think_snn_path_start", {"input_text": input_text})
+                # Call warp_manifold to perform SNN simulation and learning
                 thought_steps, response_text, spk_rec_list, activity_levels, primary_coord = \
                     self.warp_manifold(input_text)
                 
-                awareness_metrics["active_llm_fallback"] = False
+                # Update awareness metrics based on SNN processing results
+                awareness_metrics["active_llm_fallback"] = False # SNN path was taken
                 awareness_metrics["primary_concept_coord"] = primary_coord
-                awareness_metrics["coherence"] = np.clip(self.coherence, -1.0, 1.0) # Ensure it's within range
-                awareness_metrics["self_evolution_rate"] = np.clip(self.last_avg_stdp_weight_change * 1000, 0.0, 1.0) # Scaled & clipped
+                awareness_metrics["coherence"] = np.clip(self.coherence, -1.0, 1.0) # Global coherence from SNN
+                # self_evolution_rate: based on average STDP weight change, scaled and clipped
+                awareness_metrics["self_evolution_rate"] = np.clip(self.last_avg_stdp_weight_change * 1000, 0.0, 1.0) 
 
-                # Calculate Curiosity
-                if spk_rec_list:
-                    # Mean spikes per neuron per time step, averaged over all time steps
+                # Calculate Curiosity metric:
+                # Based on normalized mean SNN spike activity and (1 - abs(coherence)).
+                # Higher activity and lower coherence (more dissonance) can imply higher curiosity.
+                if spk_rec_list and any(step.size > 0 for step in spk_rec_list): # Check if there are any spikes recorded
+                    # Calculate mean spikes per neuron per time step, averaged over all time steps.
                     mean_spikes_overall = np.mean([np.mean(step_spikes) for step_spikes in spk_rec_list if step_spikes.size > 0])
-                    # Normalize by configured max spike rate (e.g., if MAX_SPIKE_RATE is target spikes/sec,
-                    # and each step is, say, 1ms, then max spikes per step is MAX_SPIKE_RATE * 0.001)
-                    # This normalization needs refinement based on how MAX_SPIKE_RATE is defined.
-                    # For now, let's use a simpler normalization against a fraction of total neurons.
-                    # Max possible mean spikes if all neurons fire once: 1.0
-                    # Let's consider normalized_mean_spikes as fraction of neurons firing per step.
+                    # Normalize mean_spikes_overall to a 0-1 range. Max possible is 1.0 (all neurons fire at every step).
                     normalized_mean_spikes = np.clip(mean_spikes_overall, 0.0, 1.0) 
-                    
-                    # Curiosity: higher with more normalized SNN activity and lower (more negative or closer to zero) coherence
-                    # (indicating dissonance or interest in resolving). Let's use (1 - abs(coherence)) for exploration drive.
+                    # Combine normalized activity with a measure of dissonance (1 - abs(coherence)).
                     awareness_metrics["curiosity"] = np.clip((normalized_mean_spikes + (1.0 - abs(self.coherence))) / 2.0, 0.0, 1.0)
-                else: # No spikes recorded
-                    awareness_metrics["curiosity"] = np.clip((1.0 - abs(self.coherence)) / 2.0, 0.0, 1.0) # Curiosity from dissonance only
+                else: # No spikes recorded, curiosity driven only by coherence/dissonance
+                    awareness_metrics["curiosity"] = np.clip((1.0 - abs(self.coherence)) / 2.0, 0.0, 1.0)
 
-
-                # Calculate Context Stability
-                if activity_levels_list and len(activity_levels_list) > 1:
-                    # Lower standard deviation of activity means more stability
-                    std_dev_activity = np.std(activity_levels_list)
-                    # Normalize: Max possible std_dev is hard to define.
-                    # Let's assume if std_dev is < 0.1 of mean activity, it's stable.
-                    # Simpler: 1 minus normalized std_dev. If std_dev is 0, stability is 1.
-                    # If std_dev is large (e.g. 0.5), stability is 0.5. Max std_dev could be around 0.5 for 0/1 data.
-                    awareness_metrics["context_stability"] = np.clip(1.0 - (2*std_dev_activity), 0.0, 1.0) 
-                elif activity_levels_list and len(activity_levels_list) == 1: # Only one step/reading
-                     awareness_metrics["context_stability"] = 0.75 # Moderately stable if only one data point
+                # Calculate Context Stability metric:
+                # Based on the standard deviation of SNN activity levels over time.
+                # Lower std_dev implies more stable activity.
+                if activity_levels and len(activity_levels) > 1:
+                    std_dev_activity = np.std(activity_levels)
+                    # Normalize stability: 1.0 for zero std_dev, decreasing as std_dev increases.
+                    # Max std_dev for 0/1 data is ~0.5. (2*std_dev) maps this to a 0-1 range for stability.
+                    awareness_metrics["context_stability"] = np.clip(1.0 - (2 * std_dev_activity), 0.0, 1.0) 
+                elif activity_levels and len(activity_levels) == 1: # Single activity reading
+                     awareness_metrics["context_stability"] = 0.75 # Moderately stable by default
                 else: # No activity levels recorded
-                    awareness_metrics["context_stability"] = 0.25 # Low stability if no SNN activity data
+                    awareness_metrics["context_stability"] = 0.25 # Low stability
 
-                snn_processed_successfully = True
+                snn_processed_successfully = True # Mark SNN path as successful
                 _log_system_event("think_snn_path_complete", {"input_text": input_text, "metrics": awareness_metrics})
 
-            except Exception as e_snn_warp:
+            except Exception as e_snn_warp: # Handle errors during SNN processing
                 _log_system_event("think_snn_path_error", 
                                   {"input_text": input_text, "error": str(e_snn_warp), "trace": traceback.format_exc()}, 
                                   level="critical")
-                response_text = f"An error occurred during SNN processing: {str(e_snn_warp)}. Falling back to LLM."
+                response_text = f"An error occurred during SNN processing for '{input_text}': {str(e_snn_warp)}. Falling back to LLM."
                 thought_steps.append(response_text)
-                awareness_metrics["snn_error"] = str(e_snn_warp)
-                # Fall through to LLM fallback, snn_processed_successfully remains False
+                awareness_metrics["snn_error"] = str(e_snn_warp) # Record the SNN error
+                # snn_processed_successfully remains False, will trigger LLM fallback
         
-        if not snn_processed_successfully: # SNN disabled or SNN error occurred
+        # Path 2: LLM Fallback (if SNN disabled or SNN error occurred)
+        if not snn_processed_successfully:
             _log_system_event("think_llm_fallback_path_start", 
                               {"input_text": input_text, 
-                               "reason": "SNN disabled" if not config.ENABLE_SNN else "SNN error"}, 
+                               "reason": "SNN disabled in config" if not config.ENABLE_SNN else "SNN processing error"}, 
                               level="info")
             try:
                 concept_coords, concept_raw_intensity, concept_summary = \

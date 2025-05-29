@@ -8,14 +8,15 @@ This module includes functionalities for:
 - Filtering memories based on ethical alignment and novelty thresholds.
 """
 
+import datetime
+import json
 import os
 import sys
-import json
-import hashlib
-import uuid # For generating unique memory IDs
-import time # For timestamps and test delays
-import datetime # For timestamps
-import numpy as np # For numerical operations, e.g., novelty calculation
+import time
+import traceback # Promoted to top-level
+import uuid
+
+import numpy as np
 
 # Attempt to import configuration from the parent package
 try:
@@ -106,119 +107,117 @@ def _load_knowledge_graph():
     Loads the knowledge graph from the path specified in config.
     Handles file not found, empty file, and malformed JSON.
     Initializes to an empty graph structure if loading fails or file doesn't exist.
-    Sets _kg_dirty_flag to False.
+    Sets the module-global `_kg_dirty_flag` to False after loading, as the in-memory
+    graph is considered synchronized with the loaded state (or a fresh default).
     """
     global _knowledge_graph, _kg_dirty_flag, config # Ensure config is accessible
     
-    # Add traceback import if not already present at module level
-    # import traceback # Already imported at module level
-
     if not config or not hasattr(config, 'KNOWLEDGE_GRAPH_PATH'):
         _log_memory_event("load_kg_failure", {"error": "Config not available or KNOWLEDGE_GRAPH_PATH not set"}, level="critical")
-        _knowledge_graph = {"nodes": [], "edges": []} # Default structure
-        _kg_dirty_flag = False # Considered clean as it's a fresh default
+        _knowledge_graph = {"nodes": [], "edges": []} # Initialize with a default empty structure
+        _kg_dirty_flag = False # Considered "clean" as it's a fresh default state
         return
 
     kg_path = config.KNOWLEDGE_GRAPH_PATH
-    # Ensure directory exists using config's utility if available, else basic os.makedirs
+    # Ensure the directory for the knowledge graph file exists.
+    # Uses config.ensure_path if available, otherwise uses os.makedirs directly.
     if hasattr(config, 'ensure_path'):
-        config.ensure_path(kg_path) 
-    else:
-        os.makedirs(os.path.dirname(kg_path), exist_ok=True)
-
+        config.ensure_path(kg_path) # ensure_path handles parent directory creation
+    else: # Fallback if config.ensure_path is not available for some reason
+        parent_dir = os.path.dirname(kg_path)
+        if parent_dir: # Ensure parent_dir is not empty (e.g. if kg_path is just a filename)
+            os.makedirs(parent_dir, exist_ok=True)
 
     try:
+        # Handle cases: file doesn't exist or is empty.
         if not os.path.exists(kg_path) or os.path.getsize(kg_path) == 0:
             _log_memory_event("load_kg_info", {"message": "Knowledge graph file not found or empty. Initializing new graph.", "path": kg_path}, level="info")
-            _knowledge_graph = {"nodes": [], "edges": []}
-            # Consider this a "change" that needs saving if we want the empty file created on disk immediately.
-            # For now, _load_knowledge_graph sets dirty_flag to False, implying this state is "saved" (as empty).
-            # If an empty file should be written, _save_knowledge_graph would need to be called here with dirty_flag = True.
-            # Let's assume creating an empty graph in memory is "clean" until modified by other functions.
+            _knowledge_graph = {"nodes": [], "edges": []} # Initialize with default structure
+            # This state is considered "clean" as it represents a newly initialized graph.
+            # If an empty file should be explicitly written to disk at this point,
+            # _save_knowledge_graph would need to be called (and dirty flag managed accordingly).
             _kg_dirty_flag = False 
             return
 
+        # Attempt to open and load JSON data from the file.
         with open(kg_path, 'r') as f:
             data = json.load(f)
 
-        if isinstance(data, dict) and "nodes" in data and isinstance(data["nodes"], list)            and "edges" in data and isinstance(data["edges"], list):
-            _knowledge_graph = data
-            _kg_dirty_flag = False
+        # Validate the loaded data structure.
+        if isinstance(data, dict) and \
+           "nodes" in data and isinstance(data["nodes"], list) and \
+           "edges" in data and isinstance(data["edges"], list):
+            _knowledge_graph = data # Assign loaded data to the global variable
+            _kg_dirty_flag = False # Successfully loaded, so in-memory is synchronized
             _log_memory_event("load_kg_success", {"path": kg_path, "nodes_loaded": len(data["nodes"]), "edges_loaded": len(data["edges"])}, level="info")
-        else:
+        else: # Malformed structure (e.g., missing 'nodes' or 'edges' keys, or they are not lists)
             _log_memory_event("load_kg_malformed_structure", {"path": kg_path, "error": "Root must be dict with 'nodes' and 'edges' lists."}, level="error")
-            _knowledge_graph = {"nodes": [], "edges": []}
-            _kg_dirty_flag = False # Defaulted, so considered "clean" from this load.
+            _knowledge_graph = {"nodes": [], "edges": []} # Reset to default
+            _kg_dirty_flag = False # Considered "clean" as it's reset to a default state
             
-    except json.JSONDecodeError as e:
+    except json.JSONDecodeError as e: # Handle errors during JSON parsing
         _log_memory_event("load_kg_json_decode_error", {"path": kg_path, "error": str(e)}, level="error")
-        _knowledge_graph = {"nodes": [], "edges": []}
+        _knowledge_graph = {"nodes": [], "edges": []} # Reset to default
         _kg_dirty_flag = False
-    except Exception as e:
-        # Ensure traceback is imported for full error details
-        import traceback # Redundant if already at top but ensures availability
+    except Exception as e: # Catch any other unexpected errors during file operations or loading
         _log_memory_event("load_kg_unknown_error", {"path": kg_path, "error": str(e), "trace": traceback.format_exc()}, level="critical")
-        _knowledge_graph = {"nodes": [], "edges": []}
+        _knowledge_graph = {"nodes": [], "edges": []} # Reset to default
         _kg_dirty_flag = False
 
 def _save_knowledge_graph():
     """
-    Saves the current state of _knowledge_graph to disk if changes have been made.
-    Uses the _kg_dirty_flag to determine if a save is necessary.
-    Sets _kg_dirty_flag to False after a successful save.
+    Saves the current state of the module-global `_knowledge_graph` to disk if changes
+    have been made (indicated by `_kg_dirty_flag`).
+    Uses an atomic write operation (write to temp file, then rename/replace) to prevent
+    data corruption. Sets `_kg_dirty_flag` to False after a successful save.
     """
     global _kg_dirty_flag # To modify the flag
-    # Ensure traceback is available for logging detailed errors
-    import traceback 
 
-    if not _kg_dirty_flag:
-        _log_memory_event("save_kg_skipped", {"message": "No changes to save."}, level="debug")
+    if not _kg_dirty_flag: # Only save if there are pending changes
+        _log_memory_event("save_kg_skipped", {"message": "No changes to save (_kg_dirty_flag is False)."}, level="debug")
         return
 
     if not config or not hasattr(config, 'KNOWLEDGE_GRAPH_PATH'):
         _log_memory_event("save_kg_failure", {"error": "Config not available or KNOWLEDGE_GRAPH_PATH not set"}, level="critical")
-        # Cannot clear dirty flag if save failed due to config issue, as changes are still pending.
+        # Do not reset _kg_dirty_flag as changes are still pending and unsaved.
         return
 
     kg_path = config.KNOWLEDGE_GRAPH_PATH
-    # Ensure directory exists using config's utility if available, else basic os.makedirs
+    # Ensure the directory for the knowledge graph file exists.
     if hasattr(config, 'ensure_path'):
-        config.ensure_path(kg_path) 
-    else: # Fallback if ensure_path is somehow not on config object
-        os.makedirs(os.path.dirname(kg_path), exist_ok=True)
+        config.ensure_path(kg_path)
+    else: # Fallback
+        parent_dir = os.path.dirname(kg_path)
+        if parent_dir:
+             os.makedirs(parent_dir, exist_ok=True)
 
+    temp_kg_path = kg_path + ".tmp" # Define temporary file path for atomic write
 
     try:
-        # Atomicity: Write to a temporary file first, then rename.
-        # This prevents data corruption if the program crashes during write.
-        temp_kg_path = kg_path + ".tmp"
-        
+        # Atomicity Step 1: Write the current graph to a temporary file.
+        # Using indent=4 for human-readable JSON output.
         with open(temp_kg_path, 'w') as f:
-            json.dump(_knowledge_graph, f, indent=4) # Indent for readability
+            json.dump(_knowledge_graph, f, indent=4)
         
-        # On Unix-like systems, os.rename is atomic. 
-        # On Windows, if dest exists, os.replace is better, or os.rename might error.
-        # os.replace will atomically replace the destination if it exists.
-        if sys.platform == "win32": # sys needs to be imported
-            os.replace(temp_kg_path, kg_path)
-        else:
-            os.rename(temp_kg_path, kg_path)
+        # Atomicity Step 2: Replace the original file with the temporary file.
+        # os.replace is atomic on Windows and POSIX (if target exists and permissions allow).
+        # os.rename might fail on Windows if the destination exists.
+        os.replace(temp_kg_path, kg_path) # Preferred for atomicity if destination might exist
 
         _kg_dirty_flag = False # Reset dirty flag only after successful write and rename
         _log_memory_event("save_kg_success", {"path": kg_path, "nodes_saved": len(_knowledge_graph["nodes"]), "edges_saved": len(_knowledge_graph["edges"])}, level="info")
     
-    except IOError as e_io:
-        _log_memory_event("save_kg_io_error", {"path": kg_path, "error": str(e_io), "trace": traceback.format_exc()}, level="critical")
-        # Do not reset dirty flag, as changes were not persisted.
-        # Consider removing temp file if it exists
+    except IOError as e_io: # Handle file I/O specific errors
+        _log_memory_event("save_kg_io_error", {"path": kg_path, "temp_path": temp_kg_path, "error": str(e_io), "trace": traceback.format_exc()}, level="critical")
+        # Do not reset dirty flag. Attempt to clean up the temporary file if it exists.
         if os.path.exists(temp_kg_path):
             try:
                 os.remove(temp_kg_path)
             except Exception as e_rm:
-                 _log_memory_event("save_kg_temp_file_cleanup_error", {"path": temp_kg_path, "error": str(e_rm)}, level="error")
-    except Exception as e:
-        _log_memory_event("save_kg_unknown_error", {"path": kg_path, "error": str(e), "trace": traceback.format_exc()}, level="critical")
-        # Do not reset dirty flag.
+                 _log_memory_event("save_kg_temp_file_cleanup_error_io", {"path": temp_kg_path, "error": str(e_rm)}, level="error")
+    except Exception as e: # Handle other unexpected errors during save
+        _log_memory_event("save_kg_unknown_error", {"path": kg_path, "temp_path": temp_kg_path, "error": str(e), "trace": traceback.format_exc()}, level="critical")
+        # Do not reset dirty flag. Attempt to clean up the temporary file.
         if os.path.exists(temp_kg_path):
             try:
                 os.remove(temp_kg_path)
@@ -241,128 +240,125 @@ def calculate_novelty(concept_coord: tuple, concept_summary: str) -> float:
     """
     _log_memory_event("calculate_novelty_start", {"coord_len": len(concept_coord) if isinstance(concept_coord, tuple) else -1, "summary_len": len(concept_summary)}, level="debug")
 
-    if not config:
-        _log_memory_event("calculate_novelty_error", {"error": "Config not loaded"}, level="error")
-        return 0.0 # Cannot calculate novelty without config for range and weights
+    if not config: # Ensure config is loaded, as it contains parameters for calculation
+        _log_memory_event("calculate_novelty_error", {"error": "Config module not loaded, cannot calculate novelty."}, level="error")
+        return 0.0 # Default to non-novel if config is unavailable
 
-    # Validate concept_coord
+    # Validate input: concept_coord should be a 4-tuple of numeric values.
     if not isinstance(concept_coord, tuple) or len(concept_coord) != 4:
-        _log_memory_event("calculate_novelty_error", {"error": "Invalid concept_coord format", "coord": str(concept_coord)}, level="warning")
-        return 0.0 # Or a default low novelty for invalid input
-
+        _log_memory_event("calculate_novelty_error", {"error": "Invalid concept_coord format (must be 4-tuple).", "coord_received": str(concept_coord)}, level="warning")
+        return 0.0 
     try:
-        # Ensure coordinates are numeric
+        # Convert coordinates to a NumPy array of floats for vectorized operations.
         current_coord_np = np.array([float(c) for c in concept_coord])
-    except (ValueError, TypeError) as e:
-        _log_memory_event("calculate_novelty_error", {"error": f"Invalid coordinate values: {str(e)}", "coord": str(concept_coord)}, level="warning")
+    except (ValueError, TypeError) as e: # Handle non-numeric coordinates
+        _log_memory_event("calculate_novelty_error", {"error": f"Invalid coordinate values (must be numeric): {str(e)}", "coord_received": str(concept_coord)}, level="warning")
         return 0.0
 
-    # --- Spatial Novelty ---
-    spatial_novelty_score = 1.0
-    if _knowledge_graph["nodes"]:
-        min_dist_sq = float('inf') # Using squared distance to avoid sqrt until the end
+    # --- Spatial Novelty Calculation ---
+    # Spatial novelty is based on the minimum normalized Euclidean distance to existing nodes in the KG.
+    # A higher distance implies higher novelty.
+    spatial_novelty_score = 1.0 # Default to max novelty if no existing nodes or other issues.
+    
+    if _knowledge_graph["nodes"]: # Only calculate if there are existing nodes to compare against.
+        min_dist_sq_normalized = float('inf') # Initialize with a very large value for squared distance.
         
-        # Normalization: Assuming coordinates are generally within +/- MANIFOLD_RANGE/2 or 0 to MANIFOLD_RANGE.
-        # A simple normalization factor can be MANIFOLD_RANGE. If a coordinate is MANIFOLD_RANGE away, normalized distance is 1.
-        # The brain module's bootstrap_concept_from_llm maps to +/- half_range for X, and 0 to half_range for Y,Z,T_coord.
-        # So, the effective range span for each dimension is MANIFOLD_RANGE.
-        # Normalizing factor for each dimension's difference could be MANIFOLD_RANGE.
-        # (coord_diff / MANIFOLD_RANGE)^2
-        
+        # Normalization factor for coordinates. MANIFOLD_RANGE from config defines the typical
+        # extent of a single dimension in the coordinate space. Distances are normalized by this range.
         norm_factor = config.MANIFOLD_RANGE 
-        if norm_factor == 0: # Avoid division by zero if range is misconfigured
-            _log_memory_event("calculate_novelty_warning", {"warning": "MANIFOLD_RANGE is 0. Cannot normalize spatial distance."}, level="warning")
-            # Spatial novelty will remain 1.0 as min_dist_sq won't be updated meaningfully if factor is 0 or 1.
-            # Or could return a default low novelty. For now, effectively skips true spatial calc.
-            norm_factor = 1.0 # Avoid division by zero, but makes normalization ineffective
+        if norm_factor == 0: # Prevent division by zero if MANIFOLD_RANGE is misconfigured.
+            _log_memory_event("calculate_novelty_warning", {"warning": "MANIFOLD_RANGE is 0. Spatial distance normalization will be ineffective."}, level="warning")
+            norm_factor = 1.0 # Use 1.0 to avoid error, though normalization becomes identity.
 
-        processed_node_coords = 0
+        processed_node_coords = 0 # Counter for nodes with valid coordinates.
         for node in _knowledge_graph["nodes"]:
-            node_coord_data = node.get("coordinates")
+            node_coord_data = node.get("coordinates") # Existing node's coordinates
             if isinstance(node_coord_data, (list, tuple)) and len(node_coord_data) == 4:
                 try:
                     node_coord_np = np.array([float(c) for c in node_coord_data])
-                    # Calculate normalized squared Euclidean distance for 4D
-                    # (dx/range)^2 + (dy/range)^2 + (dz/range)^2 + (dt/range)^2
+                    # Calculate squared Euclidean distance, normalized by norm_factor for each dimension.
+                    # diff_sq_normalized = sum(((current_coord_dim - node_coord_dim) / norm_factor)^2)
                     diff_sq_normalized = np.sum(((current_coord_np - node_coord_np) / norm_factor)**2)
-                    min_dist_sq = min(min_dist_sq, diff_sq_normalized)
+                    min_dist_sq_normalized = min(min_dist_sq_normalized, diff_sq_normalized)
                     processed_node_coords += 1
-                except (ValueError, TypeError):
-                    _log_memory_event("calculate_novelty_node_coord_error", {"node_id": node.get("id"), "coord": str(node_coord_data)}, level="debug")
-                    continue # Skip malformed node coordinate
+                except (ValueError, TypeError): # Skip nodes with malformed coordinates.
+                    _log_memory_event("calculate_novelty_node_coord_error", {"node_id": node.get("id"), "coord_data": str(node_coord_data)}, level="debug")
+                    continue 
 
-        if processed_node_coords > 0 and min_dist_sq != float('inf'):
-            # min_dist_normalized is sqrt of sum of squared normalized differences. Max value could be sqrt(4) if each dim diff is 1.
-            min_dist_normalized = np.sqrt(min_dist_sq)
-            # Spatial novelty: higher if min_dist_normalized is larger.
-            # Clip at 1.0 (e.g. if min_dist_normalized > 1, it's fully novel)
-            # A simple linear scale: min_dist_normalized / max_possible_normalized_dist (e.g. sqrt(4)=2)
-            # Or, more commonly, use an exponential: 1 - exp(-k * min_dist_normalized)
-            # For now, let's use a direct approach: further away = more novel.
-            # If min_dist_normalized is 0, novelty is 0. If it's large (e.g. >1), novelty is 1.
-            spatial_novelty_score = np.clip(min_dist_normalized, 0.0, 1.0) # Assuming normalized distance directly maps to novelty score up to 1.0
-                                                                        # This means if an item is '1 unit of normalized distance' away, it's fully novel.
-                                                                        # This might need tuning. Perhaps (min_dist_normalized / max_expected_dist_for_similarity)
-    _log_memory_event("calculate_novelty_spatial", {"score": spatial_novelty_score, "nodes_compared": len(_knowledge_graph['nodes'])}, level="debug")
+        if processed_node_coords > 0 and min_dist_sq_normalized != float('inf'):
+            # Convert minimum squared normalized distance to actual distance.
+            min_dist_normalized = np.sqrt(min_dist_sq_normalized)
+            # Spatial novelty score: Linearly maps normalized distance to novelty.
+            # A distance of 0 implies 0 novelty. A distance of 1.0 (or more) implies full novelty.
+            # This assumes that if a concept is 1 "manifold unit" away (after normalization), it's fully novel.
+            # This mapping might need tuning depending on desired sensitivity.
+            spatial_novelty_score = np.clip(min_dist_normalized, 0.0, 1.0)
+            
+    _log_memory_event("calculate_novelty_spatial", {"score": spatial_novelty_score, "nodes_compared": len(_knowledge_graph.get('nodes',[]))}, level="debug")
 
+    # --- Textual Novelty Calculation ---
+    # Textual novelty is based on the maximum Jaccard similarity between the concept's summary
+    # and summaries of existing nodes. Novelty = 1 - max_similarity.
+    textual_novelty_score = 1.0 # Default to max novelty.
+    
+    if _knowledge_graph["nodes"] and concept_summary: # Requires existing nodes and a non-empty summary.
+        max_jaccard_similarity = 0.0
+        current_summary_lower = concept_summary.lower() # Case-insensitive comparison.
+        current_tokens = set(current_summary_lower.split()) # Tokenize summary into a set of words.
 
-    # --- Textual Novelty ---
-    textual_novelty_score = 1.0
-    if _knowledge_graph["nodes"] and concept_summary:
-        max_similarity = 0.0
-        current_summary_lower = concept_summary.lower()
-        current_tokens = set(current_summary_lower.split())
-
-        if not current_tokens: # Empty summary
-            textual_novelty_score = 0.5 # Neutral novelty if no text to compare
+        if not current_tokens: # If current summary is empty or only whitespace.
+            textual_novelty_score = 0.5 # Assign neutral novelty.
         else:
             processed_text_nodes = 0
             for node in _knowledge_graph["nodes"]:
                 node_summary = node.get("summary")
-                if isinstance(node_summary, str) and node_summary:
+                if isinstance(node_summary, str) and node_summary: # Check if node has a valid summary.
                     node_summary_lower = node_summary.lower()
                     node_tokens = set(node_summary_lower.split())
                     
-                    if not node_tokens: continue
+                    if not node_tokens: continue # Skip comparison if existing node's summary is empty.
 
-                    # Jaccard Similarity
-                    intersection = len(current_tokens.intersection(node_tokens))
-                    union = len(current_tokens.union(node_tokens))
-                    if union == 0: # Both summaries are effectively empty or only share stop words that got filtered
+                    # Calculate Jaccard Similarity: intersection_size / union_size
+                    intersection_size = len(current_tokens.intersection(node_tokens))
+                    union_size = len(current_tokens.union(node_tokens))
+                    
+                    if union_size == 0: # Both summaries effectively empty (e.g. only common stop words if not filtered)
                         similarity = 1.0 if not current_tokens and not node_tokens else 0.0
                     else:
-                        similarity = intersection / union
+                        similarity = intersection_size / union_size
                     
-                    max_similarity = max(max_similarity, similarity)
+                    max_jaccard_similarity = max(max_jaccard_similarity, similarity)
                     processed_text_nodes += 1
             
-            if processed_text_nodes > 0 :
-                textual_novelty_score = 1.0 - max_similarity
+            if processed_text_nodes > 0: # If compared against at least one node.
+                textual_novelty_score = 1.0 - max_jaccard_similarity # Higher similarity means lower novelty.
     
-    _log_memory_event("calculate_novelty_textual", {"score": textual_novelty_score, "nodes_compared": len(_knowledge_graph['nodes'])}, level="debug")
+    _log_memory_event("calculate_novelty_textual", {"score": textual_novelty_score, "nodes_compared": len(_knowledge_graph.get('nodes',[]))}, level="debug")
 
-    # --- Combine Novelties ---
-    # Ensure weights sum to 1 or are handled appropriately if not. Assume they do for now.
+    # --- Combine Spatial and Textual Novelties ---
+    # Weighted average of spatial and textual novelty scores.
+    # Weights are sourced from config, defaulting to 0.5 each.
     spatial_weight = float(getattr(config, 'SPATIAL_NOVELTY_WEIGHT', 0.5))
     textual_weight = float(getattr(config, 'TEXTUAL_NOVELTY_WEIGHT', 0.5))
     
-    # Normalize weights if they don't sum to 1 (simple normalization)
+    # Normalize weights to ensure they sum to 1, or handle sum of 0.
     total_weight = spatial_weight + textual_weight
-    if total_weight == 0: # Avoid division by zero, default to equal weighting if both are zero
-        if spatial_novelty_score > 0 or textual_novelty_score > 0: # if any component has novelty
+    if total_weight == 0: # If both weights are zero
+        # If either component score is positive, default to equal weighting to reflect that novelty.
+        # Otherwise, if both scores are 0, the result is 0.
+        if spatial_novelty_score > 0 or textual_novelty_score > 0:
             spatial_weight = 0.5
             textual_weight = 0.5
-            total_weight = 1.0
-        else: # if both scores are 0, weights don't matter, result is 0
+            total_weight = 1.0 # Corrected total_weight for averaging
+        else: # Both scores are 0, weights are 0, so final novelty is 0.
              final_novelty_score = 0.0
     
-    if total_weight > 0 : # Proceed with weighted average if total_weight is positive
-        final_novelty_score = ((spatial_novelty_score * spatial_weight) +                                (textual_novelty_score * textual_weight)) / total_weight
-    else: # handles case where weights were zero and scores were zero
-        final_novelty_score = 0.0
+    if total_weight > 0: # Calculate weighted average if total_weight is positive.
+        final_novelty_score = ((spatial_novelty_score * spatial_weight) + \
+                               (textual_novelty_score * textual_weight)) / total_weight
+    # If total_weight was initially 0 and scores were also 0, final_novelty_score is already 0.
 
-
-    final_novelty_score = np.clip(final_novelty_score, 0.0, 1.0)
+    final_novelty_score = np.clip(final_novelty_score, 0.0, 1.0) # Ensure score is within [0,1].
     
     _log_memory_event("calculate_novelty_final", {"score": final_novelty_score, 
                                                  "spatial_raw": spatial_novelty_score, "textual_raw": textual_novelty_score,
@@ -389,115 +385,137 @@ def store_memory(concept_name: str, concept_coord: tuple, summary: str,
     Returns:
         True if the memory was stored, False otherwise.
     """
-    global _kg_dirty_flag # To set it True when graph is modified
-    # Ensure traceback is available for logging detailed errors
-    import traceback
+    global _kg_dirty_flag # Flag to indicate that the in-memory graph has changed and needs saving.
 
     _log_memory_event("store_memory_attempt", 
-                      {"concept_name": concept_name, "coord_len": len(concept_coord) if isinstance(concept_coord, tuple) else -1, 
+                      {"concept_name": concept_name, 
+                       "coord_len": len(concept_coord) if isinstance(concept_coord, tuple) else -1, 
                        "ethical_alignment": ethical_alignment}, 
                       level="debug")
 
-    if not config:
-        _log_memory_event("store_memory_failure", {"concept_name": concept_name, "error": "Config not loaded"}, level="critical")
+    if not config: # Critical dependency: config for thresholds.
+        _log_memory_event("store_memory_failure", {"concept_name": concept_name, "error": "Config module not loaded."}, level="critical")
         return False
 
-    # 1. Validate inputs (basic validation)
+    # --- 1. Input Validation ---
+    # Ensure essential data fields are present and have the correct basic format.
     if not all([concept_name, isinstance(concept_coord, tuple), len(concept_coord) == 4, summary is not None]):
-        _log_memory_event("store_memory_invalid_input", {"concept_name": concept_name, "reason": "Missing or invalid core inputs"}, level="warning")
+        _log_memory_event("store_memory_invalid_input", 
+                          {"concept_name": concept_name, "reason": "Missing or invalid format for core inputs (name, coord, summary)."}, 
+                          level="warning")
         return False
     try:
-        # Ensure coordinates are numeric
+        # Convert potentially stringified numeric inputs to their correct types.
         numeric_coord = tuple(float(c) for c in concept_coord)
         float_intensity = float(intensity)
         float_ethical_alignment = float(ethical_alignment)
-    except (ValueError, TypeError) as e:
-        _log_memory_event("store_memory_invalid_input_type", {"concept_name": concept_name, "error": str(e)}, level="warning")
+    except (ValueError, TypeError) as e: # Handle errors if conversion fails.
+        _log_memory_event("store_memory_invalid_input_type", 
+                          {"concept_name": concept_name, "error": f"Type conversion failed for numeric fields: {str(e)}"}, 
+                          level="warning")
         return False
 
-    # 2. Calculate Novelty
+    # --- 2. Calculate Novelty Score ---
+    # Determines how new or different this concept is compared to existing memories.
     novelty_score = calculate_novelty(numeric_coord, summary)
 
-    # 3. Check Thresholds
+    # --- 3. Check Thresholds for Storage ---
+    # Retrieve thresholds from config, with defaults if not specified.
     novelty_threshold = float(getattr(config, 'MEMORY_NOVELTY_THRESHOLD', 0.5))
     ethical_threshold = float(getattr(config, 'MEMORY_ETHICAL_THRESHOLD', 0.5))
 
+    # Reject if novelty is below threshold.
     if novelty_score < novelty_threshold:
         _log_memory_event("store_memory_rejected_novelty", 
                           {"concept_name": concept_name, "novelty_score": novelty_score, "threshold": novelty_threshold}, 
                           level="info")
         return False
 
+    # Reject if ethical alignment is below threshold.
     if float_ethical_alignment < ethical_threshold:
         _log_memory_event("store_memory_rejected_ethical", 
                           {"concept_name": concept_name, "ethical_score": float_ethical_alignment, "threshold": ethical_threshold}, 
                           level="info")
         return False
 
-    # 4. Store Memory if accepted
+    # --- 4. Store Memory in Knowledge Graph ---
+    # If all checks pass, create and store the new memory node.
     try:
-        # Ensure uuid is imported. Worker added 'import uuid' at top in previous step.
-        memory_id = uuid.uuid4().hex 
-        timestamp = datetime.datetime.utcnow().isoformat() + "Z"
+        memory_id = uuid.uuid4().hex # Generate a unique ID for the new memory.
+        timestamp = datetime.datetime.utcnow().isoformat() + "Z" # ISO 8601 format UTC timestamp.
 
+        # Construct the new node dictionary.
         new_node = {
             "id": memory_id,
-            "label": str(concept_name), # Ensure it's a string
-            "coordinates": numeric_coord, # Store validated numeric coordinates
-            "summary": str(summary),
-            "intensity": float_intensity, # Store validated float
-            "raw_t_intensity_at_storage": float_intensity, # Explicitly store the intensity value used for 't' in some contexts
+            "label": str(concept_name), # Ensure label is a string.
+            "coordinates": numeric_coord, # Store validated numeric coordinates.
+            "summary": str(summary), # Ensure summary is a string.
+            "intensity": float_intensity, # Store validated float intensity.
+            "raw_t_intensity_at_storage": float_intensity, # Explicitly store for potential future reference.
             "ethical_alignment_at_storage": float_ethical_alignment,
             "novelty_at_storage": novelty_score,
             "timestamp": timestamp,
-            "type": "concept_memory" # Example type
+            "type": "concept_memory" # Categorize the node type (can be expanded).
         }
-        _knowledge_graph["nodes"].append(new_node)
+        _knowledge_graph["nodes"].append(new_node) # Add the new node to the in-memory graph.
         
-        # Handle related_concepts (rudimentary for now: assumes related_concepts are IDs)
-        # A more robust system would look up names to get IDs if names are passed.
+        # Handle relationships to other concepts if `related_concepts` is provided.
         if related_concepts and isinstance(related_concepts, list):
-            for related_id_or_name in related_concepts:
+            for related_item_specifier in related_concepts:
                 target_node_id = None
-                if isinstance(related_id_or_name, str):
-                    # Attempt to find if it's an ID or a name
-                    # Simple check: if it looks like a UUID hex, assume ID. Otherwise, search by name.
-                    is_likely_id = len(related_id_or_name) == 32 and all(c in '0123456789abcdef' for c in related_id_or_name.lower())
+                if isinstance(related_item_specifier, str):
+                    # Attempt to resolve specifier: first as ID, then as name.
+                    is_likely_id = len(related_item_specifier) == 32 and all(c in '0123456789abcdef' for c in related_item_specifier.lower())
                     
-                    if is_likely_id:
-                        # Check if this ID exists
-                        if any(node['id'] == related_id_or_name for node in _knowledge_graph['nodes']):
-                            target_node_id = related_id_or_name
-                        else:
-                             _log_memory_event("store_memory_relation_target_id_not_found", {"source_id": memory_id, "target_spec": related_id_or_name}, level="warning")
-                    else: # Assume it's a name, find its ID
-                        found_nodes = [node['id'] for node in _knowledge_graph['nodes'] if node.get('label') == related_id_or_name]
+                    if is_likely_id: # If it looks like a UUID hex.
+                        # Check if a node with this ID already exists.
+                        if any(node['id'] == related_item_specifier for node in _knowledge_graph['nodes']):
+                            target_node_id = related_item_specifier
+                        else: # Target ID specified but not found.
+                             _log_memory_event("store_memory_relation_target_id_not_found", 
+                                               {"source_id": memory_id, "target_id_spec": related_item_specifier}, 
+                                               level="warning")
+                    else: # Assume it's a concept name; search for its ID.
+                        # This finds the first node matching the label. Could be enhanced for multiple matches.
+                        found_nodes = [node['id'] for node in _knowledge_graph['nodes'] if node.get('label') == related_item_specifier]
                         if found_nodes:
-                            target_node_id = found_nodes[0] # Take the first match if multiple
-                            if len(found_nodes) > 1:
-                                _log_memory_event("store_memory_relation_multiple_targets_by_name", {"source_id": memory_id, "target_name": related_id_or_name, "selected_id": target_node_id}, level="warning")
-                        else:
-                            _log_memory_event("store_memory_relation_target_name_not_found", {"source_id": memory_id, "target_name": related_id_or_name}, level="warning")
+                            target_node_id = found_nodes[0] # Use the ID of the first match.
+                            if len(found_nodes) > 1: # Log if multiple nodes match the name.
+                                _log_memory_event("store_memory_relation_multiple_targets_by_name", 
+                                                  {"source_id": memory_id, "target_name": related_item_specifier, "selected_id": target_node_id, "all_found_ids": found_nodes}, 
+                                                  level="warning")
+                        else: # Target name specified but no node found with that label.
+                            _log_memory_event("store_memory_relation_target_name_not_found", 
+                                              {"source_id": memory_id, "target_name": related_item_specifier}, 
+                                              level="warning")
                 
-                if target_node_id:
+                if target_node_id: # If a valid target ID was found.
+                    # Create a new edge to represent the relationship.
                     new_edge = {
-                        "id": uuid.uuid4().hex, # Unique ID for the edge
-                        "source": memory_id,
-                        "target": target_node_id,
-                        "relation_type": "related_to", # Default relation type
-                        "timestamp": timestamp
+                        "id": uuid.uuid4().hex, # Unique ID for the edge itself.
+                        "source": memory_id, # ID of the new memory node.
+                        "target": target_node_id, # ID of the related memory node.
+                        "relation_type": "related_to", # Default relationship type.
+                        "timestamp": timestamp # Timestamp of relationship creation.
                     }
-                    _knowledge_graph["edges"].append(new_edge)
-                    _log_memory_event("store_memory_relation_added", {"source_id": memory_id, "target_id": target_node_id}, level="debug")
+                    _knowledge_graph["edges"].append(new_edge) # Add edge to in-memory graph.
+                    _log_memory_event("store_memory_relation_added", 
+                                      {"source_id": memory_id, "target_id": target_node_id, "edge_id": new_edge["id"]}, 
+                                      level="debug")
 
-        _kg_dirty_flag = True
-        _save_knowledge_graph() # Attempt to save immediately
+        _kg_dirty_flag = True # Mark the graph as modified.
+        _save_knowledge_graph() # Attempt to save the updated graph to disk immediately.
 
-        _log_memory_event("store_memory_success", {"memory_id": memory_id, "concept_name": concept_name, "node_count": len(_knowledge_graph['nodes'])}, level="info")
+        _log_memory_event("store_memory_success", 
+                          {"memory_id": memory_id, "concept_name": concept_name, 
+                           "node_count": len(_knowledge_graph['nodes']), "edge_count": len(_knowledge_graph['edges'])}, 
+                          level="info")
         return True
 
-    except Exception as e:
-        _log_memory_event("store_memory_exception", {"concept_name": concept_name, "error": str(e), "trace": traceback.format_exc()}, level="critical")
+    except Exception as e: # Catch any other unexpected errors during storage.
+        _log_memory_event("store_memory_exception", 
+                          {"concept_name": concept_name, "error": str(e), "trace": traceback.format_exc()}, 
+                          level="critical")
         return False
 
 def get_memory_by_id(memory_id: str) -> dict | None:
@@ -532,8 +550,6 @@ def get_memory_by_id(memory_id: str) -> dict | None:
         return None
         
     except Exception as e:
-        # Ensure traceback is imported for full error details
-        import traceback # Redundant if already at top but ensures availability
         _log_memory_event("get_memory_by_id_exception", {"memory_id": memory_id, "error": str(e), "trace": traceback.format_exc()}, level="error")
         return None
 
@@ -579,8 +595,6 @@ def get_memories_by_concept_name(concept_name: str, exact_match: bool = True) ->
         return found_memories
 
     except Exception as e:
-        # Ensure traceback is imported for full error details
-        import traceback # Redundant if already at top but ensures availability
         _log_memory_event("get_memories_by_name_exception", 
                           {"concept_name": concept_name, "error": str(e), "trace": traceback.format_exc()}, 
                           level="error")
@@ -749,8 +763,6 @@ if __name__ == '__main__':
         print(f"--- Running Test: {test_name} ---")
         setup_test_environment() # Ensure clean slate for each test using the default test KG path
         try:
-            # Ensure traceback is available for logging detailed errors within tests
-            import traceback
             with TempConfigOverride({"KNOWLEDGE_GRAPH_PATH": TEST_KNOWLEDGE_GRAPH_PATH, "SYSTEM_LOG_PATH": os.path.join(module_dir, "test_system_log.json")}):
                  # Re-call _load_knowledge_graph with the new path if the test needs a fresh load from (non-existent) file
                  _load_knowledge_graph()

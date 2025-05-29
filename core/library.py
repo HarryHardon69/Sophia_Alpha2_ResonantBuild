@@ -151,54 +151,58 @@ class Mitigator:
         self.sensitive_keywords_config_key = "LIBRARY_SENSITIVE_KEYWORDS" # Example key if made configurable
         self.reframing_phrases_config_key = "LIBRARY_REFRAMING_PHRASES" # Example key
 
+        # Load thresholds from config if available, otherwise use class defaults.
         if config:
             self.alignment_threshold = getattr(config, 'ETHICAL_ALIGNMENT_THRESHOLD', self.alignment_threshold)
             self.mitigation_threshold = getattr(config, 'MITIGATION_ETHICAL_THRESHOLD', self.mitigation_threshold)
+            # Log if defaults are used due to missing specific config values.
             if not hasattr(config, 'ETHICAL_ALIGNMENT_THRESHOLD') or not hasattr(config, 'MITIGATION_ETHICAL_THRESHOLD'):
                 _log_library_event("mitigator_config_warning", 
-                                   {"message": "Using default ethical/mitigation thresholds for Mitigator due to missing config values."}, 
+                                   {"message": "Mitigator using default ethical/mitigation thresholds; specific values not in config."}, 
                                    level="warning")
-        else:
+        else: # Config module itself is not loaded.
             _log_library_event("mitigator_config_warning", 
-                               {"message": "Config module not loaded. Mitigator using default ethical/mitigation thresholds."}, 
+                               {"message": "Config module not loaded. Mitigator using all default thresholds and keywords/phrases."}, 
                                level="warning")
 
-        # Default sensitive keywords (should ideally be from config)
-        self.sensitive_keywords = [
+        # Load sensitive keywords from config, with fallback to hardcoded defaults.
+        # These keywords trigger content review or stronger moderation.
+        default_sensitive_keywords = [
             "harm", "destroy", "exploit", "illegal", "deceive", "manipulate", 
-            "hate speech", "violence", "suffering", "unethical" 
-            # Consider making these regex patterns for more robust matching
+            "hate speech", "violence", "suffering", "unethical"
+            # Future: Consider regex patterns for more nuanced matching.
         ]
+        self.sensitive_keywords = default_sensitive_keywords
         if config and hasattr(config, self.sensitive_keywords_config_key):
              loaded_keywords = getattr(config, self.sensitive_keywords_config_key)
+             # Validate that loaded keywords are in the expected format (list of strings).
              if isinstance(loaded_keywords, list) and all(isinstance(k, str) for k in loaded_keywords):
                  self.sensitive_keywords = loaded_keywords
-             else:
+             else: # Log error and use defaults if config value is malformed.
                 _log_library_event("mitigator_config_error", 
-                                   {"message": f"Invalid format for {self.sensitive_keywords_config_key} in config. Using defaults."}, 
+                                   {"message": f"Invalid format for '{self.sensitive_keywords_config_key}' in config. Expected list of strings. Using defaults."}, 
                                    level="error")
 
-
-        # Default reframing phrases (should ideally be from config)
-        self.reframing_phrases = {
+        # Load reframing phrases from config, with fallback to hardcoded defaults.
+        # These are used to guide conversation away from problematic content.
+        default_reframing_phrases = {
             "DEFAULT": "Let's consider this topic from a different, more constructive perspective.",
             "harm": "Instead of focusing on potential negative impacts, how can we explore solutions that promote well-being and safety?",
             "destroy": "Rather than deconstruction, let's think about how to build or improve.",
             "exploit": "It's important to ensure fairness and respect. How can this situation be approached with integrity?",
             "illegal": "Activities should align with legal and ethical standards. What are some compliant approaches?",
             "unethical": "Maintaining ethical integrity is crucial. Let's re-evaluate this through an ethical lens."
-            # Add more specific reframing phrases as needed
         }
-
+        self.reframing_phrases = default_reframing_phrases.copy() # Start with defaults.
         if config and hasattr(config, self.reframing_phrases_config_key):
             loaded_phrases = getattr(config, self.reframing_phrases_config_key)
+            # Validate that loaded phrases are in the expected format (dict).
             if isinstance(loaded_phrases, dict):
-                self.reframing_phrases.update(loaded_phrases) # Merge with defaults, allowing overrides
-            else:
+                self.reframing_phrases.update(loaded_phrases) # Merge, allowing config to override/add to defaults.
+            else: # Log error and use defaults if config value is malformed.
                 _log_library_event("mitigator_config_error", 
-                                   {"message": f"Invalid format for {self.reframing_phrases_config_key} in config. Using defaults."}, 
+                                   {"message": f"Invalid format for '{self.reframing_phrases_config_key}' in config. Expected dict. Using defaults."}, 
                                    level="error")
-
 
     def _contains_sensitive_keywords(self, text: str) -> tuple[bool, list[str]]:
         """
@@ -210,22 +214,22 @@ class Mitigator:
         Returns:
             A tuple: (bool indicating if keywords were found, list of found keywords).
         """
-        if not text or not isinstance(text, str):
+        if not text or not isinstance(text, str): # Handle empty or invalid input.
             return False, []
         
-        text_lower = text.lower()
-        found_keywords = []
+        text_lower = text.lower() # Case-insensitive search.
+        found_keywords_list = []
         for keyword in self.sensitive_keywords:
-            # Using \b for word boundaries to avoid matching substrings within words (e.g., 'harm' in 'harmony')
-            # This requires keywords to be actual words. For phrases, direct check is better.
-            # For simplicity here, we'll do a direct substring check first, then consider regex for word boundaries.
-            if keyword.lower() in text_lower: # Simple substring check
-            # Example with word boundaries (more precise but might miss multi-word keywords if not handled carefully)
-            # pattern = r"\b" + re.escape(keyword.lower()) + r"\b"
-            # if re.search(pattern, text_lower):
-                found_keywords.append(keyword)
+            # Current implementation uses simple substring matching.
+            # For more precision (avoiding 'harm' in 'harmony'), regex with word boundaries (`\b`) can be used:
+            #   pattern = r"\b" + re.escape(keyword.lower()) + r"\b"
+            #   if re.search(pattern, text_lower):
+            # However, this makes matching multi-word keywords more complex if they are stored as single strings.
+            # For now, simple substring matching is used for broader (if less precise) detection.
+            if keyword.lower() in text_lower:
+                found_keywords_list.append(keyword)
         
-        return bool(found_keywords), found_keywords
+        return bool(found_keywords_list), found_keywords_list
 
     def moderate_ethically_flagged_content(self, original_text: str, ethical_score: float = 1.0, strict_mode: bool = False) -> str:
         """
@@ -239,68 +243,77 @@ class Mitigator:
         Returns:
             The original text if no mitigation is needed, or a moderated/reframed version.
         """
-        if not isinstance(original_text, str): # Basic type check
-            _log_library_event("mitigation_error", {"reason": "Invalid original_text type", "type": type(original_text).__name__}, level="error")
-            return "[Invalid content provided for moderation.]"
+        if not isinstance(original_text, str): # Basic input validation.
+            _log_library_event("mitigation_error", {"reason": "Invalid original_text type provided for moderation.", "type_received": type(original_text).__name__}, level="error")
+            return "[System Error: Invalid content provided for moderation. Please ensure text format.]"
 
+        # Check for sensitive keywords in the text.
         keywords_found, found_keywords_list = self._contains_sensitive_keywords(original_text)
         
-        trigger_mitigation = False
-        mitigation_reason = []
+        trigger_mitigation = False # Flag to determine if moderation is needed.
+        mitigation_reason_parts = [] # List to collect reasons for mitigation.
 
+        # Condition 1: Ethical score is below the primary mitigation threshold.
         if ethical_score < self.mitigation_threshold:
             trigger_mitigation = True
-            mitigation_reason.append(f"Ethical score ({ethical_score:.2f}) below mitigation threshold ({self.mitigation_threshold:.2f})")
+            mitigation_reason_parts.append(f"Ethical score ({ethical_score:.2f}) is below mitigation threshold ({self.mitigation_threshold:.2f}).")
         
+        # Condition 2: Strict mode is enabled, and score is below the general alignment threshold.
+        # This allows for stricter moderation if `strict_mode` is True.
         if strict_mode and ethical_score < self.alignment_threshold:
-            if not trigger_mitigation: # Avoid duplicate reason if already triggered by stricter mitigation_threshold
+            if not trigger_mitigation: # Avoid adding duplicate broad category if already triggered by stricter threshold.
                  trigger_mitigation = True
-            mitigation_reason.append(f"Strict mode: Ethical score ({ethical_score:.2f}) below alignment threshold ({self.alignment_threshold:.2f})")
+            mitigation_reason_parts.append(f"Strict mode active and ethical score ({ethical_score:.2f}) is below alignment threshold ({self.alignment_threshold:.2f}).")
 
-        # Sensitive keyword check can also trigger, potentially with a less strict score.
-        # For this implementation, any sensitive keyword triggers if not already triggered.
-        # A more nuanced approach might be: `keywords_found and ethical_score < some_other_threshold`
+        # Condition 3: Sensitive keywords are found.
+        # This can trigger mitigation independently or add to reasons if already triggered by score.
         if keywords_found:
-            if not trigger_mitigation: # Trigger if not already triggered by score
+            if not trigger_mitigation: # Trigger if not already flagged by score-based checks.
                  trigger_mitigation = True
-            mitigation_reason.append(f"Sensitive keywords found: {', '.join(found_keywords_list)}")
+            mitigation_reason_parts.append(f"Sensitive keywords detected: {', '.join(found_keywords_list)}.")
 
-
+        # If any condition triggered mitigation:
         if trigger_mitigation:
-            summary = summarize_text(original_text, 75) # Slightly longer summary for context
+            content_summary_for_log = summarize_text(original_text, 75) # Create a brief summary for logs.
             log_data = {
-                "original_snippet": summary,
-                "ethical_score": ethical_score,
-                "strict_mode": strict_mode,
-                "keywords_found": found_keywords_list,
-                "reason_for_mitigation": "; ".join(mitigation_reason)
+                "original_content_snippet": content_summary_for_log,
+                "ethical_score_at_mitigation": ethical_score,
+                "strict_mode_active": strict_mode,
+                "detected_keywords": found_keywords_list,
+                "mitigation_trigger_reasons": "; ".join(mitigation_reason_parts)
             }
             _log_library_event("mitigation_triggered", log_data, level="warning")
 
-            # Select reframing phrase
-            reframing_phrase = self.reframing_phrases.get("DEFAULT")
-            if found_keywords_list:
-                # Try to find a more specific reframing phrase for the first found keyword
-                for kw in found_keywords_list:
-                    if kw.lower() in self.reframing_phrases:
-                        reframing_phrase = self.reframing_phrases[kw.lower()]
-                        break
+            # Select an appropriate reframing phrase.
+            # Default phrase is used if no specific keyword match is found.
+            reframing_phrase_to_use = self.reframing_phrases.get("DEFAULT")
+            if found_keywords_list: # If keywords were found, try to use a more specific phrase.
+                for keyword in found_keywords_list:
+                    if keyword.lower() in self.reframing_phrases:
+                        reframing_phrase_to_use = self.reframing_phrases[keyword.lower()]
+                        break # Use the first keyword-specific phrase found.
             
-            # Determine severity of response
-            # Example: Very low score or specific keywords might lead to a generic placeholder
-            if ethical_score < 0.3 or (strict_mode and ethical_score < 0.5 and keywords_found): # Example of stricter condition
-                return f"[Content Moderated due to Ethical Concerns (Score: {ethical_score:.2f}). Please rephrase or contact support.]"
+            # Determine the severity of the response based on score and keywords.
+            # Very low scores or specific keyword combinations in strict mode might lead to a generic placeholder.
+            # This is an example of tiered response logic.
+            if ethical_score < 0.3 or (strict_mode and ethical_score < 0.5 and keywords_found): 
+                return f"[Content Moderated due to significant ethical concerns (Score: {ethical_score:.2f}). Please rephrase or seek assistance if needed.]"
             
-            return f"[Content Under Review due to Ethical Concerns (Score: {ethical_score:.2f})]. {reframing_phrase} Original topic was related to: '{summary}'"
+            # Standard moderated response with reframing.
+            return f"[Content Under Review due to ethical considerations (Score: {ethical_score:.2f})]. {reframing_phrase_to_use} The original topic was related to: '{content_summary_for_log}'."
 
+        # If no mitigation was triggered, return the original text.
         return original_text
 
 # --- Module-Level Variables ---
 KNOWLEDGE_LIBRARY = {}
 _library_dirty_flag = False
-_LIBRARY_FILE_PATH = None # To be set by _initialize_library_path
+_LIBRARY_FILE_PATH = None # To be set by _initialize_library_path during module load.
 
 # --- Logging Function ---
+# Note: This _log_library_event is specific to this module and distinct from
+# logging functions in other modules like core.brain or core.memory.
+# It uses config for log path/level if available, otherwise prints to stderr.
 def _log_library_event(event_type: str, data: dict, level: str = "info"):
     """
     Basic logging for library events.
@@ -349,113 +362,147 @@ def _log_library_event(event_type: str, data: dict, level: str = "info"):
 
 # --- Path Initialization ---
 def _initialize_library_path():
-    global _LIBRARY_FILE_PATH
+    """
+    Initializes the `_LIBRARY_FILE_PATH` global variable based on configuration.
+    Ensures that the directory for this path exists.
+    If config is unavailable or path is not set, `_LIBRARY_FILE_PATH` remains None.
+    Called once at module import.
+    """
+    global _LIBRARY_FILE_PATH # This function sets the module-global path.
+    
+    # Check if config module and necessary attributes are available.
     if config and hasattr(config, 'LIBRARY_LOG_PATH') and config.LIBRARY_LOG_PATH:
-        _LIBRARY_FILE_PATH = config.LIBRARY_LOG_PATH
+        _LIBRARY_FILE_PATH = config.LIBRARY_LOG_PATH # Get path from config.
+        
+        # Use config's ensure_path utility if available.
         ensure_path_func = getattr(config, 'ensure_path', None)
         if ensure_path_func:
             try:
-                ensure_path_func(_LIBRARY_FILE_PATH) 
-                _log_library_event("library_path_initialized", {"path": _LIBRARY_FILE_PATH})
-            except Exception as e_ensure:
+                ensure_path_func(_LIBRARY_FILE_PATH) # Create directory if it doesn't exist.
+                _log_library_event("library_path_initialized", {"path": _LIBRARY_FILE_PATH, "method": "config.ensure_path"})
+            except Exception as e_ensure: # Log error if config.ensure_path fails.
                 _log_library_event("library_path_ensure_failed", {"path": _LIBRARY_FILE_PATH, "error": str(e_ensure)}, level="error")
-                try: # Fallback manual ensure
+                # Fallback to manual directory creation attempt.
+                try: 
                     lib_dir = os.path.dirname(_LIBRARY_FILE_PATH)
                     if lib_dir and not os.path.exists(lib_dir):
                         os.makedirs(lib_dir, exist_ok=True)
-                except Exception as e_manual_mkdir:
-                    _log_library_event("library_path_manual_mkdir_failed", {"path": _LIBRARY_FILE_PATH, "error": str(e_manual_mkdir)}, level="critical")
-                    _LIBRARY_FILE_PATH = None 
-        else: # Manual ensure if config.ensure_path not available
+                except Exception as e_manual_mkdir_fallback: # Log critical failure if manual attempt also fails.
+                    _log_library_event("library_path_manual_mkdir_failed_after_ensure_fail", {"path": _LIBRARY_FILE_PATH, "error": str(e_manual_mkdir_fallback)}, level="critical")
+                    _LIBRARY_FILE_PATH = None # Path is unusable if directory cannot be created.
+        else: # Manual directory creation if config.ensure_path is not available.
             try:
                 lib_dir = os.path.dirname(_LIBRARY_FILE_PATH)
-                if lib_dir and not os.path.exists(lib_dir):
+                if lib_dir and not os.path.exists(lib_dir): # Only create if path is not empty and dir doesn't exist.
                     os.makedirs(lib_dir, exist_ok=True)
-                _log_library_event("library_path_initialized_manual_ensure", {"path": _LIBRARY_FILE_PATH})
-            except Exception as e_manual_mkdir:
+                _log_library_event("library_path_initialized", {"path": _LIBRARY_FILE_PATH, "method": "manual_os.makedirs"})
+            except Exception as e_manual_mkdir: # Log critical failure.
                 _log_library_event("library_path_manual_mkdir_failed", {"path": _LIBRARY_FILE_PATH, "error": str(e_manual_mkdir)}, level="critical")
-                _LIBRARY_FILE_PATH = None 
-    else:
-        _log_library_event("library_path_init_failed", {"reason": "Config or LIBRARY_LOG_PATH missing or empty"}, level="error")
-        _LIBRARY_FILE_PATH = None
+                _LIBRARY_FILE_PATH = None # Path is unusable.
+    else: # Config or specific path attribute is missing.
+        _log_library_event("library_path_init_failed", {"reason": "Config module or LIBRARY_LOG_PATH attribute missing/empty."}, level="error")
+        _LIBRARY_FILE_PATH = None # Mark path as not set.
 
 
 # --- Persistence Functions ---
 def _load_knowledge_library():
-    global KNOWLEDGE_LIBRARY, _library_dirty_flag
-    if not _LIBRARY_FILE_PATH:
-        _log_library_event("load_library_failed", {"reason": "Library file path not set"}, level="error")
-        KNOWLEDGE_LIBRARY = {}
+    """
+    Loads the knowledge library from the file specified by `_LIBRARY_FILE_PATH`.
+    Handles file not found, empty file, and malformed JSON.
+    Initializes `KNOWLEDGE_LIBRARY` to an empty dictionary if loading fails.
+    Sets `_library_dirty_flag` to False after loading or initialization.
+    """
+    global KNOWLEDGE_LIBRARY, _library_dirty_flag # Modifies global library state.
+    
+    if not _LIBRARY_FILE_PATH: # Abort if library path was not successfully initialized.
+        _log_library_event("load_library_failed", {"reason": "Library file path (_LIBRARY_FILE_PATH) is not set."}, level="error")
+        KNOWLEDGE_LIBRARY = {} # Ensure library is empty.
         _library_dirty_flag = False 
         return
 
     try:
+        # If the library file doesn't exist or is empty, start with a fresh library.
         if not os.path.exists(_LIBRARY_FILE_PATH) or os.path.getsize(_LIBRARY_FILE_PATH) == 0:
-            _log_library_event("load_library_info", {"message": "Library file not found or empty. Initializing new.", "path": _LIBRARY_FILE_PATH})
+            _log_library_event("load_library_info", {"message": "Library file not found or empty. Initializing new library.", "path": _LIBRARY_FILE_PATH})
             KNOWLEDGE_LIBRARY = {}
-            _library_dirty_flag = False
+            _library_dirty_flag = False # Freshly initialized, so not dirty.
             return
 
-        with open(_LIBRARY_FILE_PATH, 'r', encoding='utf-8') as f: # Added encoding
+        # Attempt to open and load JSON data from the file. UTF-8 encoding is specified.
+        with open(_LIBRARY_FILE_PATH, 'r', encoding='utf-8') as f:
             data = json.load(f)
         
+        # Validate that the loaded data is a dictionary (expected root type for the library).
         if isinstance(data, dict):
-            KNOWLEDGE_LIBRARY = data
+            KNOWLEDGE_LIBRARY = data # Assign loaded data to the global variable.
             _log_library_event("load_library_success", {"path": _LIBRARY_FILE_PATH, "entries_loaded": len(KNOWLEDGE_LIBRARY)})
-        else:
-            _log_library_event("load_library_malformed", {"path": _LIBRARY_FILE_PATH, "error": "Data is not a dictionary"}, level="error")
-            KNOWLEDGE_LIBRARY = {} 
-        _library_dirty_flag = False
+        else: # If data is not a dict, it's considered malformed.
+            _log_library_event("load_library_malformed", {"path": _LIBRARY_FILE_PATH, "error": "Root data structure is not a dictionary."}, level="error")
+            KNOWLEDGE_LIBRARY = {} # Reset to empty on error.
+        _library_dirty_flag = False # Synchronized with file state (or fresh default).
 
-    except json.JSONDecodeError as e:
-        _log_library_event("load_library_json_error", {"path": _LIBRARY_FILE_PATH, "error": str(e)}, level="error")
+    except json.JSONDecodeError as e: # Handle errors during JSON parsing.
+        _log_library_event("load_library_json_error", {"path": _LIBRARY_FILE_PATH, "error_details": str(e)}, level="error")
         KNOWLEDGE_LIBRARY = {} 
         _library_dirty_flag = False
-    except IOError as e: # More specific for file issues
-        _log_library_event("load_library_io_error", {"path": _LIBRARY_FILE_PATH, "error": str(e)}, level="error")
+    except IOError as e_io: # Handle file I/O errors (e.g., permission issues).
+        _log_library_event("load_library_io_error", {"path": _LIBRARY_FILE_PATH, "error_details": str(e_io)}, level="error")
         KNOWLEDGE_LIBRARY = {}
         _library_dirty_flag = False
-    except Exception as e:
-        _log_library_event("load_library_unknown_error", {"path": _LIBRARY_FILE_PATH, "error": str(e), "trace": traceback.format_exc()}, level="critical")
+    except Exception as e_unknown: # Catch any other unexpected errors.
+        _log_library_event("load_library_unknown_error", {"path": _LIBRARY_FILE_PATH, "error_details": str(e_unknown), "trace": traceback.format_exc()}, level="critical")
         KNOWLEDGE_LIBRARY = {} 
         _library_dirty_flag = False
 
 
 def _save_knowledge_library():
-    global _library_dirty_flag
-    if not _library_dirty_flag:
-        _log_library_event("save_library_skipped", {"reason": "No changes (_library_dirty_flag is False)"}, level="debug")
+    """
+    Saves the current state of `KNOWLEDGE_LIBRARY` to disk if `_library_dirty_flag` is True.
+    Uses an atomic write (write to temp file, then replace original) to prevent data corruption.
+    Resets `_library_dirty_flag` to False after a successful save.
+    """
+    global _library_dirty_flag # To modify the flag.
+
+    if not _library_dirty_flag: # Only save if there are pending changes.
+        _log_library_event("save_library_skipped", {"reason": "No changes to save (_library_dirty_flag is False)."}, level="debug")
         return
 
-    if not _LIBRARY_FILE_PATH:
-        _log_library_event("save_library_failed", {"reason": "Library file path not set"}, level="error")
+    if not _LIBRARY_FILE_PATH: # Abort if library path is not set.
+        _log_library_event("save_library_failed", {"reason": "Library file path (_LIBRARY_FILE_PATH) is not set. Cannot save."}, level="error")
+        # Do not reset dirty flag, as changes are still pending and unsaved.
         return
 
-    temp_path = _LIBRARY_FILE_PATH + ".tmp"
+    temp_path = _LIBRARY_FILE_PATH + ".tmp" # Define temporary file path for atomic write.
     try:
-        # Ensure directory exists just before writing (in case it was deleted)
+        # Ensure directory exists just before writing (safeguard if deleted post-initialization).
         lib_dir = os.path.dirname(_LIBRARY_FILE_PATH)
         if lib_dir and not os.path.exists(lib_dir):
             os.makedirs(lib_dir, exist_ok=True)
                 
-        with open(temp_path, 'w', encoding='utf-8') as f: # Added encoding
+        # Step 1: Write the current library to the temporary file.
+        # UTF-8 encoding and indent for readability.
+        with open(temp_path, 'w', encoding='utf-8') as f: 
             json.dump(KNOWLEDGE_LIBRARY, f, indent=2)
         
+        # Step 2: Atomically replace the original file with the temporary file.
         os.replace(temp_path, _LIBRARY_FILE_PATH) 
-        _library_dirty_flag = False
+        
+        _library_dirty_flag = False # Reset dirty flag only after successful write and replacement.
         _log_library_event("save_library_success", {"path": _LIBRARY_FILE_PATH, "entries_saved": len(KNOWLEDGE_LIBRARY)})
-    except IOError as e: # More specific for file issues
-         _log_library_event("save_library_io_error", {"path": _LIBRARY_FILE_PATH, "temp_path": temp_path, "error": str(e)}, level="critical")
-    except Exception as e:
-        _log_library_event("save_library_unknown_error", {"path": _LIBRARY_FILE_PATH, "temp_path": temp_path, "error": str(e), "trace": traceback.format_exc()}, level="critical")
+    except IOError as e_io: # Handle file I/O errors.
+         _log_library_event("save_library_io_error", {"path": _LIBRARY_FILE_PATH, "temp_path": temp_path, "error_details": str(e_io)}, level="critical")
+         # Attempt to clean up temp file on error.
+         if os.path.exists(temp_path):
+            try: os.remove(temp_path)
+            except Exception as e_rm: _log_library_event("save_library_temp_cleanup_failed_io", {"path": temp_path, "error": str(e_rm)}, level="error")
+    except Exception as e_unknown: # Handle other unexpected errors during save.
+        _log_library_event("save_library_unknown_error", {"path": _LIBRARY_FILE_PATH, "temp_path": temp_path, "error_details": str(e_unknown), "trace": traceback.format_exc()}, level="critical")
         if os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
-            except Exception as e_remove:
-                _log_library_event("save_library_temp_cleanup_failed", {"path": temp_path, "error": str(e_remove)}, level="error")
+            except Exception as e_remove_unknown: # Renamed variable to avoid conflict
+                _log_library_event("save_library_temp_cleanup_failed_unknown", {"path": temp_path, "error": str(e_remove_unknown)}, level="error")
                 
-
-
 # Initialize path and load library at module import
 _initialize_library_path()
 _load_knowledge_library()
@@ -476,118 +523,149 @@ def store_knowledge(content: str, is_public: bool = False, source_uri: str = Non
     Returns:
         The entry_id (SHA256 hash of content) if successfully stored, otherwise None.
     """
-    global _library_dirty_flag
+    global _library_dirty_flag # To mark library as needing a save.
 
     # --- Input Validation ---
+    # Content must be a non-empty string.
     if not content or not isinstance(content, str) or not content.strip():
-        _log_library_event("store_knowledge_failed", {"reason": "Content is empty or not a string."}, level="error")
+        _log_library_event("store_knowledge_failed", {"reason": "Content is empty, None, or not a string."}, level="error")
         return None
 
     # --- Generate Basic Metadata ---
+    # Use SHA256 hash of the content as a unique entry ID. This also helps in deduplication if exact content is re-submitted.
     entry_id = hashlib.sha256(content.encode('utf-8')).hexdigest()
-    timestamp = datetime.datetime.utcnow().isoformat() + "Z"
-    content_hash = entry_id 
-    content_preview = summarize_text(content, max_length=150)
+    timestamp = datetime.datetime.utcnow().isoformat() + "Z" # ISO 8601 UTC timestamp.
+    content_hash = entry_id # Alias for clarity, as entry_id is the hash.
+    content_preview = summarize_text(content, max_length=150) # Short preview for logs or listings.
 
-    # --- Manifold Coordinate Generation ---
-    # Derive concept_name_for_coord from content
+    # --- Manifold Coordinate Generation (Interaction with core.brain) ---
+    # Attempt to get coordinates and related data for the content by treating its preview as a concept name.
+    # This requires the brain module and its `bootstrap_concept_from_llm` method to be available.
     concept_name_for_coord = summarize_text(content_preview, max_length=20).strip().replace('...', '')
-    if not concept_name_for_coord: # Ensure it's not empty after stripping
-        concept_name_for_coord = "generic concept"
+    if not concept_name_for_coord: # Ensure a non-empty concept name for bootstrapping.
+        concept_name_for_coord = "generic library content" # Fallback concept name.
     
-    manifold = get_shared_manifold()
-    coordinates = None
-    intensity_val = 0.0
-    summary_for_ethics = content_preview # Default summary for ethics
+    manifold = get_shared_manifold() # Get the shared SpacetimeManifold instance.
+    coordinates = None      # Default: (x,y,z,t_coord), where t_coord is scaled.
+    intensity_val = 0.0     # Default: Raw T-intensity (0-1).
+    summary_for_ethics = content_preview # Default summary to use for ethical scoring if brain interaction fails.
 
     if manifold and hasattr(manifold, 'bootstrap_concept_from_llm'):
         try:
-            # bootstrap_concept_from_llm should return (coordinates_tuple, intensity_float, summary_string)
-            # coordinates_tuple is (x,y,z,t_coord) - the scaled T-coordinate
-            # intensity_float is raw_t_intensity (0-1)
-            coord_data = manifold.bootstrap_concept_from_llm(concept_name_for_coord)
-            if coord_data and isinstance(coord_data, tuple) and len(coord_data) == 3:
-                coordinates = coord_data[0] # Should be the (x,y,z,t_coord) tuple
-                intensity_val = coord_data[1] # Should be the raw_t_intensity (0-1)
-                summary_for_ethics = coord_data[2] # Summary from LLM
-                if not is_valid_coordinate(coordinates): # Validate coordinates from brain
-                    _log_library_event("store_knowledge_warning", {"entry_id": entry_id, "reason": "Invalid coordinates from brain, using None.", "coord_received": coordinates}, level="warning")
-                    coordinates = None # Fallback
-                if not isinstance(intensity_val, (int, float)):
-                    intensity_val = 0.0 # Fallback
-                if not isinstance(summary_for_ethics, str) or not summary_for_ethics.strip():
-                    summary_for_ethics = content_preview # Fallback
-            else:
-                _log_library_event("store_knowledge_brain_data_malformed", {"entry_id": entry_id, "concept_name": concept_name_for_coord, "data_received": str(coord_data)}, level="warning")
-                # Fallbacks already set: coordinates = None, intensity_val = 0.0, summary_for_ethics = content_preview
-        except Exception as e_brain:
-            _log_library_event("store_knowledge_brain_error", {"entry_id": entry_id, "concept_name": concept_name_for_coord, "error": str(e_brain)}, level="error")
-            # Fallbacks already set
-    else:
-        _log_library_event("store_knowledge_manifold_unavailable", {"entry_id": entry_id, "reason": "Manifold or bootstrap_concept_from_llm not available."}, level="warning")
-        # Fallbacks already set
+            # `bootstrap_concept_from_llm` returns: (coordinates_tuple, raw_intensity_float, summary_string)
+            # coordinates_tuple is (scaled_x, scaled_y, scaled_z, scaled_t_intensity_coord)
+            # raw_intensity_float is the 0-1 intensity value.
+            coord_data_tuple = manifold.bootstrap_concept_from_llm(concept_name_for_coord)
+            
+            if coord_data_tuple and isinstance(coord_data_tuple, tuple) and len(coord_data_tuple) == 3:
+                coordinates = coord_data_tuple[0]       # The (x,y,z,t_coord) tuple.
+                intensity_val = coord_data_tuple[1]     # The raw_t_intensity (0-1).
+                summary_for_ethics = coord_data_tuple[2] # LLM-generated summary for this concept.
 
-    # --- Ethical Scoring ---
-    awareness_for_ethics = {
-        "primary_concept_coord": coordinates, # (x,y,z,t_coord) or None
-        "raw_t_intensity": intensity_val,     # Raw 0-1 intensity or 0.0
-        "coherence": getattr(config, 'DEFAULT_KNOWLEDGE_COHERENCE', 0.75) if config else 0.75,
-        # Add other fields if score_ethics expects them
+                # Validate the received coordinates format.
+                if not is_valid_coordinate(coordinates): 
+                    _log_library_event("store_knowledge_warning", 
+                                       {"entry_id": entry_id, "reason": "Invalid coordinates received from brain module. Storing None for coordinates.", "coord_received": coordinates}, 
+                                       level="warning")
+                    coordinates = None # Fallback to None if validation fails.
+                # Validate intensity value type.
+                if not isinstance(intensity_val, (int, float)):
+                    _log_library_event("store_knowledge_warning",
+                                       {"entry_id": entry_id, "reason": f"Invalid intensity type from brain: {type(intensity_val)}. Defaulting to 0.0."},
+                                       level="warning")
+                    intensity_val = 0.0 # Fallback.
+                # Validate summary type and content.
+                if not isinstance(summary_for_ethics, str) or not summary_for_ethics.strip():
+                    summary_for_ethics = content_preview # Fallback to original content preview.
+            else: # Data from brain is not in the expected format.
+                _log_library_event("store_knowledge_brain_data_malformed", 
+                                   {"entry_id": entry_id, "concept_name_used": concept_name_for_coord, "data_received": str(coord_data_tuple)}, 
+                                   level="warning")
+                # Defaults for coordinates, intensity_val, summary_for_ethics are already set.
+        except Exception as e_brain_interaction: # Catch any error during interaction with brain.
+            _log_library_event("store_knowledge_brain_error", 
+                               {"entry_id": entry_id, "concept_name_used": concept_name_for_coord, "error_message": str(e_brain_interaction)}, 
+                               level="error")
+            # Defaults for coordinates, intensity_val, summary_for_ethics are already set.
+    else: # Manifold instance or its method is unavailable (e.g., mock or import issue).
+        _log_library_event("store_knowledge_manifold_unavailable", 
+                           {"entry_id": entry_id, "reason": "SpacetimeManifold or bootstrap_concept_from_llm method not available."}, 
+                           level="warning")
+        # Defaults for coordinates, intensity_val, summary_for_ethics are already set.
+
+    # --- Ethical Scoring (Interaction with core.ethics) ---
+    # Prepare awareness data snapshot for ethical scoring.
+    # `primary_concept_coord` for score_ethics should be the (x,y,z,t_coord) from brain.
+    # `raw_t_intensity` for score_ethics should be the 0-1 intensity value.
+    awareness_for_ethics_scoring = {
+        "primary_concept_coord": coordinates, 
+        "raw_t_intensity": intensity_val,    
+        "coherence": getattr(config, 'DEFAULT_KNOWLEDGE_COHERENCE', 0.75) if config else 0.75, # Default coherence for new knowledge.
+        # Other metrics like 'curiosity', 'context_stability' could be added if relevant for library item scoring.
     }
-    ethics_score = 0.5 # Default neutral score
+    ethics_score_value = 0.5 # Default neutral ethical score.
 
     try:
-        # score_ethics is expected to return a float between 0.0 and 1.0
-        calculated_ethics_score = score_ethics(awareness_for_ethics, concept_summary=summary_for_ethics, action_description=content)
+        # `score_ethics` is expected to return a float between 0.0 and 1.0.
+        calculated_ethics_score = score_ethics(awareness_for_ethics_scoring, concept_summary=summary_for_ethics, action_description=content)
         if isinstance(calculated_ethics_score, (int, float)) and 0.0 <= calculated_ethics_score <= 1.0:
-            ethics_score = float(calculated_ethics_score)
-        else:
-            _log_library_event("store_knowledge_ethics_score_invalid", {"entry_id": entry_id, "score_received": str(calculated_ethics_score)}, level="warning")
-            # ethics_score remains default 0.5
-    except Exception as e_ethics:
-        _log_library_event("store_knowledge_ethics_error", {"entry_id": entry_id, "error": str(e_ethics)}, level="error")
-        # ethics_score remains default 0.5
+            ethics_score_value = float(calculated_ethics_score)
+        else: # Invalid score returned by ethics module.
+            _log_library_event("store_knowledge_ethics_score_invalid", 
+                               {"entry_id": entry_id, "score_received": str(calculated_ethics_score), "reason": "Score not float or not in [0,1] range."}, 
+                               level="warning")
+            # ethics_score_value remains the default 0.5.
+    except Exception as e_ethics_scoring: # Catch any error during interaction with ethics module.
+        _log_library_event("store_knowledge_ethics_error", 
+                           {"entry_id": entry_id, "error_message": str(e_ethics_scoring)}, 
+                           level="error")
+        # ethics_score_value remains the default 0.5.
 
-    # --- Construct Knowledge Entry ---
+    # --- Construct Knowledge Entry Dictionary ---
+    # This is the structured data that will be stored in the library.
     entry = {
-        "id": entry_id,
-        "timestamp": timestamp,
-        "content_hash": content_hash,
-        "content_preview": content_preview,
-        "full_content": content, # Original full content
-        "is_public": is_public,
-        "source_uri": source_uri,
-        "author": author,
-        "coordinates": coordinates, # Tuple (x,y,z,t_coord) or None
-        "raw_t_intensity": intensity_val, # Float 0-1
-        "ethics_score": ethics_score,
-        "version": "1.0" 
+        "id": entry_id, # SHA256 hash of content.
+        "timestamp": timestamp, # UTC timestamp of storage.
+        "content_hash": content_hash, # For consistency, same as id.
+        "content_preview": content_preview, # Short summary of the content.
+        "full_content": content, # The original, complete textual content.
+        "is_public": is_public, # Boolean indicating public accessibility.
+        "source_uri": source_uri, # Optional URI of the knowledge source.
+        "author": author, # Optional author.
+        "coordinates": coordinates, # 4D tuple (x,y,z,t_coord from brain) or None.
+        "raw_t_intensity": intensity_val, # Float (0-1) intensity from brain, or default.
+        "ethics_score": ethics_score_value, # Calculated ethical score (0-1).
+        "version": "1.0" # Version of this entry structure.
     }
 
-    # --- Public Storage Consent (Placeholder) ---
-    require_consent = getattr(config, 'REQUIRE_PUBLIC_STORAGE_CONSENT', False) if config else False
-    if entry['is_public'] and require_consent:
-        _log_library_event("public_consent_requested", {"entry_id": entry_id, "preview": content_preview}, level="info")
+    # --- Public Storage Consent (Placeholder for CLI Interaction) ---
+    # If content is marked public and config requires consent, simulate asking for it.
+    # This is a developer placeholder; a real application needs a proper consent mechanism.
+    require_consent_flag = getattr(config, 'REQUIRE_PUBLIC_STORAGE_CONSENT', False) if config else False
+    if entry['is_public'] and require_consent_flag:
+        _log_library_event("public_consent_requested", {"entry_id": entry_id, "preview_for_consent": content_preview}, level="info")
         try:
-            # This is a placeholder for development environments. 
-            # In a real application, this would need a proper UI/API interaction.
-            user_consent = input(f"Store content (preview: '{content_preview}') publicly? This is a dev placeholder. (yes/no): ").lower()
-            if user_consent != "yes":
-                _log_library_event("public_consent_refused", {"entry_id": entry_id}, level="info")
-                return None
-            _log_library_event("public_consent_placeholder", {"entry_id": entry_id, "status": "granted"}, level="info")
-        except EOFError: # Happens in non-interactive environments
-             _log_library_event("public_consent_eof_error", {"entry_id": entry_id, "message": "EOFError during input(), assuming no consent in non-interactive environment."}, level="warning")
-             return None
+            # CLI input simulates user consent. This will block in non-interactive environments.
+            user_consent_response = input(f"Store content (preview: '{content_preview}') publicly? This is a dev placeholder. (yes/no): ").lower()
+            if user_consent_response != "yes":
+                _log_library_event("public_consent_refused", {"entry_id": entry_id, "response": user_consent_response}, level="info")
+                return None # Do not store if consent is refused.
+            _log_library_event("public_consent_placeholder_granted", {"entry_id": entry_id}, level="info")
+        except EOFError: # Handle cases where input() cannot be used (e.g., non-interactive script execution).
+             _log_library_event("public_consent_eof_error", 
+                                {"entry_id": entry_id, "message": "EOFError during input() for public consent. Assuming no consent in non-interactive environment."}, 
+                                level="warning")
+             return None # Assume no consent if input fails in such environments.
 
-
-    # --- Store and Save ---
-    KNOWLEDGE_LIBRARY[entry_id] = entry
-    _library_dirty_flag = True
-    _save_knowledge_library()
+    # --- Store and Save the Knowledge Entry ---
+    KNOWLEDGE_LIBRARY[entry_id] = entry # Add entry to the in-memory library.
+    _library_dirty_flag = True # Mark library as modified.
+    _save_knowledge_library() # Persist changes to disk.
     
-    _log_library_event("knowledge_stored", {"entry_id": entry_id, "is_public": is_public, "source": source_uri if source_uri else "direct"})
-    return entry_id
+    _log_library_event("knowledge_stored_successfully", 
+                       {"entry_id": entry_id, "is_public": is_public, "source_uri": source_uri if source_uri else "N/A", "author": author if author else "N/A"}, 
+                       level="info")
+    return entry_id # Return the ID of the stored entry.
 
 def retrieve_knowledge_by_id(entry_id: str) -> dict | None:
     """
@@ -626,29 +704,43 @@ def retrieve_knowledge_by_keyword(keyword: str, search_public: bool = True, sear
     Returns:
         A list of matching knowledge entry dictionaries.
     """
+    # Validate keyword input.
     if not isinstance(keyword, str) or not keyword.strip():
-        _log_library_event("retrieve_by_keyword_failed", {"reason": "Keyword is empty or not a string."}, level="warning")
+        _log_library_event("retrieve_by_keyword_failed", {"reason": "Keyword is empty, None, or not a string."}, level="warning")
         return []
 
-    found_entries = []
-    lc_keyword = keyword.lower()
+    found_entries_list = []
+    lowercase_keyword = keyword.lower() # For case-insensitive search.
 
-    for entry in KNOWLEDGE_LIBRARY.values():
-        should_search_entry = False
-        if entry.get('is_public', False) and search_public:
-            should_search_entry = True
-        elif not entry.get('is_public', False) and search_private:
-            should_search_entry = True
+    # Iterate through all entries in the knowledge library.
+    for entry_dict in KNOWLEDGE_LIBRARY.values():
+        # Determine if the current entry should be included in the search based on its
+        # public/private status and the search flags.
+        should_search_this_entry = False
+        is_entry_public = entry_dict.get('is_public', False) # Default to False if key is missing.
         
-        if should_search_entry:
-            content_preview = entry.get('content_preview', "").lower()
-            full_content = entry.get('full_content', "").lower() # Ensure full_content exists
+        if is_entry_public and search_public: # If entry is public and we are searching public entries.
+            should_search_this_entry = True
+        elif not is_entry_public and search_private: # If entry is private and we are searching private entries.
+            should_search_this_entry = True
+        
+        if should_search_this_entry:
+            # Get content preview and full content, defaulting to empty string if missing.
+            # Perform case-insensitive search for the keyword.
+            content_preview_lower = entry_dict.get('content_preview', "").lower()
+            full_content_lower = entry_dict.get('full_content', "").lower() 
             
-            if lc_keyword in content_preview or lc_keyword in full_content:
-                found_entries.append(entry) # Appending reference, consider deepcopy if entries can be modified by caller
+            if lowercase_keyword in content_preview_lower or lowercase_keyword in full_content_lower:
+                # If keyword is found, add the entry to the results.
+                # Note: This appends a reference to the dictionary in KNOWLEDGE_LIBRARY.
+                # If callers might modify retrieved entries, consider `found_entries_list.append(entry_dict.copy())`
+                # or even `import copy; found_entries_list.append(copy.deepcopy(entry_dict))`.
+                found_entries_list.append(entry_dict)
     
-    _log_library_event("retrieve_by_keyword_result", {"keyword": keyword, "found_count": len(found_entries), "search_public": search_public, "search_private": search_private})
-    return found_entries
+    _log_library_event("retrieve_by_keyword_result", 
+                       {"keyword_searched": keyword, "found_count": len(found_entries_list), 
+                        "search_public_flag": search_public, "search_private_flag": search_private})
+    return found_entries_list
 
 
 # Example placeholder for a function that might be added later
@@ -748,13 +840,16 @@ if __name__ == "__main__":
         print("Warning (Library __main__): _LIBRARY_FILE_PATH is not set. Skipping file operations tests.")
 
 # --- Comprehensive Self-Testing Block ---
-_IS_TEST_RUNNING = False # Default to False
+_IS_TEST_RUNNING = False # Flag to indicate if the script is being run in a test context (e.g., __main__ block).
 
 if __name__ == "__main__":
-    _IS_TEST_RUNNING = True # Set flag when running as main script
-    print(f"INFO: _IS_TEST_RUNNING set to {_IS_TEST_RUNNING}")
+    # This primary __main__ block is intended for more comprehensive self-testing,
+    # distinct from the simpler demonstration __main__ block that might exist above it
+    # (which was removed/commented out in the provided code for this comprehensive block).
+    _IS_TEST_RUNNING = True # Set flag when this specific __main__ is executed.
+    print(f"INFO (Library Self-Test): _IS_TEST_RUNNING set to {_IS_TEST_RUNNING} for comprehensive tests.")
 
-    # --- Imports for Testing ---
+    # --- Imports specifically for this testing block ---
     import unittest.mock as mock
     import copy
 

@@ -18,6 +18,13 @@ import uuid
 
 import numpy as np
 
+import logging # Standard logging
+from cryptography.fernet import Fernet, InvalidToken # For encryption
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import asyncio
+import aiofiles
+
 # Attempt to import configuration from the parent package
 try:
     from .. import config
@@ -33,8 +40,90 @@ except ImportError:
 
 # Further module-level constants or setup can go here.
 
+# --- Cryptography Helper ---
+def _get_fernet_cipher() -> Fernet | None:
+    """
+    Initializes and returns a Fernet cipher object using ENCRYPTION_KEY from config.
+
+    Logs an error and returns None if the key is missing or invalid.
+    """
+    if not config or not hasattr(config, 'ENCRYPTION_KEY'):
+        _log_memory_event("fernet_cipher_error", {"error": "ENCRYPTION_KEY not found in config."}, level="critical")
+        # logging.critical("ENCRYPTION_KEY not found in config.") # Alternative if _log_memory_event is problematic here
+        return None
+
+    key = getattr(config, 'ENCRYPTION_KEY', None)
+    if not key: # Should be caught by hasattr, but as a safeguard
+        _log_memory_event("fernet_cipher_error", {"error": "ENCRYPTION_KEY is empty or None in config."}, level="critical")
+        # logging.critical("ENCRYPTION_KEY is empty or None in config.")
+        return None
+
+    try:
+        # Ensure the key is bytes
+        if isinstance(key, str):
+            key_bytes = key.encode('utf-8')
+        else:
+            key_bytes = key # Assume it's already bytes if not string
+
+        cipher = Fernet(key_bytes)
+        return cipher
+    except (ValueError, TypeError) as e: # Catches issues like incorrect key padding or type
+        _log_memory_event("fernet_cipher_error", {"error": f"Invalid ENCRYPTION_KEY format or type: {e}"}, level="critical")
+        # logging.critical(f"Invalid ENCRYPTION_KEY format or type: {e}")
+        return None
+    except Exception as e: # Catch any other unexpected errors during Fernet initialization
+        _log_memory_event("fernet_cipher_error", {"error": f"Unexpected error initializing Fernet cipher: {e}"}, level="critical")
+        # logging.critical(f"Unexpected error initializing Fernet cipher: {e}")
+        return None
+
 # --- Module-Level Logging ---
 LOG_LEVELS = {"debug": 10, "info": 20, "warning": 30, "error": 40, "critical": 50} # Duplicated from brain for now, consider centralizing
+
+# Maximum length for summary fields in logs before truncation.
+_MAX_LOG_SUMMARY_LENGTH = 100
+_SANITIZED_PLACEHOLDER = "[SANITIZED_PATH]"
+
+def _sanitize_log_data(data: dict) -> dict:
+    """
+    Sanitizes potentially sensitive information within log data.
+    Currently focuses on file paths and truncating long summaries.
+    """
+    if not isinstance(data, dict):
+        return data # Return as-is if not a dictionary
+
+    sanitized_data = {}
+    for key, value in data.items():
+        if isinstance(value, str):
+            # Sanitize common path keys
+            if key in ["path", "kg_path", "temp_path", "log_file_path", "log_dir", "file_path", "directory"]:
+                # Basic check if it looks like a path (contains typical path chars)
+                if '/' in value or '\\' in value or (os.path.sep in value if hasattr(os, 'sep') else False):
+                     sanitized_data[key] = _SANITIZED_PLACEHOLDER
+                else:
+                    sanitized_data[key] = value
+            # Truncate long summary fields
+            elif key in ["summary", "concept_summary", "text_content", "message", "details"] and len(value) > _MAX_LOG_SUMMARY_LENGTH:
+                sanitized_data[key] = value[:_MAX_LOG_SUMMARY_LENGTH] + " [TRUNCATED]"
+            # Sanitize paths within error/trace strings (basic attempt)
+            elif key in ["error", "trace", "exception_info"] and (_SANITIZED_PLACEHOLDER.lower() not in value.lower()): # Avoid re-sanitizing
+                # This is a simplistic approach. A more robust solution would use regex to find and replace paths.
+                # For now, replace known project root if present, or common patterns.
+                # This part needs careful implementation to avoid removing useful non-path info.
+                # Let's keep it simple: if it contains common path separators, consider sanitizing more generic parts.
+                # For this iteration, we'll be more conservative and rely on specific key sanitization above.
+                # However, if a known sensitive path is found, it should be replaced.
+                # Example: if config._PROJECT_ROOT is available and found in 'value', replace it.
+                # This is complex to do robustly here, focusing on key-based path sanitization for now.
+                sanitized_data[key] = value # Placeholder for more advanced string sanitization
+            else:
+                sanitized_data[key] = value
+        elif isinstance(value, dict):
+            sanitized_data[key] = _sanitize_log_data(value) # Recursively sanitize nested dicts
+        elif isinstance(value, list):
+            sanitized_data[key] = [_sanitize_log_data(item) if isinstance(item, dict) else item for item in value] # Sanitize dicts in lists
+        else:
+            sanitized_data[key] = value
+    return sanitized_data
 
 def _log_memory_event(event_type: str, data: dict, level: str = "info"):
     """
@@ -60,40 +149,116 @@ def _log_memory_event(event_type: str, data: dict, level: str = "info"):
         return # Skip logging if event level is below configured log level
 
     try:
+        # Sanitize data before constructing the log entry
+        sanitized_data = _sanitize_log_data(data)
+
         log_entry = {
             "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
             "module": "memory",
             "event_type": event_type,
             "level": level.upper(),
-            "data": data
+            "data": sanitized_data # Use sanitized data
         }
         
-        # Ensure the log directory exists (config.ensure_path should handle this for SYSTEM_LOG_PATH at import)
-        # This might be called before config fully initializes ensure_path if there's an early log.
-        # However, config.SYSTEM_LOG_PATH itself implies its parent dir should be ensured by config.py's own init.
-        
-        # Ensure SYSTEM_LOG_PATH's directory exists before writing
-        # This is a safeguard in case config.py's ensure_path hasn't run or is insufficient
+        log_json_str = json.dumps(log_entry, default=str)
+        log_content_bytes = log_json_str.encode('utf-8')
+
+        cipher = _get_fernet_cipher()
+        if cipher:
+            try:
+                encrypted_log_bytes = cipher.encrypt(log_content_bytes)
+                content_to_write = encrypted_log_bytes
+            except Exception as e_encrypt_log:
+                # If log encryption fails, log the error (unencrypted) and the original event (unencrypted)
+                # This is a critical failure for security logging.
+                print(f"CRITICAL (memory.py): Failed to encrypt log event {event_type}. Error: {e_encrypt_log}", file=sys.stderr)
+                # Fallback to writing unencrypted, clearly marked, or skip? For now, write unencrypted for diagnosability.
+                # Prepend with an indicator that this specific log entry is unencrypted.
+                unencrypted_marker = "UNENCRYPTED_LOG_ENTRY :: "
+                content_to_write = unencrypted_marker.encode('utf-8') + log_content_bytes
+        else:
+            # If cipher is not available (e.g. key missing), write unencrypted.
+            # This is a significant security note if encryption was expected.
+            # _get_fernet_cipher() already logs critical if key is missing.
+            content_to_write = log_content_bytes # Write unencrypted
+
         log_file_path = config.SYSTEM_LOG_PATH
         log_dir = os.path.dirname(log_file_path)
         if not os.path.exists(log_dir):
             try:
                 os.makedirs(log_dir, exist_ok=True)
             except Exception as e_mkdir:
-                # Very first log event might not be able to create dir if perms are wrong.
                 print(f"CRITICAL (memory.py): Could not create log directory {log_dir}. Error: {e_mkdir}", file=sys.stderr)
-                return # Cannot log to file if dir creation fails.
+                return
 
-        with open(log_file_path, 'a') as f:
-            f.write(json.dumps(log_entry, default=str) + '\n') # Use default=str for non-serializable data
-            
+        file_existed_before_open = os.path.exists(log_file_path)
+
+        with open(log_file_path, 'ab') as f: # Append bytes
+            f.write(content_to_write + b'\n') # Add newline as bytes
+
+        if not file_existed_before_open: # Attempt to set permissions if the file was just created
+            try:
+                os.chmod(log_file_path, 0o600)
+                _log_memory_event("set_log_permissions_success", {"path": log_file_path, "permissions": "0o600"}, level="debug")
+            except OSError as e_chmod_log:
+                _log_memory_event("set_log_permissions_failure", {"path": log_file_path, "error": str(e_chmod_log)}, level="warning")
+            except Exception as e_chmod_log_unexpected: # Catch any other error during chmod
+                 _log_memory_event("set_log_permissions_unexpected_error", {"path": log_file_path, "error": str(e_chmod_log_unexpected)}, level="warning")
+
     except Exception as e:
-        # Fallback to print if logging to file fails
+        # Fallback to print if logging to file fails (e.g. disk full, permissions)
         print(f"Error logging memory event to file: {e}", file=sys.stderr)
-        print(f"Original memory event: {event_type}, Data: {data}", file=sys.stderr)
-        # Also log the error itself using the same mechanism, but to avoid recursion, check event_type
-        if event_type != "logging_error":
-             _log_memory_event("logging_error", {"error": str(e), "original_event": event_type}, level="error")
+        # Avoid re-logging original data if the error is in logging itself to prevent loops/data exposure.
+        # Instead, log a generic message about the failure and the original event type.
+        sanitized_original_data_preview = {k: (v[:50] + '...' if isinstance(v, str) and len(v) > 50 else v) for k,v in data.items()}
+        print(f"Original memory event type: {event_type}, Sanitized data preview: {sanitized_original_data_preview}", file=sys.stderr)
+
+        # Log the logging error itself (unencrypted, simplified) to avoid recursion if possible.
+        if event_type != "logging_error": # Basic recursion guard
+            # Construct a minimal, safe data payload for the logging error.
+            error_data = {"error": str(e), "original_event_type": event_type}
+            # Try to log this simplified error using the same mechanism, but without encryption for this specific case.
+            # This fallback write will also be synchronous.
+            try:
+                minimal_log_entry = {
+                    "timestamp": datetime.datetime.utcnow().isoformat() + "Z", "module": "memory",
+                    "event_type": "logging_error", "level": "ERROR", "data": error_data
+                }
+                minimal_log_json = json.dumps(minimal_log_entry, default=str)
+                # Synchronous open for this critical fallback.
+                with open(config.SYSTEM_LOG_PATH, 'ab') as f_err: # Append bytes
+                    f_err.write(b"UNENCRYPTED_LOGGING_ERROR :: " + minimal_log_json.encode('utf-8') + b'\n')
+            except Exception as e_log_err: # If even this fails, print to stderr.
+                 print(f"CRITICAL (memory.py): Failed to write minimal logging_error to file. Error: {e_log_err}", file=sys.stderr)
+
+# --- Async File I/O Helpers ---
+# These helpers encapsulate aiofiles operations and are called using asyncio.run() from synchronous functions.
+# This is an interim step towards a fuller async implementation.
+# Limitations: Each asyncio.run() call creates/destroys an event loop, which has overhead.
+# For very frequent calls (like logging), a dedicated async queue with a running loop would be better.
+
+async def _async_write_to_file(filepath: str, content: bytes, mode: str = 'ab') -> None:
+    """Asynchronously writes bytes content to a file."""
+    try:
+        async with aiofiles.open(filepath, mode) as f:
+            await f.write(content)
+    except Exception as e_async_write:
+        # Log synchronous print here as this is an async func, _log_memory_event would need careful handling for recursion
+        print(f"CRITICAL_ASYNC_WRITE_ERROR (memory.py): Failed to write to {filepath}. Error: {e_async_write}", file=sys.stderr)
+        # Re-raise or handle as appropriate for the caller if needed. Here, we absorb and print.
+        # If this function were part of a larger async chain, re-raising might be better.
+
+async def _async_read_file_bytes(filepath: str) -> bytes | None:
+    """Asynchronously reads byte content from a file."""
+    try:
+        async with aiofiles.open(filepath, 'rb') as f:
+            return await f.read()
+    except FileNotFoundError:
+        # Handled by caller logic (e.g., _load_knowledge_graph treats empty graph if file not found)
+        return None
+    except Exception as e_async_read:
+        print(f"CRITICAL_ASYNC_READ_ERROR (memory.py): Failed to read from {filepath}. Error: {e_async_read}", file=sys.stderr)
+        return None # Or re-raise
 
 # --- Knowledge Graph State ---
 _knowledge_graph = {
@@ -101,6 +266,162 @@ _knowledge_graph = {
     "edges": []  # List of edge dictionaries
 }
 _kg_dirty_flag = False # True if _knowledge_graph has in-memory changes not yet saved to disk
+
+# --- Node Indexing Globals and Helpers ---
+_node_id_index = {}  # Maps node ID to the node dictionary
+_node_label_index = {} # Maps node label to a list of node dictionaries
+
+def _update_indexes(node_data: dict, remove: bool = False) -> None:
+    """
+    Updates the global node indexes with the given node data.
+
+    Args:
+        node_data: The dictionary containing node information (must include 'id' and 'label').
+        remove: If True, removes the node from indexes. Otherwise, adds/updates it.
+    """
+    if not isinstance(node_data, dict) or 'id' not in node_data or 'label' not in node_data:
+        _log_memory_event("update_indexes_invalid_input",
+                          {"node_data_preview": str(node_data)[:100], "error": "Missing id or label"},
+                          level="error")
+        return
+
+    node_id = node_data['id']
+    node_label = node_data['label']
+
+    if remove:
+        # Remove from ID index
+        if node_id in _node_id_index:
+            del _node_id_index[node_id]
+
+        # Remove from Label index
+        if node_label in _node_label_index:
+            try:
+                # Iterate to find the specific node instance if multiple nodes share a label
+                # This is important because _node_label_index[node_label] is a list of dicts
+                _node_label_index[node_label] = [n for n in _node_label_index[node_label] if n['id'] != node_id]
+                if not _node_label_index[node_label]: # If list becomes empty
+                    del _node_label_index[node_label]
+            except ValueError: # Node not found in list (should not happen if logic is correct)
+                _log_memory_event("update_indexes_remove_label_value_error",
+                                  {"node_id": node_id, "node_label": node_label}, level="warning")
+    else:
+        # Add to ID index (overwrite if exists, which is fine for updates)
+        _node_id_index[node_id] = node_data
+
+        # Add to Label index
+        if node_label not in _node_label_index:
+            _node_label_index[node_label] = []
+
+        # Avoid duplicate entries if node already in label list (e.g. if called multiple times)
+        # This check makes sense if we are "adding" rather than "rebuilding from scratch"
+        # For _rebuild_indexes, this check is redundant but harmless.
+        # For single node adds (like in store_memory), it's a safeguard.
+        found_in_label_list = False
+        for i, existing_node in enumerate(_node_label_index[node_label]):
+            if existing_node['id'] == node_id:
+                _node_label_index[node_label][i] = node_data # Update existing entry
+                found_in_label_list = True
+                break
+        if not found_in_label_list:
+            _node_label_index[node_label].append(node_data)
+
+def _rebuild_indexes() -> None:
+    """
+    Clears and rebuilds the node ID and label indexes from _knowledge_graph["nodes"].
+    """
+    global _node_id_index, _node_label_index
+    _node_id_index.clear()
+    _node_label_index.clear()
+
+    if "nodes" in _knowledge_graph and isinstance(_knowledge_graph["nodes"], list):
+        for node_data in _knowledge_graph["nodes"]:
+            if isinstance(node_data, dict) and 'id' in node_data and 'label' in node_data:
+                # Use internal add directly, assumes node_data is correct structure
+                _node_id_index[node_data['id']] = node_data
+                if node_data['label'] not in _node_label_index:
+                    _node_label_index[node_data['label']] = []
+                _node_label_index[node_data['label']].append(node_data)
+            else:
+                _log_memory_event("rebuild_indexes_skipping_malformed_node",
+                                  {"node_data_preview": str(node_data)[:100]}, level="warning")
+    _log_memory_event("rebuild_indexes_complete",
+                      {"id_index_size": len(_node_id_index), "label_index_size": len(_node_label_index)},
+                      level="info")
+
+# --- End of Node Indexing Globals and Helpers ---
+
+def _evict_nodes_if_needed(num_nodes_over_cap: int) -> None:
+    """
+    Evicts nodes from the knowledge graph based on the configured policy
+    if the graph size exceeds MAX_GRAPH_NODES.
+
+    Args:
+        num_nodes_over_cap: The number of nodes to evict.
+    """
+    global _kg_dirty_flag # To mark graph as modified
+
+    if num_nodes_over_cap <= 0:
+        return
+
+    _log_memory_event("graph_eviction_triggered",
+                      {"current_nodes": len(_knowledge_graph["nodes"]),
+                       "max_nodes": getattr(config, 'MAX_GRAPH_NODES', 10000),
+                       "nodes_to_evict_target": num_nodes_over_cap},
+                      level="info")
+
+    eviction_policy = getattr(config, 'GRAPH_EVICTION_POLICY', 'oldest')
+    if eviction_policy == 'oldest':
+        parsable_nodes_for_eviction = []
+        for node_to_sort in _knowledge_graph["nodes"]: # Iterate over current nodes
+            if isinstance(node_to_sort, dict) and isinstance(node_to_sort.get("timestamp"), str):
+                try:
+                    dt_obj = datetime.datetime.fromisoformat(node_to_sort["timestamp"].replace('Z', '+00:00'))
+                    parsable_nodes_for_eviction.append((dt_obj, node_to_sort))
+                except ValueError:
+                    _log_memory_event("graph_eviction_invalid_timestamp_during_policy",
+                                      {"node_id": node_to_sort.get("id"), "timestamp": node_to_sort.get("timestamp")},
+                                      level="warning")
+
+        if not parsable_nodes_for_eviction:
+            _log_memory_event("graph_eviction_no_parsable_nodes_for_policy",
+                              {"reason": "No nodes with parsable timestamps found for 'oldest' eviction policy."},
+                              level="error")
+            return
+
+        parsable_nodes_for_eviction.sort(key=lambda x: x[0]) # Sort by datetime object, oldest first
+
+        # Determine actual number of nodes to evict (can't evict more than available parsable nodes)
+        actual_nodes_to_evict = min(num_nodes_over_cap, len(parsable_nodes_for_eviction))
+
+        for i in range(actual_nodes_to_evict):
+            evicted_node_data = parsable_nodes_for_eviction[i][1]
+            evicted_node_id = evicted_node_data['id']
+
+            original_node_count = len(_knowledge_graph["nodes"])
+            _knowledge_graph["nodes"] = [n for n in _knowledge_graph["nodes"] if n['id'] != evicted_node_id]
+            if len(_knowledge_graph["nodes"]) == original_node_count:
+                 _log_memory_event("graph_eviction_node_not_found_in_list_during_evict", {"node_id": evicted_node_id}, level="error")
+                 continue
+
+            _update_indexes(evicted_node_data, remove=True)
+
+            original_edge_count = len(_knowledge_graph["edges"])
+            _knowledge_graph["edges"] = [
+                edge for edge in _knowledge_graph["edges"]
+                if edge.get('source') != evicted_node_id and edge.get('target') != evicted_node_id
+            ]
+            edges_removed_count = original_edge_count - len(_knowledge_graph["edges"])
+
+            _log_memory_event("graph_node_evicted_by_policy",
+                              {"policy": "oldest", "evicted_node_id": evicted_node_id,
+                               "evicted_node_label": evicted_node_data.get('label'),
+                               "evicted_node_timestamp": evicted_node_data.get('timestamp'),
+                               "edges_removed": edges_removed_count},
+                              level="info")
+            _kg_dirty_flag = True
+    else:
+        _log_memory_event("graph_eviction_unknown_policy_in_helper", {"policy": eviction_policy}, level="error")
+
 
 def _load_knowledge_graph():
     """
@@ -129,40 +450,124 @@ def _load_knowledge_graph():
             os.makedirs(parent_dir, exist_ok=True)
 
     try:
-        # Handle cases: file doesn't exist or is empty.
+        # For async read, the os.path.exists and getsize checks are done first.
+        # If the file doesn't exist or is empty, _async_read_file_bytes won't be called unnecessarily.
         if not os.path.exists(kg_path) or os.path.getsize(kg_path) == 0:
             _log_memory_event("load_kg_info", {"message": "Knowledge graph file not found or empty. Initializing new graph.", "path": kg_path}, level="info")
-            _knowledge_graph = {"nodes": [], "edges": []} # Initialize with default structure
-            # This state is considered "clean" as it represents a newly initialized graph.
-            # If an empty file should be explicitly written to disk at this point,
-            # _save_knowledge_graph would need to be called (and dirty flag managed accordingly).
-            _kg_dirty_flag = False 
+            _knowledge_graph = {"nodes": [], "edges": []}
+            _kg_dirty_flag = False
+            # Return here; finally block will handle _rebuild_indexes.
             return
 
-        # Attempt to open and load JSON data from the file.
-        with open(kg_path, 'r') as f:
-            data = json.load(f)
+        # Asynchronously read the file content using asyncio.run()
+        encrypted_content = asyncio.run(_async_read_file_bytes(kg_path))
 
-        # Validate the loaded data structure.
-        if isinstance(data, dict) and \
-           "nodes" in data and isinstance(data["nodes"], list) and \
-           "edges" in data and isinstance(data["edges"], list):
-            _knowledge_graph = data # Assign loaded data to the global variable
-            _kg_dirty_flag = False # Successfully loaded, so in-memory is synchronized
-            _log_memory_event("load_kg_success", {"path": kg_path, "nodes_loaded": len(data["nodes"]), "edges_loaded": len(data["edges"])}, level="info")
-        else: # Malformed structure (e.g., missing 'nodes' or 'edges' keys, or they are not lists)
-            _log_memory_event("load_kg_malformed_structure", {"path": kg_path, "error": "Root must be dict with 'nodes' and 'edges' lists."}, level="error")
-            _knowledge_graph = {"nodes": [], "edges": []} # Reset to default
-            _kg_dirty_flag = False # Considered "clean" as it's reset to a default state
-            
-    except json.JSONDecodeError as e: # Handle errors during JSON parsing
-        _log_memory_event("load_kg_json_decode_error", {"path": kg_path, "error": str(e)}, level="error")
-        _knowledge_graph = {"nodes": [], "edges": []} # Reset to default
-        _kg_dirty_flag = False
-    except Exception as e: # Catch any other unexpected errors during file operations or loading
-        _log_memory_event("load_kg_unknown_error", {"path": kg_path, "error": str(e), "trace": traceback.format_exc()}, level="critical")
-        _knowledge_graph = {"nodes": [], "edges": []} # Reset to default
-        _kg_dirty_flag = False
+        # Check if read was successful (async helper returns None on error/file not found)
+        if encrypted_content is None:
+            # This case implies an issue during async read for an existing, non-empty file,
+            # or the file disappeared between the os.path.exists check and read.
+            _log_memory_event("load_kg_async_read_failed", {"path": kg_path, "error": "Async read helper returned None for an expected existing file."}, level="critical")
+            _knowledge_graph = {"nodes": [], "edges": []} # Fallback to empty graph
+            _kg_dirty_flag = False
+            return
+
+        decrypted_content_str = None
+        # Proceed with decryption only if content was successfully read
+        if encrypted_content: # Check again, as it might be None if read failed and was logged by helper
+            cipher = _get_fernet_cipher()
+            if cipher:
+                try:
+                    decrypted_content_bytes = cipher.decrypt(encrypted_content)
+                    decrypted_content_str = decrypted_content_bytes.decode('utf-8')
+                    _log_memory_event("load_kg_decryption_success", {"path": kg_path}, level="debug")
+                except InvalidToken:
+                    _log_memory_event("load_kg_decryption_invalid_token", {"path": kg_path, "error": "Invalid token or corrupted data."}, level="error")
+                    # Fallback to empty graph, as data is unrecoverable
+                except Exception as e_decrypt: # Other decryption errors
+                    _log_memory_event("load_kg_decryption_error", {"path": kg_path, "error": str(e_decrypt)}, level="error")
+                    # Fallback to empty graph
+            else:
+                _log_memory_event("load_kg_decryption_skipped", {"path": kg_path, "reason": "Cipher not available. Assuming unencrypted or cannot decrypt."}, level="warning")
+                # Attempt to load as plain JSON if cipher is unavailable, for backward compatibility or if key is intentionally removed.
+                # This might fail if the content was indeed encrypted.
+                try:
+                    decrypted_content_str = encrypted_content.decode('utf-8')
+                except UnicodeDecodeError:
+                    _log_memory_event("load_kg_decryption_skipped_decode_error", {"path": kg_path, "error": "Failed to decode content as UTF-8 after skipping decryption."}, level="error")
+                    decrypted_content_str = None # Ensure it's None so it falls to empty graph
+
+        if decrypted_content_str:
+            data = json.loads(decrypted_content_str) # Parse the decrypted JSON string
+
+            # Validate the loaded data structure.
+            if isinstance(data, dict) and \
+               "nodes" in data and isinstance(data["nodes"], list) and \
+               "edges" in data and isinstance(data["edges"], list):
+                _knowledge_graph = data # Assign loaded data to the global variable
+                _kg_dirty_flag = False # Initialize dirty flag, will be set if edges are cleaned
+
+                # --- Edge Integrity Validation ---
+                node_ids = {node['id'] for node in _knowledge_graph["nodes"] if isinstance(node, dict) and 'id' in node}
+                valid_edges = []
+                invalid_edges_info = []
+
+                for edge in _knowledge_graph["edges"]:
+                    if isinstance(edge, dict) and 'source' in edge and 'target' in edge:
+                        source_id = edge['source']
+                        target_id = edge['target']
+                        if source_id in node_ids and target_id in node_ids:
+                            valid_edges.append(edge)
+                        else:
+                            invalid_edges_info.append({
+                                "edge_id": edge.get('id', 'N/A'),
+                                "source": source_id,
+                                "target": target_id,
+                                "source_exists": source_id in node_ids,
+                                "target_exists": target_id in node_ids
+                            })
+                    else: # Malformed edge entry
+                        invalid_edges_info.append({"edge_data": str(edge), "error": "Malformed edge entry"})
+
+                if invalid_edges_info:
+                    _log_memory_event("load_kg_invalid_edges_found",
+                                      {"path": kg_path, "count": len(invalid_edges_info), "details": invalid_edges_info},
+                                      level="warning")
+                    _knowledge_graph["edges"] = valid_edges
+                    _kg_dirty_flag = True # Graph was modified, needs saving
+                # --- End of Edge Integrity Validation ---
+
+                _log_memory_event("load_kg_success", {"path": kg_path, "nodes_loaded": len(_knowledge_graph["nodes"]), "edges_loaded": len(_knowledge_graph["edges"]), "encrypted": True if cipher else False, "edges_cleaned": bool(invalid_edges_info)}, level="info")
+            else: # Malformed structure (e.g., missing 'nodes' or 'edges' keys, or they are not lists)
+                _log_memory_event("load_kg_malformed_structure", {"path": kg_path, "error": "Root must be dict with 'nodes' and 'edges' lists after decryption."}, level="error")
+                _knowledge_graph = {"nodes": [], "edges": []} # Reset to default
+                _kg_dirty_flag = False # Considered "clean" as it's reset to a default state
+        else: # Decryption failed or content was empty after trying to decrypt
+             _log_memory_event("load_kg_empty_content_after_decryption", {"path": kg_path, "reason": "Content was empty or decryption failed."}, level="info")
+             _knowledge_graph = {"nodes": [], "edges": []} # Reset to default
+             _kg_dirty_flag = False
++
++    except json.JSONDecodeError as e: # Handle errors during JSON parsing (of decrypted content)
++        _log_memory_event("load_kg_json_decode_error", {"path": kg_path, "error": str(e)}, level="error")
++        _knowledge_graph = {"nodes": [], "edges": []} # Reset to default
++        _kg_dirty_flag = False
++    except Exception as e: # Catch any other unexpected errors during file operations or loading
++        _log_memory_event("load_kg_unknown_error", {"path": kg_path, "error": str(e), "trace": traceback.format_exc()}, level="critical")
++        _knowledge_graph = {"nodes": [], "edges": []} # Reset to default
++        _kg_dirty_flag = False
++    finally:
++        # Always rebuild indexes, even if graph is empty or reset, to ensure consistency.
++        _rebuild_indexes()
+        # After loading and indexing, check if graph exceeds size cap
+        max_nodes_on_load = getattr(config, 'MAX_GRAPH_NODES', 10000)
+        current_nodes_on_load = len(_knowledge_graph["nodes"])
+        if current_nodes_on_load > max_nodes_on_load:
+            nodes_over_cap = current_nodes_on_load - max_nodes_on_load
+            _log_memory_event("graph_cap_exceeded_on_load",
+                              {"loaded_nodes": current_nodes_on_load, "max_nodes": max_nodes_on_load,
+                               "nodes_to_evict_on_load": nodes_over_cap},
+                              level="info")
+            _evict_nodes_if_needed(nodes_over_cap)
+            # If eviction happened, _kg_dirty_flag will be True, prompting a save.
 
 def _save_knowledge_graph():
     """
@@ -194,15 +599,52 @@ def _save_knowledge_graph():
     temp_kg_path = kg_path + ".tmp" # Define temporary file path for atomic write
 
     try:
-        # Atomicity Step 1: Write the current graph to a temporary file.
-        # Using indent=4 for human-readable JSON output.
-        with open(temp_kg_path, 'w') as f:
-            json.dump(_knowledge_graph, f, indent=4)
+        # Serialize the knowledge graph to a JSON string first
+        json_data_str = json.dumps(_knowledge_graph, indent=4)
+        content_to_write = json_data_str.encode('utf-8') # Default to unencrypted bytes
+
+        cipher = _get_fernet_cipher()
+        if cipher:
+            try:
+                encrypted_content = cipher.encrypt(content_to_write)
+                content_to_write = encrypted_content
+                _log_memory_event("save_kg_encryption_success", {"path": kg_path}, level="debug")
+            except Exception as e_encrypt:
+                _log_memory_event("save_kg_encryption_failure", {"path": kg_path, "error": str(e_encrypt)}, level="critical")
+                # Do not proceed with saving if encryption fails, as per security requirements.
+                # _kg_dirty_flag remains true, so a subsequent attempt might be made.
+                return
+        else:
+            _log_memory_event("save_kg_encryption_skipped", {"path": kg_path, "reason": "Cipher not available. Saving unencrypted (SECURITY RISK if key was intended)."}, level="warning")
+            # Depending on strictness, one might choose to return here as well if encryption is mandatory.
+            # For now, allow unencrypted save if cipher is not available (e.g. key removed from config).
+
+        # Atomicity Step 1: Asynchronously write the content (potentially encrypted) to a temporary file.
+        # See limitations comment with _async_write_to_file.
+        asyncio.run(_async_write_to_file(temp_kg_path, content_to_write, mode='wb'))
+
+        # Crucially, check if the async write operation actually succeeded by verifying file existence and size.
+        # _async_write_to_file currently logs its own errors but doesn't re-raise to asyncio.run's caller.
+        if not os.path.exists(temp_kg_path) or os.path.getsize(temp_kg_path) == 0:
+            _log_memory_event("save_kg_async_write_failed",
+                              {"path": temp_kg_path,
+                               "error": "Temporary file not created or empty after async write. See previous async error logs if any."},
+                              level="critical")
+            # Do not proceed with os.replace if temp file wasn't written correctly.
+            # _kg_dirty_flag remains true, so changes are not lost for next save attempt.
+            return
         
         # Atomicity Step 2: Replace the original file with the temporary file.
         # os.replace is atomic on Windows and POSIX (if target exists and permissions allow).
         # os.rename might fail on Windows if the destination exists.
         os.replace(temp_kg_path, kg_path) # Preferred for atomicity if destination might exist
+
+        try:
+            os.chmod(kg_path, 0o600) # Set restrictive permissions: read/write for owner only
+            _log_memory_event("set_kg_permissions_success", {"path": kg_path, "permissions": "0o600"}, level="debug")
+        except OSError as e_chmod:
+            _log_memory_event("set_kg_permissions_failure", {"path": kg_path, "error": str(e_chmod)}, level="warning")
+            # Continue even if chmod fails, as the file is saved. This is a hardening step.
 
         _kg_dirty_flag = False # Reset dirty flag only after successful write and rename
         _log_memory_event("save_kg_success", {"path": kg_path, "nodes_saved": len(_knowledge_graph["nodes"]), "edges_saved": len(_knowledge_graph["edges"])}, level="info")
@@ -259,102 +701,110 @@ def calculate_novelty(concept_coord: tuple, concept_summary: str) -> float:
             return 0.0 # Return 0.0 novelty if any coordinate part is invalid.
     current_coord_np = np.array(processed_coords)
 
-    # --- Spatial Novelty Calculation ---
-    # Spatial novelty is based on the minimum normalized Euclidean distance to existing nodes in the KG.
-    # A higher distance implies higher novelty.
-    spatial_novelty_score = 1.0 # Default to max novelty if no existing nodes or other issues.
+    # Clip incoming coordinates for novelty calculation
+    # Ensure config values are available, with defaults
+    min_val = getattr(config, 'COORDINATE_MIN_VALUE', -1000.0)
+    max_val = getattr(config, 'COORDINATE_MAX_VALUE', 1000.0)
     
-    if _knowledge_graph["nodes"]: # Only calculate if there are existing nodes to compare against.
-        min_dist_sq_normalized = float('inf') # Initialize with a very large value for squared distance.
-        
-        # Normalization factor for coordinates. MANIFOLD_RANGE from config defines the typical
-        # extent of a single dimension in the coordinate space. Distances are normalized by this range.
-        norm_factor = getattr(config, 'MANIFOLD_RANGE', 1000.0) # Use default if not in config
-        if norm_factor == 0: # Prevent division by zero if MANIFOLD_RANGE is misconfigured.
-            _log_memory_event("calculate_novelty_warning", {"warning": "MANIFOLD_RANGE is 0 or not configured. Spatial distance normalization will be ineffective using 1.0."}, level="warning")
-            norm_factor = 1.0 # Use 1.0 to avoid error, though normalization becomes identity.
+    original_coords_for_log = current_coord_np.copy() # For logging if clipping occurs
+    np.clip(current_coord_np, min_val, max_val, out=current_coord_np)
 
-        processed_node_coords = 0 # Counter for nodes with valid coordinates.
+    if not np.array_equal(original_coords_for_log, current_coord_np):
+        _log_memory_event("calculate_novelty_coord_clipping",
+                          {"original_coord": original_coords_for_log.tolist(),
+                           "clipped_coord": current_coord_np.tolist(),
+                           "min_clip": min_val, "max_clip": max_val},
+                          level="info")
+
+    # --- Data Collection: Single loop for coordinates and summaries ---
+    existing_node_coords_list = []
+    existing_node_summaries = []
+    if _knowledge_graph["nodes"]:
         for node in _knowledge_graph["nodes"]:
-            node_coord_data = node.get("coordinates") # Existing node's coordinates
+            # Spatial data collection
+            node_coord_data = node.get("coordinates")
             if isinstance(node_coord_data, (list, tuple)) and len(node_coord_data) == 4:
                 try:
-                    # Safely convert node coordinates
-                    processed_node_coord_parts = []
-                    valid_node_coord = True
-                    for i_node_c, node_c_part in enumerate(node_coord_data):
-                        try:
-                            processed_node_coord_parts.append(float(node_c_part))
-                        except (ValueError, TypeError) as e_node_c:
-                            _log_memory_event("calculate_novelty_node_coord_part_error", 
-                                              {"node_id": node.get("id"), "coord_data": str(node_coord_data), 
-                                               "part_index": i_node_c, "part_value": node_c_part, "error": str(e_node_c)}, 
-                                              level="debug")
-                            valid_node_coord = False
-                            break
-                    if not valid_node_coord:
-                        continue # Skip this node if its coordinates are malformed
+                    processed_parts = [float(c) for c in node_coord_data]
+                    existing_node_coords_list.append(np.array(processed_parts))
+                except (ValueError, TypeError):
+                    _log_memory_event("calculate_novelty_invalid_stored_coord",
+                                      {"node_id": node.get("id"), "coord_data": str(node_coord_data)},
+                                      level="debug") # Was warning, changed to debug as it's per-node
 
-                    node_coord_np = np.array(processed_node_coord_parts)
-                    # Calculate squared Euclidean distance, normalized by norm_factor for each dimension.
-                    diff_sq_normalized = np.sum(((current_coord_np - node_coord_np) / norm_factor)**2)
-                    min_dist_sq_normalized = min(min_dist_sq_normalized, diff_sq_normalized)
-                    processed_node_coords += 1
-                except Exception as e_inner_spatial: # Catch any other unexpected error in loop
-                    _log_memory_event("calculate_novelty_spatial_loop_error", 
-                                      {"node_id": node.get("id"), "error": str(e_inner_spatial)}, 
-                                      level="warning")
-                    continue # Skip this node
+            # Textual data collection
+            node_summary = node.get("summary", "") # Default to empty string if no summary
+            if node_summary: # Only add non-empty summaries to corpus for TF-IDF
+                 existing_node_summaries.append(node_summary)
 
-        if processed_node_coords > 0 and min_dist_sq_normalized != float('inf'):
-            # Convert minimum squared normalized distance to actual distance.
+    # --- Spatial Novelty Calculation ---
+    spatial_novelty_score = 1.0 # Default to max novelty
+    if existing_node_coords_list: # Only if there are valid coordinates from existing nodes
+        min_dist_sq_normalized = float('inf')
+        norm_factor = getattr(config, 'MANIFOLD_RANGE', 1000.0)
+        if norm_factor == 0:
+            _log_memory_event("calculate_novelty_warning", {"warning": "MANIFOLD_RANGE is 0. Using 1.0 for norm."}, level="warning")
+            norm_factor = 1.0
+
+        for node_coord_np in existing_node_coords_list:
+            diff_sq_normalized = np.sum(((current_coord_np - node_coord_np) / norm_factor)**2)
+            min_dist_sq_normalized = min(min_dist_sq_normalized, diff_sq_normalized)
+
+        if min_dist_sq_normalized != float('inf'):
             min_dist_normalized = np.sqrt(min_dist_sq_normalized)
-            # Spatial novelty score: Linearly maps normalized distance to novelty.
-            # A distance of 0 implies 0 novelty. A distance of 1.0 (or more) implies full novelty.
-            # This assumes that if a concept is 1 "manifold unit" away (after normalization), it's fully novel.
-            # This mapping might need tuning depending on desired sensitivity.
             spatial_novelty_score = np.clip(min_dist_normalized, 0.0, 1.0)
             
-    _log_memory_event("calculate_novelty_spatial", {"score": spatial_novelty_score, "nodes_compared": len(_knowledge_graph.get('nodes',[]))}, level="debug")
+    _log_memory_event("calculate_novelty_spatial", {"score": spatial_novelty_score, "nodes_compared": len(existing_node_coords_list)}, level="debug")
 
-    # --- Textual Novelty Calculation ---
-    # Textual novelty is based on the maximum Jaccard similarity between the concept's summary
-    # and summaries of existing nodes. Novelty = 1 - max_similarity.
+    # --- Textual Novelty Calculation (TF-IDF based) ---
     textual_novelty_score = 1.0 # Default to max novelty.
-    
-    if _knowledge_graph["nodes"] and concept_summary: # Requires existing nodes and a non-empty summary.
-        max_jaccard_similarity = 0.0
-        current_summary_lower = concept_summary.lower() # Case-insensitive comparison.
-        current_tokens = set(current_summary_lower.split()) # Tokenize summary into a set of words.
+    max_similarity = 0.0
 
-        if not current_tokens: # If current summary is empty or only whitespace.
-            textual_novelty_score = getattr(config, 'TEXTUAL_NOVELTY_EMPTY_SUMMARY_SCORE', 0.5)
-        else:
-            processed_text_nodes = 0
-            for node in _knowledge_graph["nodes"]:
-                node_summary = node.get("summary")
-                if isinstance(node_summary, str) and node_summary: # Check if node has a valid summary.
-                    node_summary_lower = node_summary.lower()
-                    node_tokens = set(node_summary_lower.split())
-                    
-                    if not node_tokens: continue # Skip comparison if existing node's summary is empty.
+    if not concept_summary:
+        textual_novelty_score = getattr(config, 'TEXTUAL_NOVELTY_EMPTY_SUMMARY_SCORE', 0.5)
+        _log_memory_event("calculate_novelty_textual_empty_input_summary", {"score": textual_novelty_score}, level="debug")
+    elif not existing_node_summaries: # No existing valid summaries to compare against.
+        _log_memory_event("calculate_novelty_textual_no_existing_summaries", {"score": textual_novelty_score}, level="debug")
+        # textual_novelty_score remains 1.0
+    else:
+        # Add the current concept's summary to the corpus for vectorization
+        full_corpus = existing_node_summaries + [concept_summary]
 
-                    # Calculate Jaccard Similarity: intersection_size / union_size
-                    intersection_size = len(current_tokens.intersection(node_tokens))
-                    union_size = len(current_tokens.union(node_tokens))
-                    
-                    if union_size == 0: # Both summaries effectively empty (e.g. only common stop words if not filtered)
-                        similarity = 1.0 if not current_tokens and not node_tokens else 0.0
-                    else:
-                        similarity = intersection_size / union_size
-                    
-                    max_jaccard_similarity = max(max_jaccard_similarity, similarity)
-                    processed_text_nodes += 1
+        try:
+            vectorizer = TfidfVectorizer(stop_words='english') # TODO: Consider config for TfidfVectorizer params
+            tfidf_matrix = vectorizer.fit_transform(full_corpus)
             
-            if processed_text_nodes > 0: # If compared against at least one node.
-                textual_novelty_score = 1.0 - max_jaccard_similarity # Higher similarity means lower novelty.
-    
-    _log_memory_event("calculate_novelty_textual", {"score": textual_novelty_score, "nodes_compared": len(_knowledge_graph.get('nodes',[]))}, level="debug")
+            concept_vector = tfidf_matrix[-1:]
+            existing_nodes_vectors = tfidf_matrix[:-1]
+
+            if existing_nodes_vectors.shape[0] > 0:
+                cosine_similarities = cosine_similarity(concept_vector, existing_nodes_vectors)
+                if cosine_similarities.size > 0:
+                    max_similarity = np.max(cosine_similarities[0])
+                # else max_similarity remains 0.0
+            # else max_similarity remains 0.0
+
+            textual_novelty_score = 1.0 - max_similarity
+            _log_memory_event("calculate_novelty_textual_tfidf",
+                              {"score": textual_novelty_score, "max_similarity_tfidf": max_similarity,
+                               "corpus_size": len(full_corpus), "existing_summaries_count": len(existing_node_summaries)},
+                              level="debug")
+
+        except ValueError as e_tfidf:
+            _log_memory_event("calculate_novelty_textual_tfidf_error",
+                              {"error": str(e_tfidf), "concept_summary": concept_summary,
+                               "corpus_preview": existing_node_summaries[:3]},
+                              level="warning")
+            if "empty vocabulary" in str(e_tfidf).lower() and not concept_summary.strip():
+                textual_novelty_score = getattr(config, 'TEXTUAL_NOVELTY_EMPTY_SUMMARY_SCORE', 0.5)
+            else:
+                textual_novelty_score = 0.9
+        except Exception as e_general_tfidf:
+            _log_memory_event("calculate_novelty_textual_tfidf_general_error",
+                              {"error": str(e_general_tfidf)}, level="error")
+            textual_novelty_score = 0.9
+
+    _log_memory_event("calculate_novelty_textual", {"score": textual_novelty_score, "method": "tfidf", "nodes_compared": len(existing_node_summaries)}, level="debug")
 
     # --- Combine Spatial and Textual Novelties ---
     # Weighted average of spatial and textual novelty scores.
@@ -437,7 +887,24 @@ def store_memory(concept_name: str, concept_coord: tuple, summary: str,
                                   {"concept_name": concept_name, "coord_part_index": i_c, "value": c_part, "error": str(e_c)}, 
                                   level="warning")
                 return False # Reject if coordinate part is invalid
-        numeric_coord = tuple(numeric_coord_parts)
++
++        # Clip coordinates before creating the tuple
++        clipped_coord_parts = []
++        min_val = getattr(config, 'COORDINATE_MIN_VALUE', -1000.0) # Default if not in config
++        max_val = getattr(config, 'COORDINATE_MAX_VALUE', 1000.0) # Default if not in config
++
++        for i, part in enumerate(numeric_coord_parts):
++            original_part = part
++            clipped_part = max(min_val, min(part, max_val))
++            if clipped_part != original_part:
++                _log_memory_event("store_memory_coord_clipping",
++                                  {"concept_name": concept_name, "coord_index": i,
++                                   "original_value": original_part, "clipped_value": clipped_part,
++                                   "min_clip": min_val, "max_clip": max_val},
++                                  level="info")
++            clipped_coord_parts.append(clipped_part)
++        numeric_coord = tuple(clipped_coord_parts)
++
     except Exception as e_coord_processing: # Catch any other issue with coord processing
         _log_memory_event("store_memory_invalid_coord_processing",
                           {"concept_name": concept_name, "coord_value": str(concept_coord), "error": str(e_coord_processing)},
@@ -538,19 +1005,28 @@ def store_memory(concept_name: str, concept_coord: tuple, summary: str,
                                               {"source_id": memory_id, "target_name": related_item_specifier}, 
                                               level="warning")
                 
-                if target_node_id: # If a valid target ID was found.
-                    # Create a new edge to represent the relationship.
-                    new_edge = {
-                        "id": uuid.uuid4().hex, # Unique ID for the edge itself.
-                        "source": memory_id, # ID of the new memory node.
-                        "target": target_node_id, # ID of the related memory node.
-                        "relation_type": default_relation_type, 
-                        "timestamp": timestamp # Timestamp of relationship creation.
-                    }
-                    _knowledge_graph["edges"].append(new_edge) # Add edge to in-memory graph.
-                    _log_memory_event("store_memory_relation_added", 
-                                      {"source_id": memory_id, "target_id": target_node_id, "edge_id": new_edge["id"]}, 
-                                      level="debug")
+                if target_node_id: # If a valid target ID was resolved
+                    # Explicitly verify target_node_id still exists in the graph before creating edge.
+                    # memory_id (source) is for the node currently being added, so it's implicitly valid here.
+                    if any(node['id'] == target_node_id for node in _knowledge_graph['nodes']):
+                        new_edge = {
+                            "id": uuid.uuid4().hex, # Unique ID for the edge itself.
+                            "source": memory_id, # ID of the new memory node.
+                            "target": target_node_id, # ID of the related memory node.
+                            "relation_type": default_relation_type,
+                            "timestamp": timestamp # Timestamp of relationship creation.
+                        }
+                        _knowledge_graph["edges"].append(new_edge) # Add edge to in-memory graph.
+                        _log_memory_event("store_memory_relation_added",
+                                          {"source_id": memory_id, "target_id": target_node_id, "edge_id": new_edge["id"]},
+                                          level="debug")
+                    else:
+                        # This case should ideally not be reached if target_node_id resolution is correct
+                        # and no concurrent modifications are happening.
+                        _log_memory_event("store_memory_relation_target_disappeared",
+                                          {"source_id": memory_id, "intended_target_id": target_node_id,
+                                           "reason": "Target node ID not found in graph at edge creation time."},
+                                          level="error")
 
         _kg_dirty_flag = True # Mark the graph as modified.
         _save_knowledge_graph() # Attempt to save the updated graph to disk immediately.
@@ -559,6 +1035,16 @@ def store_memory(concept_name: str, concept_coord: tuple, summary: str,
                           {"memory_id": memory_id, "concept_name": concept_name, 
                            "node_count": len(_knowledge_graph['nodes']), "edge_count": len(_knowledge_graph['edges'])}, 
                           level="info")
+        _update_indexes(new_node) # Update indexes with the new node
+
+        # --- Graph Size Capping ---
+        max_nodes_config = getattr(config, 'MAX_GRAPH_NODES', 10000)
+        current_node_count = len(_knowledge_graph["nodes"])
+
+        if current_node_count > max_nodes_config:
+            nodes_over_cap = current_node_count - max_nodes_config
+            _evict_nodes_if_needed(nodes_over_cap)
+
         return True
 
     except Exception as e: # Catch any other unexpected errors during storage.
@@ -582,24 +1068,17 @@ def get_memory_by_id(memory_id: str) -> dict | None:
         return None
 
     try:
-        # Ensure _knowledge_graph and "nodes" key exist and "nodes" is a list
-        if not isinstance(_knowledge_graph, dict) or            not isinstance(_knowledge_graph.get("nodes"), list):
-            _log_memory_event("get_memory_by_id_kg_malformed", 
-                              {"error": "Knowledge graph not initialized or malformed"}, 
-                              level="error")
+        # Use the ID index for direct lookup
+        node = _node_id_index.get(memory_id)
+        if node:
+            _log_memory_event("get_memory_by_id_success_indexed", {"memory_id": memory_id}, level="debug")
+            return node.copy() # Return a copy to prevent external modification
+        else:
+            _log_memory_event("get_memory_by_id_not_found_indexed", {"memory_id": memory_id}, level="debug")
             return None
             
-        for node in _knowledge_graph["nodes"]:
-            if isinstance(node, dict) and node.get("id") == memory_id:
-                _log_memory_event("get_memory_by_id_success", {"memory_id": memory_id}, level="debug")
-                return node # Return a copy to prevent external modification? For now, return original.
-                           # Consider: return node.copy() if external modification is a concern.
-        
-        _log_memory_event("get_memory_by_id_not_found", {"memory_id": memory_id}, level="debug")
-        return None
-        
-    except Exception as e:
-        _log_memory_event("get_memory_by_id_exception", {"memory_id": memory_id, "error": str(e), "trace": traceback.format_exc()}, level="error")
+    except Exception as e: # Should be less likely with direct dict access, but good for safety
+        _log_memory_event("get_memory_by_id_exception_indexed", {"memory_id": memory_id, "error": str(e), "trace": traceback.format_exc()}, level="error")
         return None
 
 def get_memories_by_concept_name(concept_name: str, exact_match: bool = True) -> list:
@@ -620,32 +1099,36 @@ def get_memories_by_concept_name(concept_name: str, exact_match: bool = True) ->
 
     found_memories = []
     try:
-        if not isinstance(_knowledge_graph, dict) or            not isinstance(_knowledge_graph.get("nodes"), list):
-            _log_memory_event("get_memories_by_name_kg_malformed", 
-                              {"error": "Knowledge graph not initialized or malformed"}, 
-                              level="error")
-            return []
+        if exact_match:
+            # Use the label index for exact matches
+            nodes_with_label = _node_label_index.get(concept_name, [])
+            found_memories = [node.copy() for node in nodes_with_label] # Return copies
+            _log_memory_event("get_memories_by_name_exact_indexed",
+                              {"concept_name": concept_name, "count": len(found_memories)},
+                              level="debug")
+        else:
+            # Fallback to iteration for substring matches (case-insensitive)
+            # This part remains unchanged as _node_label_index is for exact labels.
+            if not isinstance(_knowledge_graph, dict) or not isinstance(_knowledge_graph.get("nodes"), list):
+                _log_memory_event("get_memories_by_name_kg_malformed_substring",
+                                  {"error": "Knowledge graph not initialized or malformed for substring search"},
+                                  level="error")
+                return []
 
-        search_term_lower = concept_name.lower() # For case-insensitive search
-
-        for node in _knowledge_graph["nodes"]:
-            if isinstance(node, dict) and "label" in node and isinstance(node["label"], str):
-                node_label = node["label"]
-                if exact_match:
-                    if node_label == concept_name:
-                        found_memories.append(node) # Consider node.copy()
-                else: # Substring match, case-insensitive
-                    if search_term_lower in node_label.lower():
-                        found_memories.append(node) # Consider node.copy()
+            search_term_lower = concept_name.lower()
+            for node in _knowledge_graph["nodes"]: # Iterate through main graph for substring
+                if isinstance(node, dict) and "label" in node and isinstance(node["label"], str):
+                    if search_term_lower in node["label"].lower():
+                        found_memories.append(node.copy()) # Return copies
+            _log_memory_event("get_memories_by_name_substring_iterated",
+                              {"concept_name": concept_name, "count": len(found_memories)},
+                              level="debug")
         
-        _log_memory_event("get_memories_by_name_result", 
-                          {"concept_name": concept_name, "exact_match": exact_match, "count": len(found_memories)}, 
-                          level="debug")
         return found_memories
 
     except Exception as e:
         _log_memory_event("get_memories_by_name_exception", 
-                          {"concept_name": concept_name, "error": str(e), "trace": traceback.format_exc()}, 
+                          {"concept_name": concept_name, "exact_match": exact_match, "error": str(e), "trace": traceback.format_exc()},
                           level="error")
         return [] # Return empty list on error
 
@@ -683,20 +1166,35 @@ def get_recent_memories(limit: int = 10) -> list:
                               level="error")
             return []
 
-        # Filter out nodes that might lack a timestamp or have an invalid one, though ideally all nodes from store_memory will have it.
-        valid_nodes_with_timestamp = [
-            node for node in _knowledge_graph["nodes"] 
-            if isinstance(node, dict) and isinstance(node.get("timestamp"), str)
-        ]
-        
-        # Sort nodes by timestamp in descending order (most recent first)
-        # ISO format timestamps (like "2023-05-15T10:30:00Z") can be compared lexicographically.
-        sorted_nodes = sorted(valid_nodes_with_timestamp, key=lambda x: x["timestamp"], reverse=True)
+        # Filter nodes with valid and parsable timestamps
+        parsable_nodes = []
+        for node in _knowledge_graph["nodes"]:
+            if isinstance(node, dict) and isinstance(node.get("timestamp"), str):
+                try:
+                    # Validate and prepare for sorting by parsing the timestamp
+                    datetime.datetime.fromisoformat(node["timestamp"].replace('Z', '+00:00'))
+                    parsable_nodes.append(node)
+                except ValueError:
+                    _log_memory_event("get_recent_memories_invalid_timestamp",
+                                      {"node_id": node.get("id"), "timestamp": node.get("timestamp")},
+                                      level="warning")
+            elif isinstance(node, dict): # Log if node is dict but timestamp is missing/wrong type
+                 _log_memory_event("get_recent_memories_missing_timestamp",
+                                   {"node_id": node.get("id"), "timestamp_val": node.get("timestamp", "NotSet")},
+                                   level="debug")
+
+
+        # Sort nodes by actual datetime objects for robustness
+        sorted_nodes = sorted(
+            parsable_nodes,
+            key=lambda x: datetime.datetime.fromisoformat(x["timestamp"].replace('Z', '+00:00')),
+            reverse=True
+        )
         
         returned_memories = sorted_nodes[:limit] # Get the top 'limit' memories
         
         _log_memory_event("get_recent_memories_success", 
-                          {"limit": limit, "returned_count": len(returned_memories)}, 
+                          {"limit": limit, "returned_count": len(returned_memories), "parsable_nodes": len(parsable_nodes)},
                           level="debug")
         # Consider returning copies: [node.copy() for node in returned_memories]
         return returned_memories
@@ -728,14 +1226,29 @@ def read_memory(n: int = None) -> list:
                               level="error")
             return []
 
-        # Filter out nodes that might lack a timestamp or have an invalid one
-        valid_nodes_with_timestamp = [
-            node for node in _knowledge_graph["nodes"] 
-            if isinstance(node, dict) and isinstance(node.get("timestamp"), str)
-        ]
-        
-        # Sort nodes by timestamp in descending order (most recent first)
-        sorted_nodes = sorted(valid_nodes_with_timestamp, key=lambda x: x["timestamp"], reverse=True)
+        # Filter nodes with valid and parsable timestamps
+        parsable_nodes = []
+        for node in _knowledge_graph["nodes"]:
+            if isinstance(node, dict) and isinstance(node.get("timestamp"), str):
+                try:
+                    # Validate and prepare for sorting by parsing the timestamp
+                    datetime.datetime.fromisoformat(node["timestamp"].replace('Z', '+00:00'))
+                    parsable_nodes.append(node)
+                except ValueError:
+                    _log_memory_event("read_memory_invalid_timestamp",
+                                      {"node_id": node.get("id"), "timestamp": node.get("timestamp")},
+                                      level="warning")
+            elif isinstance(node, dict): # Log if node is dict but timestamp is missing/wrong type
+                 _log_memory_event("read_memory_missing_timestamp",
+                                   {"node_id": node.get("id"), "timestamp_val": node.get("timestamp", "NotSet")},
+                                   level="debug")
+
+        # Sort nodes by actual datetime objects for robustness
+        sorted_nodes = sorted(
+            parsable_nodes,
+            key=lambda x: datetime.datetime.fromisoformat(x["timestamp"].replace('Z', '+00:00')),
+            reverse=True
+        )
         
         if n is not None and isinstance(n, int) and n > 0:
             returned_memories = sorted_nodes[:n]
@@ -848,8 +1361,11 @@ if __name__ == '__main__':
     # For these tests, TempConfigOverride will handle VERBOSE_OUTPUT.
 
     module_dir = os.path.dirname(os.path.abspath(__file__))
-    TEST_KNOWLEDGE_GRAPH_PATH = os.path.join(module_dir, TEST_KG_FILENAME)
-    TEST_SYSTEM_LOG_PATH = os.path.join(module_dir, "test_memory_system_log.json")
+    # Define the dedicated test output directory
+    TEST_OUTPUT_DIR = os.path.join(module_dir, "tests", "output")
+
+    TEST_KNOWLEDGE_GRAPH_PATH = os.path.join(TEST_OUTPUT_DIR, TEST_KG_FILENAME)
+    TEST_SYSTEM_LOG_PATH = os.path.join(TEST_OUTPUT_DIR, "test_memory_system_log.json")
 
 
     def setup_test_environment():
@@ -857,10 +1373,15 @@ if __name__ == '__main__':
         Prepares the testing environment for memory module tests.
 
         This involves:
-        1.  Deleting any existing test knowledge graph file.
-        2.  Resetting the in-memory `_knowledge_graph` and `_kg_dirty_flag` to a clean state.
+        1.  Ensuring the test output directory exists.
+        2.  Deleting any existing test knowledge graph and log files from previous runs.
+        3.  Resetting the in-memory `_knowledge_graph` and `_kg_dirty_flag` to a clean state.
         """
         global _knowledge_graph, _kg_dirty_flag
+
+        # Ensure the test output directory exists
+        os.makedirs(TEST_OUTPUT_DIR, exist_ok=True)
+
         if os.path.exists(TEST_KNOWLEDGE_GRAPH_PATH):
             os.remove(TEST_KNOWLEDGE_GRAPH_PATH)
         if os.path.exists(TEST_SYSTEM_LOG_PATH): # Also clean up system log for tests
@@ -1196,6 +1717,8 @@ if __name__ == '__main__':
         test_calculate_novelty_scenarios,
         test_store_and_retrieve_memory,
         test_retrieval_empty_graph,
+        test_large_graph_operations,
+        test_graph_capacity_and_eviction, # Added new test
     ]
     
     results = []

@@ -3,3 +3,6 @@ torch
 snntorch
 numpy
 requests
+cryptography==42.0.8
+scikit-learn==1.5.0
+aiofiles==23.2.1

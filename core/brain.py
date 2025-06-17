@@ -8,6 +8,8 @@ This module is responsible for:
 - Generating awareness metrics based on SNN activity and coherence.
 """
 
+__version__ = "0.1.0"
+
 import datetime
 import json
 import os

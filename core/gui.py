@@ -5,6 +5,8 @@ Provides a Streamlit-based Graphical User Interface for interacting with
 Sophia_Alpha2.
 """
 
+__version__ = "0.1.0"
+
 import json
 import os
 import sys

@@ -34,6 +34,12 @@ except NameError: # __file__ not defined (e.g. in some embedded environments)
          sys.path.insert(0, project_root_path)
 
 # Config Import
+# The 'config' module is imported directly as 'config'.
+# In some projects, an alias like 'app_config' (e.g., 'from config import config as app_config')
+# is used to avoid potential name clashes if 'config' were a common local variable name.
+# However, given 'config' is consistently used as the global accessor for configuration
+# settings across modules in this project, maintaining the direct import 'config'
+# is acceptable for consistency here.
 try:
     from config import config # Assuming config.py is within a 'config' package/directory
 except ImportError as e_config_import:
@@ -259,6 +265,13 @@ async def main_logic(cli_args):
                             stream_thought_steps=getattr(config, 'DEFAULT_SINGLE_QUERY_STREAM_THOUGHTS', False)
                         )
 
+                        # TODO: Refactor core_dialogue.generate_response to be a true generator
+                        #       if CLI response streaming is a desired feature.
+                        # The current core_dialogue.generate_response returns a direct tuple,
+                        # so the following streaming logic (iterating over response_generator)
+                        # will likely not execute as a stream. The 'else' path that treats
+                        # response_generator as a direct tuple is currently the effective path.
+                        # This conceptual streaming code is a placeholder for future enhancement.
                         # Check if it's a generator (conceptual check)
                         if hasattr(response_generator, '__iter__') and not isinstance(response_generator, (str, tuple)):
                             full_response_parts = []

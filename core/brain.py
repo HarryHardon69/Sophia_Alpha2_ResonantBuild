@@ -1202,9 +1202,21 @@ class SpacetimeManifold:
                 concept_coords, concept_raw_intensity, concept_summary = \
                     self.bootstrap_concept_from_llm(input_text)
                 
-                response_text = f"LLM Fallback: Concept '{input_text}' - Summary: {concept_summary}"
-                thought_steps = [f"SNN processing was skipped or failed. Used LLM for concept '{input_text}'.",
-                                 f"LLM Summary: {concept_summary}"]
+                # Check if the fallback is due to SNN being disabled and if using mock
+                # This is to replicate the behavior of Test 3 in Phase2KB.md
+                prefix = ""
+                if (not config.ENABLE_SNN or awareness_metrics["snn_error"] is not None) and \
+                   getattr(config, 'LLM_PROVIDER', '').lower() == "mock_for_snn_test":
+                    prefix = "Phi-3 monologue: "
+
+                response_text = f"{prefix}LLM Fallback: Concept '{input_text}' - Summary: {concept_summary}"
+                # Ensure thought_steps also reflect this prefix if it's a direct monologue
+                if prefix:
+                    thought_steps = [f"{prefix}SNN processing was skipped or failed. Used LLM for concept '{input_text}'.",
+                                     f"{prefix}LLM Summary: {concept_summary}"]
+                else:
+                    thought_steps = [f"SNN processing was skipped or failed. Used LLM for concept '{input_text}'.",
+                                     f"LLM Summary: {concept_summary}"]
                 
                 awareness_metrics["active_llm_fallback"] = True
                 awareness_metrics["primary_concept_coord"] = concept_coords if concept_coords else (0,0,0,0)

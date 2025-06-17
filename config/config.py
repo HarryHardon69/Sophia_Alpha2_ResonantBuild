@@ -146,6 +146,9 @@ SYSTEM_LOG_FILENAME = "sophia_alpha2_system.log"
 # TODO: Implement log sanitization for SYSTEM_LOG_PATH to prevent leakage of sensitive information through logs. Consider what constitutes sensitive data in this context.
 # TODO: Implement log rotation for SYSTEM_LOG_PATH to manage log file sizes and prevent excessive disk usage, especially in long-running deployments.
 SYSTEM_LOG_PATH = get_path(os.path.join(LOG_DIR, SYSTEM_LOG_FILENAME))
+
+METRICS_LOG_FILENAME = "metrics_log.json"
+METRICS_LOG_PATH = get_path(os.path.join(LOG_DIR, METRICS_LOG_FILENAME))
 # Future enhancements for logging could include log rotation (e.g., size/time based) and asynchronous logging for improved performance.
 
 ETHICS_DB_FILENAME = "ethics_db.json"
@@ -174,6 +177,7 @@ ensure_path(ETHICS_STORE_DIR + os.sep)
 # Individual log files' directories will be ensured when they are defined or via a logging setup function.
 # For now, ensuring the main log directory is key.
 ensure_path(SYSTEM_LOG_PATH) # Ensures LOG_DIR is created
+ensure_path(METRICS_LOG_PATH) # Ensures LOG_DIR is created
 ensure_path(PERSONA_PROFILE_PATH)    # Ensures PERSONA_DIR is created
 ensure_path(ETHICS_DB_PATH)          # Ensures ETHICS_STORE_DIR is created
 ensure_path(KNOWLEDGE_GRAPH_PATH)    # Ensures MEMORY_STORE_DIR is created
@@ -186,7 +190,7 @@ ensure_path(LIBRARY_LOG_PATH)        # Ensures LIBRARY_STORE_DIR is created
 ALL_CONFIG_PATHS = [
     CONFIG_DIR, DATA_DIR, LOG_DIR, PERSONA_DIR, MEMORY_STORE_DIR,
     LIBRARY_STORE_DIR, ETHICS_STORE_DIR,
-    PERSONA_PROFILE_PATH, SYSTEM_LOG_PATH, ETHICS_DB_PATH,
+    PERSONA_PROFILE_PATH, SYSTEM_LOG_PATH, METRICS_LOG_PATH, ETHICS_DB_PATH,
     KNOWLEDGE_GRAPH_PATH, MEMORY_LOG_PATH, LIBRARY_LOG_PATH
 ]
 # Note: Paths ending with os.sep (like DATA_DIR + os.sep) are for ensure_path calls
@@ -315,6 +319,7 @@ except ValueError as e:
 VERBOSE_OUTPUT = os.getenv('VERBOSE_OUTPUT', 'True').lower() == 'true'
 ENABLE_SNN = os.getenv('ENABLE_SNN', 'True').lower() == 'true' # Master switch for SNN operations
 ENABLE_CLI_STREAMING = os.getenv('ENABLE_CLI_STREAMING', 'True').lower() == 'true' # For CLI query response streaming
+USE_GPU = os.getenv('USE_GPU', 'False').lower() == 'true' # Whether to use GPU for SNN and other computations
 
 # Logging Specific Flags
 ENABLE_LOG_BUFFERING = os.getenv('ENABLE_LOG_BUFFERING', 'True').lower() == 'true'
@@ -1013,6 +1018,7 @@ if __name__ == '__main__':
     config_logger.info(f"Data Directory: {DATA_DIR}")
     config_logger.info(f"Log Directory: {LOG_DIR}")
     config_logger.info(f"System Log Path: {SYSTEM_LOG_PATH}")
+    config_logger.info(f"Metrics Log Path: {METRICS_LOG_PATH}")
     config_logger.info(f"Persona Name: {PERSONA_NAME}")
     config_logger.info(f"Persona Profile Path: {PERSONA_PROFILE_PATH}")
     
@@ -1020,6 +1026,7 @@ if __name__ == '__main__':
     config_logger.info(f"  Max Neurons: {RESOURCE_PROFILE['MAX_NEURONS']}")
     
     config_logger.info(f"Enable SNN: {ENABLE_SNN}")
+    config_logger.info(f"Use GPU: {USE_GPU}")
     config_logger.info(f"Enable LLM API: {ENABLE_LLM_API}")
     if ENABLE_LLM_API:
         config_logger.info(f"  LLM Provider: {LLM_PROVIDER}")

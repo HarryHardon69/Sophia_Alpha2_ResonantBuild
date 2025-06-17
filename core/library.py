@@ -12,6 +12,7 @@ import json
 import datetime
 import hashlib
 import traceback
+from cryptography.fernet import Fernet, InvalidToken # For encryption
 
 # --- Configuration Import ---
 try:
@@ -321,6 +322,32 @@ KNOWLEDGE_LIBRARY = {}
 _library_dirty_flag = False
 _LIBRARY_FILE_PATH = None # To be set by _initialize_library_path during module load.
 
+# --- Cryptography Helper for Library ---
+def _get_library_fernet_cipher() -> Fernet | None:
+    """
+    Initializes and returns a Fernet cipher object using config.ENCRYPTION_KEY for the library.
+    Logs an error and returns None if the key is missing or invalid.
+    """
+    if not config or not hasattr(config, 'ENCRYPTION_KEY'):
+        _log_library_event("library_fernet_cipher_error", {"error": "ENCRYPTION_KEY not found in config."}, level="critical")
+        return None
+
+    key = getattr(config, 'ENCRYPTION_KEY', None)
+    if not key:
+        _log_library_event("library_fernet_cipher_error", {"error": "ENCRYPTION_KEY is empty or None in config."}, level="critical")
+        return None
+
+    try:
+        key_bytes = key.encode('utf-8') if isinstance(key, str) else key
+        cipher = Fernet(key_bytes)
+        return cipher
+    except (ValueError, TypeError) as e:
+        _log_library_event("library_fernet_cipher_error", {"error": f"Invalid ENCRYPTION_KEY format or type for library: {e}"}, level="critical")
+        return None
+    except Exception as e:
+        _log_library_event("library_fernet_cipher_error", {"error": f"Unexpected error initializing Fernet cipher for library: {e}"}, level="critical")
+        return None
+
 # --- Logging Function ---
 # Note: This _log_library_event is specific to this module and distinct from
 # logging functions in other modules like core.brain or core.memory.
@@ -439,30 +466,62 @@ def _load_knowledge_library():
             _library_dirty_flag = False # Freshly initialized, so not dirty.
             return
 
-        # Attempt to open and load JSON data from the file. UTF-8 encoding is specified.
-        with open(_LIBRARY_FILE_PATH, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        # Validate that the loaded data is a dictionary (expected root type for the library).
-        if isinstance(data, dict):
-            KNOWLEDGE_LIBRARY = data # Assign loaded data to the global variable.
-            _log_library_event("load_library_success", {"path": _LIBRARY_FILE_PATH, "entries_loaded": len(KNOWLEDGE_LIBRARY)})
-        else: # If data is not a dict, it's considered malformed.
-            _log_library_event("load_library_malformed", {"path": _LIBRARY_FILE_PATH, "error": "Root data structure is not a dictionary."}, level="error")
-            KNOWLEDGE_LIBRARY = {} # Reset to empty on error.
-        _library_dirty_flag = False # Synchronized with file state (or fresh default).
+        content_to_load = None
+        is_encrypted_load = getattr(config, 'ENCRYPT_LIBRARY_LOG', False)
+        cipher = _get_library_fernet_cipher() if is_encrypted_load else None
 
-    except json.JSONDecodeError as e: # Handle errors during JSON parsing.
-        _log_library_event("load_library_json_error", {"path": _LIBRARY_FILE_PATH, "error_details": str(e)}, level="error")
-        KNOWLEDGE_LIBRARY = {} 
+        with open(_LIBRARY_FILE_PATH, 'rb') as f_bytes: # Always read as bytes first
+            raw_bytes = f_bytes.read()
+
+        if is_encrypted_load and cipher:
+            try:
+                decrypted_bytes = cipher.decrypt(raw_bytes)
+                content_to_load = decrypted_bytes.decode('utf-8')
+                _log_library_event("load_library_decryption_success", {"path": _LIBRARY_FILE_PATH}, level="debug")
+            except InvalidToken:
+                _log_library_event("load_library_decryption_invalid_token", {"path": _LIBRARY_FILE_PATH, "error": "Invalid token or key. Attempting plain JSON load."}, level="warning")
+                try:
+                    content_to_load = raw_bytes.decode('utf-8') # Try as plain text
+                except UnicodeDecodeError:
+                    _log_library_event("load_library_decryption_fallback_decode_error", {"path": _LIBRARY_FILE_PATH}, level="error")
+                    KNOWLEDGE_LIBRARY = {}; _library_dirty_flag = False; return
+            except Exception as e_decrypt:
+                _log_library_event("load_library_decryption_error", {"path": _LIBRARY_FILE_PATH, "error": str(e_decrypt)}, level="error")
+                KNOWLEDGE_LIBRARY = {}; _library_dirty_flag = False; return
+        else: # Not encrypted or cipher unavailable
+            if is_encrypted_load and not cipher:
+                _log_library_event("load_library_encryption_intended_but_no_cipher", {"path": _LIBRARY_FILE_PATH}, level="warning")
+            try:
+                content_to_load = raw_bytes.decode('utf-8')
+            except UnicodeDecodeError as e_decode:
+                 _log_library_event("load_library_decode_error_plain", {"path": _LIBRARY_FILE_PATH, "error": str(e_decode)}, level="error")
+                 KNOWLEDGE_LIBRARY = {}; _library_dirty_flag = False; return
+
+
+        if content_to_load:
+            data = json.loads(content_to_load)
+            if isinstance(data, dict):
+                KNOWLEDGE_LIBRARY = data
+                _log_library_event("load_library_success", {"path": _LIBRARY_FILE_PATH, "entries_loaded": len(KNOWLEDGE_LIBRARY), "encrypted_attempt": is_encrypted_load})
+            else:
+                _log_library_event("load_library_malformed", {"path": _LIBRARY_FILE_PATH, "error": "Root data structure is not a dictionary."}, level="error")
+                KNOWLEDGE_LIBRARY = {}
+        else: # Content was empty or became None after failed decryption/decode attempts
+            _log_library_event("load_library_empty_content", {"path": _LIBRARY_FILE_PATH}, level="warning")
+            KNOWLEDGE_LIBRARY = {}
         _library_dirty_flag = False
-    except IOError as e_io: # Handle file I/O errors (e.g., permission issues).
+
+    except json.JSONDecodeError as e:
+        _log_library_event("load_library_json_error", {"path": _LIBRARY_FILE_PATH, "error_details": str(e)}, level="error")
+        KNOWLEDGE_LIBRARY = {}
+        _library_dirty_flag = False
+    except IOError as e_io:
         _log_library_event("load_library_io_error", {"path": _LIBRARY_FILE_PATH, "error_details": str(e_io)}, level="error")
         KNOWLEDGE_LIBRARY = {}
         _library_dirty_flag = False
-    except Exception as e_unknown: # Catch any other unexpected errors.
+    except Exception as e_unknown:
         _log_library_event("load_library_unknown_error", {"path": _LIBRARY_FILE_PATH, "error_details": str(e_unknown), "trace": traceback.format_exc()}, level="critical")
-        KNOWLEDGE_LIBRARY = {} 
+        KNOWLEDGE_LIBRARY = {}
         _library_dirty_flag = False
 
 
@@ -491,15 +550,36 @@ def _save_knowledge_library():
             os.makedirs(lib_dir, exist_ok=True)
                 
         # Step 1: Write the current library to the temporary file.
-        # UTF-8 encoding and indent for readability.
-        with open(temp_path, 'w', encoding='utf-8') as f: 
-            json.dump(KNOWLEDGE_LIBRARY, f, indent=2)
+        json_data_str = json.dumps(KNOWLEDGE_LIBRARY, indent=2)
+        bytes_to_write = json_data_str.encode('utf-8')
+
+        encrypt_this_save = getattr(config, 'ENCRYPT_LIBRARY_LOG', False)
+        cipher = _get_library_fernet_cipher() if encrypt_this_save else None
+
+        if encrypt_this_save and cipher:
+            try:
+                bytes_to_write = cipher.encrypt(bytes_to_write)
+                _log_library_event("save_library_encryption_success", {"path": _LIBRARY_FILE_PATH}, level="debug")
+            except Exception as e_encrypt:
+                _log_library_event("save_library_encryption_failure", {"path": _LIBRARY_FILE_PATH, "error": str(e_encrypt)}, level="critical")
+                # Abort save if encryption was intended but failed
+                if os.path.exists(temp_path): # Clean up temp file if it was somehow created before error
+                    try: os.remove(temp_path)
+                    except Exception as e_rm_enc_fail: _log_library_event("save_library_temp_cleanup_failed_enc_err", {"path": temp_path, "error": str(e_rm_enc_fail)}, level="error")
+                return
+        elif encrypt_this_save and not cipher:
+            _log_library_event("save_library_encryption_skipped_no_cipher", {"path": _LIBRARY_FILE_PATH}, level="warning")
+            # Depending on policy, might abort if encryption intended but key/cipher is bad.
+            # For now, proceed with unencrypted save and log warning.
+
+        with open(temp_path, 'wb') as f: # Write as bytes
+            f.write(bytes_to_write)
         
         # Step 2: Atomically replace the original file with the temporary file.
         os.replace(temp_path, _LIBRARY_FILE_PATH) 
         
         _library_dirty_flag = False # Reset dirty flag only after successful write and replacement.
-        _log_library_event("save_library_success", {"path": _LIBRARY_FILE_PATH, "entries_saved": len(KNOWLEDGE_LIBRARY)})
+        _log_library_event("save_library_success", {"path": _LIBRARY_FILE_PATH, "entries_saved": len(KNOWLEDGE_LIBRARY), "encrypted": (encrypt_this_save and cipher)})
     except IOError as e_io: # Handle file I/O errors.
          _log_library_event("save_library_io_error", {"path": _LIBRARY_FILE_PATH, "temp_path": temp_path, "error_details": str(e_io)}, level="critical")
          # Attempt to clean up temp file on error.
@@ -519,6 +599,10 @@ _initialize_library_path()
 _load_knowledge_library()
 
 # --- Public API ---
+# TODO: Implement a full multi-user consent mechanism. The current consent
+# logic is a single-user CLI placeholder. True multi-user consent would
+# likely involve user authentication, session management, and a persistent
+# way to record consent preferences.
 def store_knowledge(content: str, is_public: bool = False, source_uri: str = None, author: str = None) -> str | None:
     """
     Stores a piece of knowledge in the library after processing and ethical checks.
@@ -688,7 +772,11 @@ def store_knowledge(content: str, is_public: bool = False, source_uri: str = Non
 
     # --- Public Storage Consent (Placeholder for CLI Interaction) ---
     # If content is marked public and config requires consent, simulate asking for it.
-    # This is a developer placeholder; a real application needs a proper consent mechanism.
+    # TODO: Replace CLI input with a proper consent mechanism.
+    # The current input() call is a developer placeholder and will block in
+    # non-interactive environments. For production, especially with multi-user
+    # considerations, a robust consent flow tied to user sessions or a different
+    # interaction model is required.
     require_consent_flag = getattr(config, 'REQUIRE_PUBLIC_STORAGE_CONSENT', False) if config else False
     if entry['is_public'] and require_consent_flag:
         _log_library_event("public_consent_requested", {"entry_id": entry_id, "preview_for_consent": content_preview}, level="info")

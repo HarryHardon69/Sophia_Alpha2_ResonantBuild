@@ -69,6 +69,7 @@ import copy # For deepcopy in sanitization
 # Further module-level constants or setup can go here.
 
 # --- Module-Level Logging ---
+# TODO: Centralize LOG_LEVELS definition, possibly in core.logger or a shared config utility, to avoid duplication across modules.
 LOG_LEVELS = {"debug": 10, "info": 20, "warning": 30, "error": 40, "critical": 50}
 _log_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='EthicsLogWorker')
 atexit.register(_log_executor.shutdown, wait=True)
@@ -90,6 +91,10 @@ def _actual_log_write(log_file_path_str: str, log_entry_json: str):
     try:
         # ensure_path should ideally be called before submitting to executor,
         # or the executor needs access to config. For now, assume path exists or ensure_path is robust.
+        # config.ensure_path is called here, within the executor's thread.
+        # This is generally acceptable but means it's executed on each log write.
+        # For very high-frequency logging, ensuring the path once at logger initialization
+        # might be marginally more performant.
         if config and hasattr(config, 'ensure_path'): # Check if config and ensure_path are available
              config.ensure_path(log_file_path_str)
 
@@ -121,6 +126,13 @@ def _log_ethics_event(event_type: str, data: dict, level: str = "info"):
             if key_to_sanitize in data_to_log:
                 data_to_log[key_to_sanitize] = REDACTION_PLACEHOLDER
 
+        # The following check is intended to ensure that the deepcopy operation itself
+        # didn't inadvertently link parts of data_to_log back to the original 'data' argument
+        # before redaction occurs, or that redaction isn't subtly altering 'data_to_log'
+        # in a way that makes it appear like the original 'data' was changed if 'data' itself
+        # contained pre-redacted strings. Given 'data_to_log' is a deepcopy and redaction
+        # replaces values, the primary goal is that the original 'data' argument to this function
+        # remains unmodified.
         if data != data_to_log and any(data.get(k) != data_to_log.get(k) for k in SENSITIVE_LOG_KEYS if k in data and k in data_to_log and data_to_log[k] == REDACTION_PLACEHOLDER):
              print(f"CRITICAL_LOGGING_ERROR: Original data modified during sanitization for event {event_type}.", file=sys.stderr)
 

@@ -91,6 +91,7 @@ SYSTEM_LOG_FILENAME = "sophia_alpha2_system.log"
 # TODO: Implement log sanitization for SYSTEM_LOG_PATH to prevent leakage of sensitive information through logs. Consider what constitutes sensitive data in this context.
 # TODO: Implement log rotation for SYSTEM_LOG_PATH to manage log file sizes and prevent excessive disk usage, especially in long-running deployments.
 SYSTEM_LOG_PATH = get_path(os.path.join(LOG_DIR, SYSTEM_LOG_FILENAME))
+# Future enhancements for logging could include log rotation (e.g., size/time based) and asynchronous logging for improved performance.
 
 ETHICS_DB_FILENAME = "ethics_db.json"
 ETHICS_DB_PATH = get_path(os.path.join(ETHICS_STORE_DIR, ETHICS_DB_FILENAME))
@@ -104,6 +105,9 @@ MEMORY_LOG_PATH = get_path(os.path.join(MEMORY_STORE_DIR, MEMORY_LOG_FILENAME))
 
 LIBRARY_LOG_FILENAME = "library_log.json"
 LIBRARY_LOG_PATH = get_path(os.path.join(LIBRARY_STORE_DIR, LIBRARY_LOG_FILENAME))
+
+# Future enhancement: Flag to enable encryption for the library log.
+ENCRYPT_LIBRARY_LOG = os.getenv('ENCRYPT_LIBRARY_LOG', 'False').lower() == 'true'
 
 # Initial ensure_path calls for essential directories at import time
 ensure_path(DATA_DIR + os.sep) # Ensure DATA_DIR itself is created

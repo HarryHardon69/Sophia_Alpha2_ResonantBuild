@@ -49,7 +49,11 @@ class Persona:
             return # Or skip entirely if preferred
 
         # Basic redaction for profile_path if message is sensitive
-        # This is a placeholder for more robust redaction.
+        # TODO: Implement more robust path redaction. Current method only redacts
+        #       self.profile_path. A general solution could involve normalizing paths
+        #       (os.path.normpath) and checking if they are within known sensitive
+        #       directory roots (e.g., from config.DATA_DIR or config._PROJECT_ROOT if available)
+        #       or using regex for common path patterns.
         # A more robust solution would involve specifically finding and redacting paths.
         message_to_print = message
         if sensitive and hasattr(self, 'profile_path') and isinstance(self.profile_path, str) and self.profile_path in message:
@@ -455,6 +459,18 @@ class Persona:
         # AND a separate 'raw_t_intensity' (expected to be 0-1).
         # We need to construct the final awareness coordinate using scaled x,y,z and the raw_t_intensity.
         
+        # --- Handling of 'primary_concept_coord' from brain_awareness_metrics ---
+        # Expectation: brain_awareness_metrics["primary_concept_coord"] is expected to provide
+        # scaled coordinates (e.g., x, y, z values that are already normalized, potentially to a [0,1] range,
+        # representing their position within a conceptual space or manifold).
+        # The fourth element, if used by the brain for its 't' coordinate, might also be scaled.
+        # However, this module prioritizes brain_awareness_metrics["raw_t_intensity"] (expected 0-1)
+        # for the final 't' value stored in the persona's awareness.
+
+        # Current Behavior: The x, y, z components received from brain_awareness_metrics["primary_concept_coord"]
+        # are explicitly clipped to the COORD_RANGE [0,1] defined within this method before being stored.
+        # Ensure that the brain module sends coordinates consistent with this expectation or that this
+        # clipping is the desired behavior for standardization within the Persona state.
         scaled_coord_from_brain = brain_awareness_metrics.get("primary_concept_coord")
         raw_t_from_brain = brain_awareness_metrics.get("raw_t_intensity") # Expected 0-1 intensity
         
@@ -470,7 +486,8 @@ class Persona:
             elif isinstance(scaled_coord_from_brain, (list, tuple)) and len(scaled_coord_from_brain) == 4:
                 # Valid structure for scaled_coord_from_brain.
                 try:
-                    # Define expected range for scaled coordinates.
+                    # Define expected range for scaled spatial coordinates (x, y, z) from brain.
+                    # This range is applied via clipping.
                     COORD_RANGE = (0.0, 1.0)
 
                     scaled_x = float(scaled_coord_from_brain[0])

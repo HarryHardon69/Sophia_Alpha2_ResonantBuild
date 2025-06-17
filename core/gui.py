@@ -95,6 +95,11 @@ try:
         _FERNET_INSTANCE = Fernet(_ENCRYPTION_KEY)
         logger.info("Successfully loaded SESSION_ENCRYPTION_KEY from config.")
     else:
+        # This generated key is ephemeral (changes each time the application starts
+        # without a configured SESSION_ENCRYPTION_KEY). Encrypted session state
+        # will not persist across application restarts if relying on this generated key.
+        # This is generally fine for Streamlit's session state model but ensure
+        # SESSION_ENCRYPTION_KEY is set in config for persistent encrypted state if needed elsewhere.
         logger.warning("SESSION_ENCRYPTION_KEY not found in config. Using a generated key for this session. THIS IS NOT SECURE FOR PRODUCTION.")
 
     from .. import config
@@ -204,7 +209,7 @@ def initialize_session_state():
     }
 
     # Placeholder for loading history from memory
-    logger.info("Placeholder: Add call to core.memory.load_dialogue_history(...) here and populate/replace encrypted_dialogue_history if available.")
+    # TODO: Implement call to core.memory.load_dialogue_history(...) here and populate/replace encrypted_dialogue_history if available.
     # Example:
     # loaded_history = core.memory.load_dialogue_history()
     # if loaded_history is not None:
@@ -502,7 +507,7 @@ def render_main_interface():
                 dialogue_history_for_update.append({"role": "user", "content": sanitized_query})
                 st.session_state.encrypted_dialogue_history = encrypt_data(dialogue_history_for_update)
                 # Placeholder for saving user input to memory
-                logger.info(f"Placeholder: Add call to core.memory.save_dialogue_history_event('user', '{sanitized_query}') here.")
+                # TODO: Implement call to core.memory.save_dialogue_history_event('user', sanitized_query) for persistent dialogue logging if required.
                 # Then proceed to generate response for the unknown command as if it's normal text
                 process_as_regular_input = True
         else: # Not a command, process as regular input
@@ -512,7 +517,7 @@ def render_main_interface():
             dialogue_history_for_update.append({"role": "user", "content": sanitized_query})
             st.session_state.encrypted_dialogue_history = encrypt_data(dialogue_history_for_update)
             # Placeholder for saving user input to memory
-            logger.info(f"Placeholder: Add call to core.memory.save_dialogue_history_event('user', '{sanitized_query}') here.")
+            # TODO: Implement call to core.memory.save_dialogue_history_event('user', sanitized_query) for persistent dialogue logging if required.
 
         if process_as_regular_input:
             with st.chat_message(name=persona_display_name, avatar="🧠"):
@@ -554,6 +559,8 @@ def render_main_interface():
                         # Preserve intro message if it's the first one and from assistant
                         intro_message_present = False
                         if dialogue_history_for_response_update and dialogue_history_for_response_update[0].get("role") == "assistant":
+                            # Attempt to preserve the first message if it's from the assistant,
+                            # assuming it might be an initial greeting or introduction from Sophia.
                             # This is a simple check; could be more robust to identify a true intro
                             intro_message_present = True
 
@@ -567,7 +574,7 @@ def render_main_interface():
 
                     st.session_state.encrypted_dialogue_history = encrypt_data(dialogue_history_for_response_update)
                     # Placeholder for saving assistant response to memory
-                    logger.info(f"Placeholder: Add call to core.memory.save_dialogue_history_event('assistant', '{sophia_response_text.strip()}') here.")
+                    # TODO: Implement call to core.memory.save_dialogue_history_event('assistant', sophia_response_text.strip()) for persistent dialogue logging.
 
                 except Exception as e_generate_response_gui:
                     error_text_gui = f"Error during response generation: {str(e_generate_response_gui)}"
@@ -579,6 +586,8 @@ def render_main_interface():
                     if len(dialogue_history_for_error_update) > MAX_HISTORY_TURNS * 2:
                         intro_message_present_err = False
                         if dialogue_history_for_error_update and dialogue_history_for_error_update[0].get("role") == "assistant":
+                            # Attempt to preserve the first message if it's from the assistant,
+                            # assuming it might be an initial greeting or introduction from Sophia.
                             intro_message_present_err = True
                         num_messages_to_remove_err = len(dialogue_history_for_error_update) - (MAX_HISTORY_TURNS * 2)
                         if intro_message_present_err:
@@ -587,7 +596,7 @@ def render_main_interface():
                             del dialogue_history_for_error_update[0 : num_messages_to_remove_err]
                     st.session_state.encrypted_dialogue_history = encrypt_data(dialogue_history_for_error_update)
                     # Placeholder for saving error event to memory
-                    logger.info(f"Placeholder: Add call to core.memory.save_dialogue_history_event('assistant_error', '{error_text_gui}') here.")
+                    # TODO: Implement call to core.memory.save_dialogue_history_event('assistant_error', error_text_gui) for persistent error logging.
                     if not getattr(sys, '_IS_TEST_RUNNING', False): logger.exception("Error during response generation:")
             st.rerun() # Rerun to update the chat display immediately.
 

@@ -407,6 +407,9 @@ def generate_response(user_input: str, stream_thought_steps: bool = False) -> tu
         thought_steps.append(f"Dialogue Manager: Error during content mitigation: {str(e_mitigation_application)}")
 
     # Step 7: Track ethical trends.
+    # Track ethical trends. The score_ethics function, called earlier,
+    # persists the current interaction's ethical score to the ethics database.
+    # The track_trends function will analyze the historical data, including this latest score.
     try:
         if _ETHICS_TRACK_TRENDS_AVAILABLE: # Check if `track_trends` function is available.
             # Call track_trends with the current ethical score and context summary.
@@ -545,6 +548,10 @@ def dialogue_loop(enable_streaming_thoughts: bool = None):
     _log_dialogue_event("dialogue_loop_end", {})
 
 # --- Comprehensive Self-Testing Block ---
+# _IS_TEST_RUNNING is a global flag used to modify behavior during self-tests,
+# primarily to suppress noisy operational print statements.
+# Alternative approaches for test-specific behavior control could include
+# environment variables or more specific configurations passed to tests.
 _IS_TEST_RUNNING = False 
 
 if __name__ == "__main__":

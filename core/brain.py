@@ -16,6 +16,12 @@ import socket # For _try_connect_llm
 import sys
 import time
 import traceback # For error logging
+import base64
+import json
+from cryptography.fernet import Fernet
+import bleach
+import hashlib
+import random
 
 import numpy as np
 import requests # Added: For LLM API calls
@@ -45,6 +51,47 @@ except ImportError:
         config = None # Placeholder if import fails, to prevent immediate crash
 
 # Further module-level constants or setup can go here.
+
+# Placeholder key for demonstration if SNN_ENCRYPTION_KEY is not set
+PLACEHOLDER_KEY = Fernet.generate_key().decode()
+
+def _generate_key():
+    """Generates a new Fernet key."""
+    return Fernet.generate_key()
+
+def _encrypt_data(data, key):
+    """Encrypts data using Fernet. Handles serialization of PyTorch tensors."""
+    f = Fernet(key)
+    if isinstance(data, torch.Tensor):
+        # Detach tensor from graph, move to CPU, then convert to list
+        serialized_data = json.dumps(data.detach().cpu().tolist())
+    else:
+        try:
+            serialized_data = json.dumps(data)
+        except TypeError as e:
+            print(f"Error serializing data for encryption: {e}")
+            _log_system_event("encryption_serialization_error", {"error": str(e), "data_type": str(type(data))}, level="error")
+            # Fallback: convert to string if direct JSON serialization fails
+            serialized_data = json.dumps(str(data))
+    return f.encrypt(serialized_data.encode())
+
+def _decrypt_data(encrypted_data, key, target_device=None):
+    """Decrypts data using Fernet. Handles deserialization from JSON."""
+    f = Fernet(key)
+    decrypted_bytes = f.decrypt(encrypted_data)
+    serialized_data = decrypted_bytes.decode()
+    original_data = json.loads(serialized_data)
+
+    # Attempt to convert to tensor if it's a list and target_device is specified
+    # This is a common case for PyTorch tensors that were stored as lists.
+    if isinstance(original_data, list) and target_device:
+        try:
+            return torch.tensor(original_data, device=target_device)
+        except Exception as e: # Broad exception for tensor conversion issues
+            print(f"Error converting list to tensor: {e}. Returning list.")
+            _log_system_event("decryption_tensor_conversion_error", {"error": str(e)}, level="error")
+            return original_data # Return as list if tensor conversion fails
+    return original_data
 
 # --- Module-Level Logging ---
 # Ensure config is loaded to get log paths and levels
@@ -80,7 +127,16 @@ def _log_system_event(event_type: str, data: dict, level: str = "info"):
 
         with open(config.SYSTEM_LOG_PATH, 'a') as f:
             f.write(json.dumps(log_entry) + '\n')
-            
+
+        # Set restrictive permissions on the log file
+        try:
+            os.chmod(config.SYSTEM_LOG_PATH, 0o600)
+        except OSError as e_chmod:
+            print(f"Warning: Could not set permissions on log file {config.SYSTEM_LOG_PATH}. Error: {e_chmod}", file=sys.stderr)
+            # Log this specific issue, but avoid recursion if _log_system_event is the source of the problem
+            if event_type != "logging_permission_error":
+                 _log_system_event("logging_permission_error", {"file": config.SYSTEM_LOG_PATH, "error": str(e_chmod)}, level="warning")
+
     except Exception as e:
         # Fallback to print if logging to file fails
         print(f"Error logging system event to file: {e}", file=sys.stderr)
@@ -176,6 +232,26 @@ class SpacetimeManifold:
             ImportError: If the `config` module is not loaded, as it's critical for
                          parameterizing the SpacetimeManifold.
         """
+        # Encryption setup
+        self.encryption_key = os.getenv("SNN_ENCRYPTION_KEY")
+        if not self.encryption_key:
+            print("Warning: SNN_ENCRYPTION_KEY environment variable not found. Using a placeholder key. SET THIS VARIABLE FOR FUTURE RUNS.")
+            _log_system_event("encryption_key_warning", {"message": "SNN_ENCRYPTION_KEY not found, using placeholder."}, level="warning")
+            self.encryption_key = PLACEHOLDER_KEY.encode() # Use bytes for Fernet
+        else:
+            self.encryption_key = self.encryption_key.encode() # Ensure key is bytes
+
+        # Define paths for encrypted files
+        # Ensure config.DATA_DIR is available and a string
+        data_dir = getattr(config, 'DATA_DIR', '.') # Default to current dir if not set
+        if not isinstance(data_dir, str):
+            print(f"Warning: config.DATA_DIR is not a string ('{data_dir}'). Defaulting to current directory for encrypted files.")
+            _log_system_event("config_datadir_invalid", {"data_dir_type": str(type(data_dir))}, level="warning")
+            data_dir = '.'
+
+        self.ENCRYPTED_WEIGHTS_PATH = os.path.join(data_dir, "snn_weights.enc")
+        self.ENCRYPTED_COORDINATES_PATH = os.path.join(data_dir, "snn_coordinates.enc")
+
         _log_system_event("manifold_initialization_start", {"message": "Initializing SpacetimeManifold..."})
 
         if not config:
@@ -316,9 +392,80 @@ class SpacetimeManifold:
         self.coherence = 0.0   # Global coherence metric of the manifold
         self.last_avg_stdp_weight_change = 0.0 # For self_evolution_rate metric
 
+        # Load encrypted state if available
+        self._load_encrypted_state()
+
         _log_system_event("manifold_initialization_complete", 
                           {"device": str(self.device), "max_neurons": self.max_neurons, 
                            "input_size": self.snn_input_size, "time_steps": self.snn_time_steps})
+
+    def _load_encrypted_state(self):
+        """Loads encrypted weights and coordinates if files exist."""
+        # Load weights
+        try:
+            if os.path.exists(self.ENCRYPTED_WEIGHTS_PATH):
+                with open(self.ENCRYPTED_WEIGHTS_PATH, 'rb') as f:
+                    encrypted_weights = f.read()
+                decrypted_weights = _decrypt_data(encrypted_weights, self.encryption_key, target_device=self.device)
+                if isinstance(decrypted_weights, torch.Tensor) and decrypted_weights.shape == self.fc.weight.data.shape:
+                    self.fc.weight.data = decrypted_weights
+                    _log_system_event("encrypted_weights_loaded", {"path": self.ENCRYPTED_WEIGHTS_PATH}, level="info")
+                else:
+                    _log_system_event("encrypted_weights_type_mismatch", {"path": self.ENCRYPTED_WEIGHTS_PATH, "loaded_type": str(type(decrypted_weights))}, level="warning")
+
+        except Exception as e:
+            _log_system_event("encrypted_weights_load_error", {"path": self.ENCRYPTED_WEIGHTS_PATH, "error": str(e)}, level="error")
+            print(f"Error loading encrypted weights: {e}")
+
+        # Load coordinates
+        try:
+            if os.path.exists(self.ENCRYPTED_COORDINATES_PATH):
+                with open(self.ENCRYPTED_COORDINATES_PATH, 'rb') as f:
+                    encrypted_coords = f.read()
+                decrypted_coords = _decrypt_data(encrypted_coords, self.encryption_key) # Coordinates are not tensors initially
+                if isinstance(decrypted_coords, dict): # Expecting a dictionary
+                    self.coordinates = decrypted_coords
+                    _log_system_event("encrypted_coordinates_loaded", {"path": self.ENCRYPTED_COORDINATES_PATH}, level="info")
+                else:
+                    _log_system_event("encrypted_coordinates_type_mismatch", {"path": self.ENCRYPTED_COORDINATES_PATH, "loaded_type": str(type(decrypted_coords))}, level="warning")
+        except Exception as e:
+            _log_system_event("encrypted_coordinates_load_error", {"path": self.ENCRYPTED_COORDINATES_PATH, "error": str(e)}, level="error")
+            print(f"Error loading encrypted coordinates: {e}")
+
+    def save_encrypted_state(self):
+        """Encrypts and saves SNN weights and coordinates."""
+        _log_system_event("save_encrypted_state_start", {}, level="info")
+        # Save weights
+        try:
+            encrypted_weights = _encrypt_data(self.fc.weight.data, self.encryption_key)
+            with open(self.ENCRYPTED_WEIGHTS_PATH, 'wb') as f:
+                f.write(encrypted_weights)
+            _log_system_event("encrypted_weights_saved", {"path": self.ENCRYPTED_WEIGHTS_PATH}, level="info")
+            # Set restrictive permissions
+            try:
+                os.chmod(self.ENCRYPTED_WEIGHTS_PATH, 0o600)
+            except OSError as e_chmod:
+                _log_system_event("chmod_error_weights", {"path": self.ENCRYPTED_WEIGHTS_PATH, "error": str(e_chmod)}, level="warning")
+                print(f"Warning: Could not set permissions on {self.ENCRYPTED_WEIGHTS_PATH}. Error: {e_chmod}")
+        except Exception as e:
+            _log_system_event("encrypted_weights_save_error", {"path": self.ENCRYPTED_WEIGHTS_PATH, "error": str(e)}, level="error")
+            print(f"Error saving encrypted weights: {e}")
+
+        # Save coordinates
+        try:
+            encrypted_coordinates = _encrypt_data(self.coordinates, self.encryption_key)
+            with open(self.ENCRYPTED_COORDINATES_PATH, 'wb') as f:
+                f.write(encrypted_coordinates)
+            _log_system_event("encrypted_coordinates_saved", {"path": self.ENCRYPTED_COORDINATES_PATH}, level="info")
+            # Set restrictive permissions
+            try:
+                os.chmod(self.ENCRYPTED_COORDINATES_PATH, 0o600)
+            except OSError as e_chmod:
+                _log_system_event("chmod_error_coordinates", {"path": self.ENCRYPTED_COORDINATES_PATH, "error": str(e_chmod)}, level="warning")
+                print(f"Warning: Could not set permissions on {self.ENCRYPTED_COORDINATES_PATH}. Error: {e_chmod}")
+        except Exception as e:
+            _log_system_event("encrypted_coordinates_save_error", {"path": self.ENCRYPTED_COORDINATES_PATH, "error": str(e)}, level="error")
+            print(f"Error saving encrypted coordinates: {e}")
 
     def _mock_phi3_concept_data(self, concept_name: str) -> dict:
         """
@@ -405,8 +552,16 @@ class SpacetimeManifold:
         llm_data = None # Initialize to ensure it's defined in all paths
 
         # Attempt to connect to LLM API if enabled
-        if config.ENABLE_LLM_API and self._try_connect_llm():
-            headers = {"Content-Type": "application/json"}
+        if config.ENABLE_LLM_API:
+            # TLS Enforcement
+            if not config.LLM_BASE_URL.startswith("https://"):
+                _log_system_event("llm_security_error", {"reason": "LLM_BASE_URL does not use https", "url": config.LLM_BASE_URL}, level="error")
+                # Depending on strictness, either raise error or prevent LLM call
+                # For this implementation, we'll prevent the call and allow fallback to mock.
+                # raise ValueError("LLM_BASE_URL must use https for secure communication.")
+                print(f"Error: LLM_BASE_URL '{config.LLM_BASE_URL}' is not secure. HTTPS is required. LLM call will be skipped.")
+            elif self._try_connect_llm(): # Only proceed if URL is HTTPS and connection is possible
+                headers = {"Content-Type": "application/json"}
             # Add Authorization header for OpenAI if API key is present
             if config.LLM_PROVIDER == "openai" and config.LLM_API_KEY != "YOUR_OPENAI_API_KEY_HERE_IF_NOT_SET_AS_ENV":
                 headers["Authorization"] = f"Bearer {config.LLM_API_KEY}"
@@ -536,11 +691,69 @@ class SpacetimeManifold:
         # Ensure default values for all expected keys in llm_data to prevent KeyErrors later
         # This is especially important if mock data or a failed LLM response (even after regex)
         # does not guarantee all keys.
-        llm_data.setdefault("summary", "No summary available.")
-        llm_data.setdefault("valence", 0.0)
-        llm_data.setdefault("abstraction", 0.0)
-        llm_data.setdefault("relevance", 0.0)
-        llm_data.setdefault("intensity", 0.0)
+
+        # --- Robust Validation of LLM Data ---
+        VALID_RANGES = {
+            "valence": (-1.0, 1.0), "abstraction": (0.0, 1.0),
+            "relevance": (0.0, 1.0), "intensity": (0.0, 1.0)
+        }
+        DEFAULT_VALUES = {
+            "summary": "Summary not available or invalid.", "valence": 0.0,
+            "abstraction": 0.5, "relevance": 0.0, "intensity": 0.1
+        }
+
+        # Validate summary type
+        summary_val = llm_data.get("summary")
+        if not isinstance(summary_val, str):
+            _log_system_event("llm_summary_type_error",
+                              {"concept": concept_name, "original_type": str(type(summary_val))},
+                              level="warning")
+            llm_data["summary"] = DEFAULT_VALUES["summary"]
+
+        # Sanitize summary (now that it's guaranteed to be a string or default)
+        if not llm_data["summary"].startswith("Mock summary:"): # Avoid sanitizing mock data unnecessarily
+            try:
+                original_summary = llm_data["summary"]
+                llm_data["summary"] = bleach.clean(original_summary)
+                if original_summary != llm_data["summary"]:
+                    _log_system_event("llm_summary_sanitized", {"concept_name": concept_name, "original_summary_snippet": original_summary[:50], "sanitized_summary_snippet": llm_data["summary"][:50]}, level="info")
+                # else: # No need to log if no change, reduces noise
+                #     _log_system_event("llm_summary_no_change_after_sanitize", {"concept_name": concept_name, "summary_snippet": original_summary[:50]}, level="debug")
+            except Exception as e_sanitize:
+                _log_system_event("llm_summary_sanitize_error", {"concept_name": concept_name, "error": str(e_sanitize)}, level="warning")
+                print(f"Warning: Could not sanitize LLM summary for '{concept_name}'. Error: {e_sanitize}")
+                # llm_data["summary"] might remain the original if bleach failed, or could be a default if type was wrong initially.
+
+        # Validate numeric fields (valence, abstraction, relevance, intensity)
+        for key in ["valence", "abstraction", "relevance", "intensity"]:
+            value = llm_data.get(key)
+            val_float = None
+            try:
+                val_float = float(value)
+            except (ValueError, TypeError):
+                _log_system_event("llm_numeric_value_type_error",
+                                  {"concept": concept_name, "key": key, "original_value": str(value)[:50], "original_type": str(type(value))},
+                                  level="warning")
+                llm_data[key] = DEFAULT_VALUES[key]
+                continue # Skip range check if type was wrong
+
+            # Range check
+            min_r, max_r = VALID_RANGES[key]
+            clipped_val = np.clip(val_float, min_r, max_r)
+
+            if val_float != clipped_val:
+                _log_system_event("llm_numeric_value_range_clipped",
+                                  {"concept": concept_name, "key": key, "original_value": val_float, "clipped_value": clipped_val},
+                                  level="warning")
+            llm_data[key] = clipped_val
+
+        # Ensure all keys are present now, using defaults if any were totally missing from llm_data initially
+        # This replaces the earlier setdefault calls for numeric types
+        for key in ["valence", "abstraction", "relevance", "intensity"]:
+            if key not in llm_data: # Should be rare if parsing worked, but as a safeguard
+                 _log_system_event("llm_key_missing_post_validation", {"concept": concept_name, "key": key}, level="warning")
+                 llm_data[key] = DEFAULT_VALUES[key]
+
 
         # --- Calculate 4D Manifold Coordinates ---
         # Coordinates are derived from LLM/mock data (valence, abstraction, relevance, intensity).
@@ -590,20 +803,16 @@ class SpacetimeManifold:
 
     def update_stdp(self, pre_spk_flat: torch.Tensor, post_spk_flat: torch.Tensor, 
                     current_weights: torch.Tensor, 
-                    concept_name: str, prev_t_intensity: float) -> tuple[torch.Tensor, float]:
+                    concept_name: str, prev_raw_intensity: float) -> tuple[torch.Tensor, float]:
         """
-        Implements STDP learning rule or a Hebbian-like update.
+        Implements STDP learning rule or a Hebbian-like update, using consistently scaled raw intensities.
         
         Args:
-            pre_spk_flat: Flattened presynaptic spikes (from input features or previous layer).
-                          Expected shape: (batch_size, num_presynaptic_neurons) which is (1, snn_input_size)
-            post_spk_flat: Flattened postsynaptic spikes (from the SNN's output neurons).
-                           Expected shape: (batch_size, num_postsynaptic_neurons) which is (1, snn_output_size)
+            pre_spk_flat: Flattened presynaptic spikes.
+            post_spk_flat: Flattened postsynaptic spikes.
             current_weights: The current weight matrix of the fc layer.
-                             Expected shape: (num_postsynaptic_neurons, num_presynaptic_neurons)
-                                             which is (snn_output_size, snn_input_size)
-            concept_name: Name of the concept being processed, to fetch its current t_intensity.
-            prev_t_intensity: t_intensity from the previous significant processing step or concept.
+            concept_name: Name of the concept being processed, to fetch its current coordinates.
+            prev_raw_intensity: Raw (0-1) intensity from the previous significant processing step.
 
         Returns:
             Tuple of (updated_weights, delta_w_mean_abs).
@@ -620,24 +829,38 @@ class SpacetimeManifold:
 
         # Get current t_intensity for the concept from stored coordinates
         current_concept_coords = self.coordinates.get(concept_name)
-        if not current_concept_coords: # Should ideally not happen if concept was bootstrapped
+        if not current_concept_coords:
             _log_system_event("stdp_error_no_coords", {"concept": concept_name}, level="warning")
-            return current_weights_clone, 0.0 # Return original weights if no coordinates found
-        
-        # The 't' coordinate (index 3) is used as a proxy for the timing of the current event.
-        # This was previously scaled by self.range/2. For STDP, the raw_intensity (0-1) might be
-        # more suitable for calculating delta_t if prev_t_intensity is also raw.
-        # Current implementation uses scaled t_coord_intensity. This needs to be consistent.
-        current_t_intensity = current_concept_coords[3] 
+            return current_weights_clone, 0.0
 
-        # --- STDP/Hebbian Logic using t_intensity as a proxy for time ---
-        # delta_t = t_current_event - t_previous_event
-        # Positive delta_t: Current event is "after" previous. If pre-synaptic spike (input) led to post-synaptic spike (output)
-        #                   under this condition, it implies potentiation (LTP).
-        # Negative delta_t: Current event is "before" previous. If post-synaptic spike occurred before pre-synaptic under this
-        #                   timing, it implies depression (LTD).
-        # This is a conceptual application of STDP principles where t_intensity differences model event timing.
-        delta_t = current_t_intensity - prev_t_intensity 
+        # Derive current raw intensity (0-1) from stored scaled t_coord_intensity
+        t_coord_intensity = current_concept_coords[3] # This is scaled: raw_intensity * half_range
+        half_range = self.range / 2.0
+        current_raw_intensity = 0.5 # Default if half_range is zero
+
+        if half_range != 0:
+            current_raw_intensity = t_coord_intensity / half_range
+        else:
+            _log_system_event("stdp_error_zero_half_range", {"concept": concept_name, "range": self.range}, level="error")
+            # current_raw_intensity remains 0.5 as a fallback
+
+        # Validate and clip both current and previous raw intensities to be within [0.0, 1.0]
+        current_raw_intensity_validated = np.clip(current_raw_intensity, 0.0, 1.0)
+        if current_raw_intensity != current_raw_intensity_validated:
+            _log_system_event("stdp_intensity_clipping",
+                              {"type": "current", "concept": concept_name,
+                               "original": current_raw_intensity, "clipped": current_raw_intensity_validated},
+                              level="warning")
+
+        prev_raw_intensity_validated = np.clip(prev_raw_intensity, 0.0, 1.0)
+        if prev_raw_intensity != prev_raw_intensity_validated:
+            _log_system_event("stdp_intensity_clipping",
+                              {"type": "previous", "concept": concept_name,
+                               "original": prev_raw_intensity, "clipped": prev_raw_intensity_validated},
+                              level="warning")
+
+        # --- STDP/Hebbian Logic using validated raw intensities (0-1 range) as proxies for event timing ---
+        delta_t = current_raw_intensity_validated - prev_raw_intensity_validated
         
         # Initialize weight change matrix
         delta_w = torch.zeros_like(current_weights_clone)
@@ -675,6 +898,20 @@ class SpacetimeManifold:
         coherence_change = -self.lr_stdp * delta_w_mean_abs # More change = less coherence
         self.coherence += coherence_change * config.COHERENCE_UPDATE_FACTOR
         self.coherence = np.clip(self.coherence, -1.0, 1.0) # Assuming coherence is within a range
+
+        # Log placeholder for future coherence calculation improvements
+        _log_system_event(
+            "coherence_update_placeholder",
+            {
+                "message": "Coherence calculation currently uses a simplified model based on weight change. Future improvements should incorporate network topology metrics (e.g., clustering coefficient, average path length, modularity) for a more comprehensive measure of manifold organization.",
+                "current_coherence_value": self.coherence,
+                "learning_rate_stdp": self.lr_stdp,
+                "mean_abs_weight_change": delta_w_mean_abs,
+                "coherence_update_factor": config.COHERENCE_UPDATE_FACTOR,
+                "related_concept": concept_name
+            },
+            level="info"
+        )
 
         if delta_w_mean_abs > 1e-5: # Log if change is somewhat significant
             _log_system_event("stdp_update_applied", 
@@ -745,17 +982,48 @@ class SpacetimeManifold:
                           level="debug")
                           
         for step in range(self.snn_time_steps):
-            # --- a. Create Input Features Tensor ---
-            # The input to the SNN is derived from the bootstrapped concept's properties.
-            # Current approach: Activate a subset of input neurons proportionally to concept_raw_intensity.
-            # This is a simplified representation; more complex mappings from concept features to SNN inputs are possible.
+            # --- a. Create Input Features Tensor (Hash-Based Neuron Selection) ---
             input_features = torch.zeros(self.batch_size, self.snn_input_size, device=self.device)
+            activation_value = concept_raw_intensity
+
             if self.snn_input_size > 0:
-                # Activate a portion of input neurons
                 num_active_inputs = min(self.snn_input_size, max(1, int(self.snn_input_size * config.SNN_INPUT_ACTIVE_FRACTION)))
-                activation_value = concept_raw_intensity # Modulate activation by concept's raw intensity
-                input_features[0, :num_active_inputs] = activation_value
-            
+
+                selected_indices = set()
+                if num_active_inputs > 0: # Proceed only if we need to activate any neurons
+                    concept_hash = hashlib.sha256(input_text.encode('utf-8')).digest()
+
+                    # Seed a local PRNG instance with the hash for deterministic fallback
+                    seed_int = int.from_bytes(concept_hash[:8], 'big') # Use first 8 bytes for seed
+                    local_prng = random.Random(seed_int)
+
+                    # Primary selection directly from hash bytes (using 2-byte chunks)
+                    hash_ptr = 0
+                    while len(selected_indices) < num_active_inputs and hash_ptr + 2 <= len(concept_hash):
+                        val = int.from_bytes(concept_hash[hash_ptr:hash_ptr+2], 'big')
+                        selected_indices.add(val % self.snn_input_size)
+                        hash_ptr += 2
+
+                    # Fallback: If not enough unique indices from hash, use the seeded PRNG
+                    # This loop runs only if selected_indices is still less than num_active_inputs
+                    # and ensures we don't try to select more unique indices than available neurons.
+                    while len(selected_indices) < num_active_inputs and len(selected_indices) < self.snn_input_size:
+                        idx = local_prng.randint(0, self.snn_input_size - 1)
+                        selected_indices.add(idx) # Set handles uniqueness
+
+                    for idx in selected_indices:
+                        input_features[0, idx] = activation_value
+
+                    _log_system_event("snn_input_mapping_hash",
+                                      {"concept": input_text, "hash_prefix": concept_hash[:4].hex(),
+                                       "num_requested": num_active_inputs, "num_selected": len(selected_indices),
+                                       "snn_input_size": self.snn_input_size},
+                                      level="debug")
+            else: # snn_input_size is 0 or less
+                 _log_system_event("snn_input_mapping_skip",
+                                   {"reason": "snn_input_size is zero or negative", "snn_input_size": self.snn_input_size},
+                                   level="debug")
+
             # --- b. SNN Forward Pass ---
             # Propagate input features through the fully connected layer and then the LIF neuron layer.
             # self.fc: [batch_size, snn_input_size] -> [batch_size, snn_output_size]
@@ -780,7 +1048,7 @@ class SpacetimeManifold:
                     post_spk_flat=spk_out,          # Resulting output spikes
                     current_weights=current_weights,# Current weights (clone) being updated in this cycle
                     concept_name=input_text,        # Primary concept for contextual t_intensity
-                    prev_t_intensity=prev_t_intensity_for_stdp # Temporal context from initial bootstrap
+                    prev_raw_intensity=prev_t_intensity_for_stdp # Temporal context from initial bootstrap (raw 0-1)
                 )
                 current_weights = updated_weights # Persist STDP changes for this warp cycle
                 total_stdp_change_accumulator += delta_w_mean_abs

@@ -10,6 +10,8 @@ import os
 import datetime
 import json
 import traceback
+import threading
+_persona_instance_lock = threading.Lock()
 # 'time' module is used only in the __main__ test block, not in the module's core logic.
 # It can be imported there if specific test timing is needed.
 
@@ -225,21 +227,21 @@ def get_dialogue_persona() -> Persona | None:
         Persona | None: The shared Persona instance, or None if unavailable/failed.
     """
     global _dialogue_persona_instance
-    if _dialogue_persona_instance is None:
-        # Check if Persona class itself is available (might have failed import).
-        if not _PERSONA_AVAILABLE or Persona is None:
-            _log_dialogue_event("get_persona_failed", {"reason": "Persona class was not imported successfully."}, level="error")
-            return None
-        try:
-            # Instantiate Persona (loads its state from file or defaults).
-            _dialogue_persona_instance = Persona()
-            _log_dialogue_event("dialogue_persona_initialized", 
-                                {"persona_name": _dialogue_persona_instance.name if _dialogue_persona_instance else "UnknownName"}, 
-                                level="info")
-        except Exception as e: # Catch any error during Persona instantiation.
-            _log_dialogue_event("dialogue_persona_init_error", {"error_message": str(e), "traceback": traceback.format_exc()}, level="critical")
-            _dialogue_persona_instance = None # Ensure it remains None on failure.
-            return None
+    if _dialogue_persona_instance is None: # Quick check without lock first (double-checked locking pattern)
+        with _persona_instance_lock: # Acquire lock
+            if _dialogue_persona_instance is None: # Check again after acquiring lock
+                if not _PERSONA_AVAILABLE or Persona is None:
+                    _log_dialogue_event("get_persona_failed", {"reason": "Persona class was not imported successfully."}, level="error")
+                    return None
+                try:
+                    _dialogue_persona_instance = Persona()
+                    _log_dialogue_event("dialogue_persona_initialized",
+                                        {"persona_name": _dialogue_persona_instance.name if _dialogue_persona_instance else "UnknownName"},
+                                        level="info")
+                except Exception as e:
+                    _log_dialogue_event("dialogue_persona_init_error", {"error_message": str(e), "traceback": traceback.format_exc()}, level="critical")
+                    _dialogue_persona_instance = None
+                    # No return here, let it fall through to return the (now None) _dialogue_persona_instance
     return _dialogue_persona_instance
 
 # --- Main Dialogue Functions ---
@@ -544,8 +546,21 @@ def dialogue_loop(enable_streaming_thoughts: bool = None):
 _IS_TEST_RUNNING = False 
 
 if __name__ == "__main__":
+    # This block allows the script to be run directly for testing,
+    # ensuring that relative imports within the 'core' package can be resolved.
+    if __package__ is None or __package__ == '':
+        import sys
+        from pathlib import Path
+        # Add the parent directory of 'core' to sys.path
+        # This assumes the script is in 'core/dialogue.py' and we want to add the directory containing 'core'
+        parent_dir = Path(__file__).resolve().parent.parent
+        if str(parent_dir) not in sys.path:
+            sys.path.insert(0, str(parent_dir))
+        # Try to re-evaluate __package__ or set it, though direct execution might still limit some package features.
+        # For this script, modifying sys.path is often sufficient for imports.
+        __package__ = "core" # Attempt to set package context for relative imports
+
     _IS_TEST_RUNNING = True 
-    # print(f"INFO (dialogue.py __main__): _IS_TEST_RUNNING set to {_IS_TEST_RUNNING}")
 
     import unittest
     import unittest.mock as mock

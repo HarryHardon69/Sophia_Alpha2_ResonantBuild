@@ -127,7 +127,7 @@ ensure_path(LIBRARY_LOG_PATH)        # Ensures LIBRARY_STORE_DIR is created
 
 # --- End of Path Configuration ---
 
-# TODO: Consider implementing lazy loading for non-critical configuration parameters. This could improve startup time by deferring the loading of some settings until they are actually needed.
+
 
 # --- Resource Management ---
 # Defines different operational intensity profiles for the SNN and other components.
@@ -525,6 +525,40 @@ try:
 except ValueError as e:
     print(f"Warning: Invalid value for DEFAULT_KNOWLEDGE_COHERENCE env var ('{os.getenv('DEFAULT_KNOWLEDGE_COHERENCE')}'). Using default: {DEFAULT_KNOWLEDGE_COHERENCE}. Error: {e}", file=sys.stderr)
     DEFAULT_KNOWLEDGE_COHERENCE = DEFAULT_KNOWLEDGE_COHERENCE
+
+# Coordinate range for memory storage and novelty calculations
+DEFAULT_COORDINATE_MIN_VALUE = -1000.0
+try:
+    COORDINATE_MIN_VALUE = float(os.getenv('COORDINATE_MIN_VALUE', DEFAULT_COORDINATE_MIN_VALUE))
+except ValueError as e:
+    print(f"Warning: Invalid value for COORDINATE_MIN_VALUE env var ('{os.getenv('COORDINATE_MIN_VALUE')}'). Using default: {DEFAULT_COORDINATE_MIN_VALUE}. Error: {e}", file=sys.stderr)
+    COORDINATE_MIN_VALUE = DEFAULT_COORDINATE_MIN_VALUE
+
+DEFAULT_COORDINATE_MAX_VALUE = 1000.0
+try:
+    COORDINATE_MAX_VALUE = float(os.getenv('COORDINATE_MAX_VALUE', DEFAULT_COORDINATE_MAX_VALUE))
+except ValueError as e:
+    print(f"Warning: Invalid value for COORDINATE_MAX_VALUE env var ('{os.getenv('COORDINATE_MAX_VALUE')}'). Using default: {DEFAULT_COORDINATE_MAX_VALUE}. Error: {e}", file=sys.stderr)
+    COORDINATE_MAX_VALUE = DEFAULT_COORDINATE_MAX_VALUE
+
+# Maximum number of nodes in the knowledge graph.
+DEFAULT_MAX_GRAPH_NODES = 10000
+try:
+    MAX_GRAPH_NODES = int(os.getenv('MAX_GRAPH_NODES', DEFAULT_MAX_GRAPH_NODES))
+except ValueError as e:
+    print(f"Warning: Invalid value for MAX_GRAPH_NODES env var ('{os.getenv('MAX_GRAPH_NODES')}'). Using default: {DEFAULT_MAX_GRAPH_NODES}. Error: {e}", file=sys.stderr)
+    MAX_GRAPH_NODES = DEFAULT_MAX_GRAPH_NODES
+if MAX_GRAPH_NODES <= 0: # Ensure it's a positive value
+    print(f"Warning: MAX_GRAPH_NODES was '{MAX_GRAPH_NODES}', must be positive. Resetting to default {DEFAULT_MAX_GRAPH_NODES}.", file=sys.stderr)
+    MAX_GRAPH_NODES = DEFAULT_MAX_GRAPH_NODES
+
+
+# Policy for evicting nodes when MAX_GRAPH_NODES is reached. E.g., "oldest", "lru" (not implemented).
+DEFAULT_GRAPH_EVICTION_POLICY = "oldest"
+GRAPH_EVICTION_POLICY = os.getenv('GRAPH_EVICTION_POLICY', DEFAULT_GRAPH_EVICTION_POLICY).lower()
+if GRAPH_EVICTION_POLICY not in ["oldest"]: # Add other policies as they are implemented
+    print(f"Warning: Unknown GRAPH_EVICTION_POLICY '{GRAPH_EVICTION_POLICY}'. Defaulting to '{DEFAULT_GRAPH_EVICTION_POLICY}'.", file=sys.stderr)
+    GRAPH_EVICTION_POLICY = DEFAULT_GRAPH_EVICTION_POLICY
 
 # --- End of Memory/Library Configuration ---
 

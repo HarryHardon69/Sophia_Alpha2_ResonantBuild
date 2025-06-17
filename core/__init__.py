@@ -6,6 +6,9 @@ including the SpacetimeManifold (brain), memory systems, dialogue management,
 ethics engine, etc.
 """
 
+# Version for the core package
+__version__ = "0.1.0"
+
 import sys # For stderr in the fallback case of think()
 
 # --- Brain Exports ---

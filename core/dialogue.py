@@ -5,6 +5,8 @@ Manages dialogue interactions, user input processing, and response generation
 for Sophia_Alpha2.
 """
 
+__version__ = "0.1.0"
+
 import sys
 import os
 import datetime

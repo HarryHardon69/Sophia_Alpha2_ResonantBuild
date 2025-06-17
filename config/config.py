@@ -6,6 +6,14 @@ paths, resource profiles, API keys, persona details, ethical framework
 parameters, and other operational flags.
 """
 
+# TODO: Document cross-module parameter dependencies. Many parameters defined here
+# are used by other modules (e.g., core, interface). Understanding these
+# dependencies is crucial for system stability and maintainability.
+# This could be a separate markdown document or inline comments where parameters
+# are defined, explaining which modules consume them.
+
+# TODO: Explore options for dynamic configuration loading (e.g., from a file or a configuration server) to allow updates without restarting the application. This could also involve a mechanism to signal modules to reload their configuration.
+
 import json
 import os
 import sys
@@ -80,12 +88,16 @@ PERSONA_NAME = os.getenv('PERSONA_NAME', 'Sophia_Alpha2_Prime')
 PERSONA_PROFILE_PATH = get_path(os.path.join(PERSONA_DIR, PERSONA_NAME + '.json'))
 
 SYSTEM_LOG_FILENAME = "sophia_alpha2_system.log"
+# TODO: Implement log sanitization for SYSTEM_LOG_PATH to prevent leakage of sensitive information through logs. Consider what constitutes sensitive data in this context.
+# TODO: Implement log rotation for SYSTEM_LOG_PATH to manage log file sizes and prevent excessive disk usage, especially in long-running deployments.
 SYSTEM_LOG_PATH = get_path(os.path.join(LOG_DIR, SYSTEM_LOG_FILENAME))
+# Future enhancements for logging could include log rotation (e.g., size/time based) and asynchronous logging for improved performance.
 
 ETHICS_DB_FILENAME = "ethics_db.json"
 ETHICS_DB_PATH = get_path(os.path.join(ETHICS_STORE_DIR, ETHICS_DB_FILENAME))
 
 KNOWLEDGE_GRAPH_FILENAME = "knowledge_graph.json"
+# TODO: Consider adding encryption options for persistent JSON files like knowledge_graph.json to protect sensitive data at rest.
 KNOWLEDGE_GRAPH_PATH = get_path(os.path.join(MEMORY_STORE_DIR, KNOWLEDGE_GRAPH_FILENAME))
 
 MEMORY_LOG_FILENAME = "memory_log.json" # General memory log
@@ -93,6 +105,9 @@ MEMORY_LOG_PATH = get_path(os.path.join(MEMORY_STORE_DIR, MEMORY_LOG_FILENAME))
 
 LIBRARY_LOG_FILENAME = "library_log.json"
 LIBRARY_LOG_PATH = get_path(os.path.join(LIBRARY_STORE_DIR, LIBRARY_LOG_FILENAME))
+
+# Future enhancement: Flag to enable encryption for the library log.
+ENCRYPT_LIBRARY_LOG = os.getenv('ENCRYPT_LIBRARY_LOG', 'False').lower() == 'true'
 
 # Initial ensure_path calls for essential directories at import time
 ensure_path(DATA_DIR + os.sep) # Ensure DATA_DIR itself is created
@@ -112,19 +127,14 @@ ensure_path(LIBRARY_LOG_PATH)        # Ensures LIBRARY_STORE_DIR is created
 
 # --- End of Path Configuration ---
 
-# --- Encryption Configuration ---
-# Key for encrypting sensitive data stored by the application.
-# IMPORTANT: This key should be kept secret and managed securely.
-# For production, consider environment variables or a secrets management service.
-# This is a Fernet key, generate using: from cryptography.fernet import Fernet; Fernet.generate_key().decode()
-ENCRYPTION_KEY = "B9OgRJu0mUPFkjvreQSqqKCjL382uJEUsaVh2QMPVJQ="
-# --- End of Encryption Configuration ---
+
 
 # --- Resource Management ---
 # Defines different operational intensity profiles for the SNN and other components.
 # Can be set via environment variable RESOURCE_PROFILE, otherwise defaults to "moderate".
 RESOURCE_PROFILE_TYPE = os.getenv('RESOURCE_PROFILE', 'moderate').lower()
 
+# TODO: Document the expected resource usage (CPU, memory, network) for each profile (low, moderate, high) to help users select the appropriate one for their environment.
 _RESOURCE_PROFILES = {
     "low": {
         "MAX_NEURONS": 50000,       # Max neurons in the SNN spacetime manifold
@@ -270,6 +280,7 @@ except ValueError as e:
 # --- End of System Behavior ---
 
 # --- API Keys and Endpoints ---
+# TODO: Reference relevant threat models or security assessments in comments throughout this section to provide context for security decisions.
 # Configuration for Large Language Models (LLMs) and other external APIs.
 
 ENABLE_LLM_API = os.getenv('ENABLE_LLM_API', 'True').lower() == 'true'
@@ -311,7 +322,7 @@ DEFAULT_OLLAMA_MODEL = "llama2"
 
 _LLM_CONFIG = {
     "openai": {
-        "API_KEY": os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY_HERE_IF_NOT_SET_AS_ENV"),
+        "API_KEY": os.getenv("OPENAI_API_KEY", ""),
         "BASE_URL": os.getenv("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
         "MODEL": os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
         "CONCEPT_PROMPT_TEMPLATE": { # Default prompts, consider making these configurable as well if needed
@@ -372,6 +383,7 @@ LLM_CONCEPT_PROMPT_TEMPLATE = CURRENT_LLM_SETTINGS["CONCEPT_PROMPT_TEMPLATE"]
 # Parameters governing the ethical decision-making and alignment framework.
 
 # Placeholder for the ethical framework. This could be loaded from a JSON file or defined here.
+# TODO: Load ETHICAL_FRAMEWORK dynamically (e.g., from ETHICS_DB_PATH or another configuration file) to allow for easier updates without code changes.
 # Example structure: { "principle_name": {"weight": float, "rules": ["rule1", "rule2"]}}
 ETHICAL_FRAMEWORK = {
     "NonMaleficence": {"weight": 0.8, "description": "Avoid causing harm."},
@@ -661,6 +673,7 @@ def validate_config():
     Returns:
         bool: True if basic validation passes, False otherwise.
     """
+    # TODO: Expand validate_config to cover all critical parameters and their interdependencies. Currently, coverage is partial.
     print("\n--- Validating Configuration ---")
     valid = True
 
@@ -809,3 +822,5 @@ if __name__ == '__main__':
         print("One or more configuration self-tests FAILED or reported warnings.")
     
     print("\n--- End of Configuration Self-Test ---")
+
+# TODO: Add comprehensive unit tests for parameter logic, including validation of environment variable parsing, default fallbacks, type conversions, and resource profile selection.

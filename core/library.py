@@ -230,14 +230,11 @@ class Mitigator:
         text_lower = text.lower() # Case-insensitive search.
         found_keywords_list = []
         for keyword in self.sensitive_keywords:
-            # Current implementation uses simple substring matching.
-            # For more precision (avoiding 'harm' in 'harmony'), regex with word boundaries (`\b`) can be used:
-            #   pattern = r"\b" + re.escape(keyword.lower()) + r"\b"
-            #   if re.search(pattern, text_lower):
-            # However, this makes matching multi-word keywords more complex if they are stored as single strings.
-            # For now, simple substring matching is used for broader (if less precise) detection.
-            if keyword.lower() in text_lower:
-                found_keywords_list.append(keyword)
+            # Use regex with word boundaries for more precise matching.
+            # re.escape is used to ensure characters in keywords are treated literally.
+            pattern = r"\b" + re.escape(keyword.lower()) + r"\b"
+            if re.search(pattern, text_lower):
+                found_keywords_list.append(keyword) # Append the original keyword
         
         return bool(found_keywords_list), found_keywords_list
 
@@ -554,6 +551,31 @@ def store_knowledge(content: str, is_public: bool = False, source_uri: str = Non
     preview_max_len = getattr(config, 'KNOWLEDGE_PREVIEW_MAX_LENGTH', 150)
     content_preview = summarize_text(content, max_length=preview_max_len) # Short preview for logs or listings.
 
+    # --- source_uri validation ---
+    if source_uri is not None:
+        if not isinstance(source_uri, str):
+            _log_library_event("store_knowledge_invalid_uri", {"entry_id": entry_id, "reason": "source_uri is not a string", "provided_uri": source_uri}, level="warning")
+            source_uri = None
+        else:
+            # Basic URL pattern: checks for http(s) or ftp protocol.
+            uri_pattern = r'^(https?|ftp)://[^\s/$.?#].[^\s]*$'
+            if not re.match(uri_pattern, source_uri):
+                _log_library_event("store_knowledge_invalid_uri", {"entry_id": entry_id, "reason": "source_uri does not match expected pattern", "provided_uri": source_uri}, level="warning")
+                source_uri = None
+
+    # --- author validation ---
+    if author is not None:
+        if not isinstance(author, str):
+            _log_library_event("store_knowledge_invalid_author", {"entry_id": entry_id, "reason": "author is not a string", "provided_author": author}, level="warning")
+            author = None
+        else:
+            stripped_author = author.strip()
+            if not stripped_author: # Check if empty after stripping whitespace
+                _log_library_event("store_knowledge_invalid_author", {"entry_id": entry_id, "reason": "author is an empty or whitespace-only string", "provided_author": author}, level="warning")
+                author = None
+            else:
+                author = stripped_author # Use the stripped version
+
     # --- Manifold Coordinate Generation (Interaction with core.brain) ---
     # Attempt to get coordinates and related data for the content by treating its preview as a concept name.
     # This requires the brain module and its `bootstrap_concept_from_llm` method to be available.
@@ -595,8 +617,17 @@ def store_knowledge(content: str, is_public: bool = False, source_uri: str = Non
                 if not isinstance(summary_for_ethics, str) or not summary_for_ethics.strip():
                     summary_for_ethics = content_preview # Fallback to original content preview.
             else: # Data from brain is not in the expected format.
+                logged_coord_data = str(coord_data_tuple) # Default to string of original tuple
+                # Check if the structure is a 3-tuple and the third element is a string (the summary)
+                if isinstance(coord_data_tuple, tuple) and len(coord_data_tuple) == 3 and isinstance(coord_data_tuple[2], str):
+                    # Use KNOWLEDGE_PREVIEW_MAX_LENGTH for consistency, or a specific config for log summary length if available
+                    log_summary_max_len = getattr(config, 'KNOWLEDGE_PREVIEW_MAX_LENGTH', 150)
+                    summarized_llm_summary = summarize_text(coord_data_tuple[2], max_length=log_summary_max_len)
+                    # Reconstruct the tuple with the summarized string for logging purposes
+                    logged_coord_data = str((coord_data_tuple[0], coord_data_tuple[1], summarized_llm_summary))
+
                 _log_library_event("store_knowledge_brain_data_malformed", 
-                                   {"entry_id": entry_id, "concept_name_used": concept_name_for_coord, "data_received": str(coord_data_tuple)}, 
+                                   {"entry_id": entry_id, "concept_name_used": concept_name_for_coord, "data_received": logged_coord_data},
                                    level="warning")
                 # Defaults for coordinates, intensity_val, summary_for_ethics are already set.
         except Exception as e_brain_interaction: # Catch any error during interaction with brain.
@@ -696,6 +727,12 @@ def retrieve_knowledge_by_id(entry_id: str) -> dict | None:
     """
     if not isinstance(entry_id, str):
         _log_library_event("retrieve_by_id_failed", {"reason": "Invalid entry_id type", "entry_id_type": type(entry_id).__name__}, level="warning")
+        return None
+
+    # Validate SHA256 format (64 lowercase hex characters)
+    sha256_pattern = r'^[a-f0-9]{64}$'
+    if not re.match(sha256_pattern, entry_id):
+        _log_library_event("retrieve_by_id_failed", {"reason": "Invalid entry_id format", "entry_id_provided": entry_id}, level="warning")
         return None
 
     entry = KNOWLEDGE_LIBRARY.get(entry_id)
@@ -1145,9 +1182,51 @@ if __name__ == "__main__":
             assert "[Content Moderated due to significant ethical concerns" in moderated_low_score
 
             # High score, no keywords (should return original text)
-            original = "perfectly fine content"
-            moderated = mitigator.moderate_ethically_flagged_content(original, 0.95)
-            assert moderated == original
+            original_text_val = "perfectly fine content" # Renamed to avoid conflict with 'original_keywords' later
+            moderated = mitigator.moderate_ethically_flagged_content(original_text_val, 0.95)
+            assert moderated == original_text_val
+
+            # --- Specific tests for _contains_sensitive_keywords regex logic ---
+            original_keywords = mitigator.sensitive_keywords
+
+            # Test 1: Word boundaries - "sen" vs "sensitive"
+            mitigator.sensitive_keywords = ["sen"]
+            found, keywords = mitigator._contains_sensitive_keywords("This is a sensitive test.")
+            assert not found, "Mitigator test fail: 'sen' should not match in 'sensitive' with word boundaries"
+
+            mitigator.sensitive_keywords = ["sensitive"]
+            found, keywords = mitigator._contains_sensitive_keywords("This is a sensitive test.")
+            assert found and "sensitive" in keywords, "Mitigator test fail: 'sensitive' exact match"
+
+            # Test 2: Provided "test_sensitive" from initial config of this test function
+            # Note: initial config was {"LIBRARY_SENSITIVE_KEYWORDS": ["danger", "badword"]}, so "test_sensitive" is not in defaults here.
+            # We will use one of the initial keywords "danger" for this style of test.
+            mitigator.sensitive_keywords = ["danger"]
+            found, keywords = mitigator._contains_sensitive_keywords("A danger phrase.")
+            assert found and "danger" in keywords, "Mitigator test fail: 'danger' exact match"
+            found, keywords = mitigator._contains_sensitive_keywords("A non_danger phrase.")
+            assert not found, "Mitigator test fail: 'danger' should not match 'non_danger'"
+            found, keywords = mitigator._contains_sensitive_keywords("A danger_extra phrase.")
+            assert not found, "Mitigator test fail: 'danger' should not match 'danger_extra'"
+            found, keywords = mitigator._contains_sensitive_keywords("endanger") # Test substring at end
+            assert not found, "Mitigator test fail: 'danger' should not match 'endanger'"
+            found, keywords = mitigator._contains_sensitive_keywords("dangerous") # Test substring at start
+            assert not found, "Mitigator test fail: 'danger' should not match 'dangerous'"
+
+
+            # Test 3: Multi-word keyword precision
+            mitigator.sensitive_keywords = ["real bad"]
+            found, keywords = mitigator._contains_sensitive_keywords("This is a real bad situation.")
+            assert found and "real bad" in keywords, "Mitigator test fail: 'real bad' exact match"
+            found, keywords = mitigator._contains_sensitive_keywords("This is really bad.")
+            assert not found, "Mitigator test fail: 'real bad' should not match 'really bad'"
+            found, keywords = mitigator._contains_sensitive_keywords("This is a real good situation, not bad.")
+            assert not found, "Mitigator test fail: 'real bad' should not match 'bad' alone"
+            found, keywords = mitigator._contains_sensitive_keywords("This is a real bad situation not a real bad problem.")
+            assert found and "real bad" in keywords and len(keywords) == 1, "Mitigator test fail: 'real bad' multi-match but should be one keyword"
+
+
+            mitigator.sensitive_keywords = original_keywords # Restore original keywords for any subsequent tests in this function
 
     def test_knowledge_library_persistence():
         """Tests the persistence (_load, _save) of the knowledge library."""
@@ -1248,7 +1327,78 @@ if __name__ == "__main__":
             entry_id5 = store_knowledge("Content with ethics failure", is_public=False) # Private
             assert entry_id5 is not None, "S5: Entry ID is None (ethics failure)"
             assert KNOWLEDGE_LIBRARY[entry_id5]["ethics_score"] == 0.5, "S5: Ethics score should be default"
-        
+            # Clear KNOWLEDGE_LIBRARY and reload to ensure clean state from file for next scenarios
+            KNOWLEDGE_LIBRARY.clear(); _load_knowledge_library()
+
+
+            # Scenario: Invalid source_uri (bad format)
+            with mock.patch('core.library._log_library_event') as mock_log_event_uri:
+                # Ensure mocks from function decorator are reset if their specific state matters here
+                mock_input.reset_mock(); mock_manifold_instance.bootstrap_concept_from_llm.reset_mock(); mock_score_ethics_func.reset_mock()
+                mock_manifold_instance.bootstrap_concept_from_llm.return_value = ((0.1, 0.2, 0.3, 0.4), 0.5, "Mock summary from LLM") # Re-set return value
+                mock_input.return_value = "yes"
+                mock_score_ethics_func.return_value = 0.9
+
+                entry_id_bad_uri = store_knowledge("Content with bad URI", is_public=False, source_uri="ftp:/invalid-uri")
+                assert entry_id_bad_uri is not None, "S_bad_uri: Entry ID should not be None"
+                assert KNOWLEDGE_LIBRARY[entry_id_bad_uri]["source_uri"] is None, "S_bad_uri: source_uri should be None in stored entry"
+
+                called_with_warning = False
+                for call_arg in mock_log_event_uri.call_args_list:
+                    args, kwargs = call_arg
+                    if args[0] == "store_knowledge_invalid_uri" and kwargs.get('level') == "warning":
+                        called_with_warning = True
+                        assert args[1]['data']["reason"] == "source_uri does not match expected pattern"
+                        break
+                assert called_with_warning, "S_bad_uri: Expected 'store_knowledge_invalid_uri' warning log not found"
+            KNOWLEDGE_LIBRARY.clear(); _load_knowledge_library() # Reset state
+
+            # Scenario: Invalid author (empty string)
+            with mock.patch('core.library._log_library_event') as mock_log_event_author:
+                mock_input.reset_mock(); mock_manifold_instance.bootstrap_concept_from_llm.reset_mock(); mock_score_ethics_func.reset_mock()
+                mock_manifold_instance.bootstrap_concept_from_llm.return_value = ((0.1, 0.2, 0.3, 0.4), 0.5, "Mock summary from LLM")
+                mock_input.return_value = "yes"
+                mock_score_ethics_func.return_value = 0.9
+
+                entry_id_empty_author = store_knowledge("Content with empty author", is_public=False, author="   ")
+                assert entry_id_empty_author is not None, "S_empty_author: Entry ID should not be None"
+                assert KNOWLEDGE_LIBRARY[entry_id_empty_author]["author"] is None, "S_empty_author: author should be None in stored entry"
+
+                called_with_warning = False
+                for call_arg in mock_log_event_author.call_args_list:
+                    args, kwargs = call_arg
+                    if args[0] == "store_knowledge_invalid_author" and kwargs.get('level') == "warning":
+                        called_with_warning = True
+                        assert args[1]['data']["reason"] == "author is an empty or whitespace-only string"
+                        break
+                assert called_with_warning, "S_empty_author: Expected 'store_knowledge_invalid_author' warning log not found"
+            KNOWLEDGE_LIBRARY.clear(); _load_knowledge_library() # Reset state
+
+            # Scenario: Valid source_uri and author (also tests stripping for author)
+            with mock.patch('core.library._log_library_event') as mock_log_event_valid:
+                mock_input.reset_mock(); mock_manifold_instance.bootstrap_concept_from_llm.reset_mock(); mock_score_ethics_func.reset_mock()
+                mock_manifold_instance.bootstrap_concept_from_llm.return_value = ((0.1, 0.2, 0.3, 0.4), 0.5, "Mock summary from LLM")
+                mock_input.return_value = "yes"
+                mock_score_ethics_func.return_value = 0.9
+                valid_uri = "http://example.com/path"
+                valid_author_input = "  Test Author  "
+                expected_author_stored = "Test Author"
+
+                entry_id_valid_inputs = store_knowledge("Content with valid URI and author", is_public=False, source_uri=valid_uri, author=valid_author_input)
+                assert entry_id_valid_inputs is not None, "S_valid_inputs: Entry ID should not be None"
+                assert KNOWLEDGE_LIBRARY[entry_id_valid_inputs]["source_uri"] == valid_uri, "S_valid_inputs: source_uri mismatch"
+                assert KNOWLEDGE_LIBRARY[entry_id_valid_inputs]["author"] == expected_author_stored, "S_valid_inputs: author mismatch or not stripped"
+
+                no_warning_logs = True
+                for call_arg in mock_log_event_valid.call_args_list:
+                    args, kwargs = call_arg
+                    if kwargs.get('level') == "warning" and (args[0] == "store_knowledge_invalid_uri" or args[0] == "store_knowledge_invalid_author"):
+                        no_warning_logs = False
+                        print(f"Unexpected warning log: {args}, {kwargs}") # Debug print
+                        break
+                assert no_warning_logs, "S_valid_inputs: Warning logs were unexpectedly found for valid inputs"
+            KNOWLEDGE_LIBRARY.clear(); _load_knowledge_library() # Reset state
+
         delete_test_files(test_lib_path, test_sys_log_path) # Clean up after this complex test
 
     def test_retrieval_functions():
@@ -1288,6 +1438,39 @@ if __name__ == "__main__":
             
             results_case_insensitive_apples = retrieve_knowledge_by_keyword("APPLES", search_public=True, search_private=True)
             assert len(results_case_insensitive_apples) == 2, "Case-insensitive keyword search for 'APPLES' wrong count"
+
+            # --- Tests for retrieve_knowledge_by_id input validation ---
+            with mock.patch('core.library._log_library_event') as mock_log_event_retrieve:
+                # Test case 1: Invalid length (too short)
+                assert retrieve_knowledge_by_id("abc") is None, "Retrieve_by_id: Too short ID did not return None"
+                ret_args, ret_kwargs = mock_log_event_retrieve.call_args
+                assert ret_kwargs.get('level') == "warning", "Retrieve_by_id: Log level not warning for short ID"
+                assert ret_args[0] == "retrieve_by_id_failed", "Retrieve_by_id: Event type mismatch for short ID"
+                assert "Invalid entry_id format" in ret_args[1]['data'].get("reason", ""), "Retrieve_by_id: Reason mismatch for short ID"
+                mock_log_event_retrieve.reset_mock()
+
+                # Test case 2: Invalid length (too long)
+                assert retrieve_knowledge_by_id("a" * 65) is None, "Retrieve_by_id: Too long ID did not return None"
+                ret_args, ret_kwargs = mock_log_event_retrieve.call_args
+                assert ret_kwargs.get('level') == "warning", "Retrieve_by_id: Log level not warning for long ID"
+                assert ret_args[0] == "retrieve_by_id_failed", "Retrieve_by_id: Event type mismatch for long ID"
+                assert "Invalid entry_id format" in ret_args[1]['data'].get("reason", ""), "Retrieve_by_id: Reason mismatch for long ID"
+                mock_log_event_retrieve.reset_mock()
+
+                # Test case 3: Invalid characters
+                assert retrieve_knowledge_by_id("g" * 64) is None, "Retrieve_by_id: Invalid char ID did not return None" # 'g' is not hex
+                ret_args, ret_kwargs = mock_log_event_retrieve.call_args
+                assert ret_kwargs.get('level') == "warning", "Retrieve_by_id: Log level not warning for invalid char ID"
+                assert ret_args[0] == "retrieve_by_id_failed", "Retrieve_by_id: Event type mismatch for invalid char ID"
+                assert "Invalid entry_id format" in ret_args[1]['data'].get("reason", ""), "Retrieve_by_id: Reason mismatch for invalid char ID"
+                mock_log_event_retrieve.reset_mock()
+
+                # Test case 4: Invalid type (integer) - existing type check handles this, but verify log
+                assert retrieve_knowledge_by_id(12345) is None, "Retrieve_by_id: Integer ID did not return None"
+                ret_args, ret_kwargs = mock_log_event_retrieve.call_args
+                assert ret_kwargs.get('level') == "warning", "Retrieve_by_id: Log level not warning for int ID"
+                assert ret_args[0] == "retrieve_by_id_failed", "Retrieve_by_id: Event type mismatch for int ID"
+                assert "Invalid entry_id type" in ret_args[1]['data'].get("reason", ""), "Retrieve_by_id: Reason mismatch for int ID"
 
         delete_test_files(test_lib_path, test_sys_log_path)
 
